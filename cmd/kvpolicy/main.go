@@ -85,7 +85,7 @@ func run() error {
 			return err
 		}
 	}
-	for name, v := range map[string]any{"summary.json": r, "profile_cpu.json": r.CPU, "routing.json": r.RoutingTrace, "config.json": c} {
+	for name, v := range map[string]any{"summary.json": r, "cache-metrics.json": r.CacheMetrics, "profile_cpu.json": r.CPU, "routing.json": r.RoutingTrace, "config.json": c} {
 		if err = writeJSON(filepath.Join(*output, name), v); err != nil {
 			return err
 		}

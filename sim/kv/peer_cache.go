@@ -10,6 +10,7 @@ import (
 // PeerCache wraps BLIS's physical HBM allocator. DRAM and CXL are peers in
 // access, not stages in a chain. Only completed full input blocks are reusable.
 type PeerCache struct {
+	cacheMetrics         *cacheMetricState
 	hotprefix            *hotPrefixRuntime
 	prefixCopies         map[string][]int64
 	decodeTargets        map[string]int64
@@ -148,6 +149,9 @@ func (s *PeerCache) unpin(b *KVBlock) {
 	}
 }
 func (s *PeerCache) invalidate(b *KVBlock) {
+	if s.cacheMetrics != nil {
+		delete(s.cacheMetrics.origins, b.ID)
+	}
 	if x := s.fabric.external; x != nil && x.memory != nil {
 		if err := x.memory.InvalidateHBM(b.ID); err != nil {
 			panic(err)
@@ -487,6 +491,7 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		b.Tokens = append([]sim.TokenID(nil), e.tokens...)
 		s.HashToBlock[h] = b.ID
 		s.publishReadyCopy(b)
+		s.metricLoad(b, a.Pool, reason, req)
 		s.releaseHotPrefixParent(h)
 		e.readers--
 		e.last = now
@@ -512,6 +517,8 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 	return true
 }
 func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached []int64) bool {
+	s.observeCacheLookup(req.ID, req.FullInputTokens())
+	fresh := len(s.RequestMap[req.ID]) == 0
 	s.noteAllocationWait(req.ID, "dependency")
 	known, restoreCandidates, pendingLookup := s.observeRestoreLookup(req, cached)
 	if known {
@@ -666,6 +673,7 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 		}
 	}
 	if ok {
+		s.stageCacheReuse(req, start, cached, fresh)
 		s.allocationFailure = sim.AllocationFailure{}
 		if previous != nil {
 			var allocated []int64
@@ -711,6 +719,7 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	// Compatibility method name in KVStore; peer mode publishes computed HBM
 	// blocks here. An explicitly configured background pool also receives them.
 	for _, req := range batch {
+		s.completeCacheReuse(req)
 		if s.hotprefix != nil {
 			s.hotprefix.policy.remember(s.hotPrefixKeys(req.PrefillTokens()))
 		}
@@ -758,6 +767,11 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	}
 }
 func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
+	if s.cacheMetrics != nil {
+		if r := s.cacheMetrics.requests[req.ID]; r != nil {
+			r.pending = nil
+		}
+	}
 	s.releaseWorkerRequest(req)
 	s.releaseDecodeCapacity(req.ID)
 	delete(s.restoreLimits, req.ID)

@@ -95,6 +95,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	CacheMetrics                        CacheMetrics                  `json:"cache_metrics"`
 	ArrivalUS                           map[string]int64              `json:"arrival_us,omitempty"`
 	ProfileWarnings                     []ProfileWarning              `json:"profile_warnings,omitempty"`
 	ProfileCostCoverage                 string                        `json:"profile_cost_coverage,omitempty"`
@@ -1257,8 +1258,10 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 		stores[p.Instance].SchedulePromotion(p.At, p.Tokens, p.Budget)
 	}
 	if err := cs.Run(); err != nil {
+		out.CacheMetrics = collectCacheMetrics(c, stores)
 		return out, err
 	}
+	out.CacheMetrics = collectCacheMetrics(c, stores)
 	if conversation.err != nil {
 		return out, conversation.err
 	}

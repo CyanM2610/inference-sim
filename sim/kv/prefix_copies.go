@@ -16,6 +16,7 @@ func (s *PeerCache) EnableFirstPublishedCopy() error {
 // publishReadyCopy is called only when compute/restore completion is visible.
 // Re-observing a completed block must not move it behind a newer duplicate.
 func (s *PeerCache) publishReadyCopy(b *KVBlock) {
+	s.metricPublish(b)
 	if s.hotprefix != nil {
 		s.hotprefix.policy.published(b.Hash)
 	}
