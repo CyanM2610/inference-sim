@@ -10,7 +10,6 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/inference-sim/inference-sim/sim"
-	"github.com/inference-sim/inference-sim/sim/internal/hash"
 	"github.com/inference-sim/inference-sim/sim/internal/util"
 )
 
@@ -22,13 +21,13 @@ import (
 // Each block stores a fixed number of tokens and is tracked by a prefix hash.
 // A block becomes eligible for caching once it is full.
 type KVBlock struct {
-	ID       int64    // Unique ID of the block
-	RefCount int      // Number of active requests referencing this block
-	InUse    bool     // Whether the block is currently in use by an active (batched) request
-	Hash     string   // Prefix hash identifying this block's content and its lineage (if full)
+	ID       int64         // Unique ID of the block
+	RefCount int           // Number of active requests referencing this block
+	InUse    bool          // Whether the block is currently in use by an active (batched) request
+	Hash     string        // Prefix hash identifying this block's content and its lineage (if full)
 	Tokens   []sim.TokenID // Actual tokens stored in this block; full if len(Tokens) == BlockSizeTokens
-	PrevFree *KVBlock // LRU doubly linked list: previous free block
-	NextFree *KVBlock // LRU doubly linked list: next free block
+	PrevFree *KVBlock      // LRU doubly linked list: previous free block
+	NextFree *KVBlock      // LRU doubly linked list: next free block
 }
 
 // KVCacheState maintains global KV cache status across all requests.
@@ -36,16 +35,19 @@ type KVBlock struct {
 // via a direct counter on the free list (FreeBlockCnt), mirroring vLLM's
 // FreeKVCacheBlockQueue.num_free_blocks.
 type KVCacheState struct {
-	TotalBlocks     int64              // Total KV blocks available on GPU
-	BlockSizeTokens int64              // Tokens per block
-	Blocks          []*KVBlock         // All KV blocks
-	RequestMap      map[string][]int64 // RequestID -> block sequence
-	HashToBlock     map[string]int64   // Hash -> block ID
-	FreeHead        *KVBlock           // Head of free list
-	FreeTail        *KVBlock           // Tail of free list
-	FreeBlockCnt    int64              // Direct count of blocks in free list (vLLM parity)
-	CacheHits       int64              // blocks found via prefix cache (PR12)
-	CacheMisses     int64              // blocks not found, allocated fresh (PR12)
+	allocationFailure sim.AllocationFailure
+	hashAccounting    bool
+	hashWork          HashWork
+	TotalBlocks       int64              // Total KV blocks available on GPU
+	BlockSizeTokens   int64              // Tokens per block
+	Blocks            []*KVBlock         // All KV blocks
+	RequestMap        map[string][]int64 // RequestID -> block sequence
+	HashToBlock       map[string]int64   // Hash -> block ID
+	FreeHead          *KVBlock           // Head of free list
+	FreeTail          *KVBlock           // Tail of free list
+	FreeBlockCnt      int64              // Direct count of blocks in free list (vLLM parity)
+	CacheHits         int64              // blocks found via prefix cache (PR12)
+	CacheMisses       int64              // blocks not found, allocated fresh (PR12)
 }
 
 // NewKVCacheState initializes the KVCacheState and places all blocks in the free list in order.
@@ -129,7 +131,7 @@ func (kvc *KVCacheState) GetCachedBlocks(tokens []sim.TokenID) (blockIDs []int64
 	for i := int64(0); i < n; i++ {
 		start := i * kvc.BlockSizeTokens
 		end := start + kvc.BlockSizeTokens
-		h := hash.HashBlock(prevHash, tokens[start:end])
+		h := kvc.hashBlock(prevHash, tokens[start:end])
 		blockId, ok := kvc.HashToBlock[h]
 		if !ok {
 			break
@@ -164,7 +166,7 @@ func (kvc *KVCacheState) SnapshotCachedBlocksFn() func([]sim.TokenID) int {
 		for i := int64(0); i < n; i++ {
 			start := i * blockSize
 			end := start + blockSize
-			h := hash.HashBlock(prevHash, tokens[start:end])
+			h := kvc.hashBlock(prevHash, tokens[start:end])
 			if _, ok := snapshot[h]; !ok {
 				break
 			}
@@ -180,14 +182,15 @@ func (kvc *KVCacheState) SnapshotCachedBlocksFn() func([]sim.TokenID) int {
 // start and endIndex are by original requests' index
 // endIndex is non-inclusive
 func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, endIndex int64, cachedBlocks []int64) bool {
+	kvc.allocationFailure = sim.AllocationFailure{}
 	reqID := req.ID
 	logrus.Debugf("AllocateBlock for ReqID: %s, Num Inputs: %d, startIndex = %d, endIndex = %d", req.ID, req.InputLen(), startIndex, endIndex)
 
 	var newTokens []sim.TokenID
 	var numNewBlocks int64
-	if req.ProgressIndex < req.InputLen() {
+	if req.ProgressIndex < req.PrefillEnd() {
 		// request is in prefill (could be chunked)
-		newTokens = req.InputTokenSlice(startIndex, endIndex)
+		newTokens = req.PrefillTokenSlice(startIndex, endIndex)
 
 		// Compute blocks needed, accounting for tokens that will be absorbed
 		// into the request's existing partially-filled last block. Without this,
@@ -222,7 +225,7 @@ func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, en
 		if numNewBlocks+cachedFromFreeList > kvc.countFreeBlocks() {
 			logrus.Debugf("KV cache full: cannot allocate %d new + %d cached blocks for req %s",
 				numNewBlocks, cachedFromFreeList, req.ID)
-			return false
+			return kvc.capacityFailure(req.ID, numNewBlocks+cachedFromFreeList)
 		}
 	} else {
 		// request is in decode
@@ -242,13 +245,13 @@ func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, en
 			lastBlk := kvc.Blocks[ids[len(ids)-1]]
 			if util.Len64(lastBlk.Tokens) == kvc.BlockSizeTokens && kvc.countFreeBlocks() == 0 {
 				logrus.Debugf("KV cache full: cannot allocate decode block for req %s (last block full, 0 free)", reqID)
-				return false
+				return kvc.capacityFailure(req.ID, 1)
 			}
 		} else {
 			// No existing blocks — need 1 new block for this decode token.
 			if kvc.countFreeBlocks() == 0 {
 				logrus.Debugf("KV cache full: cannot allocate decode block for req %s (no existing blocks, 0 free)", reqID)
-				return false
+				return kvc.capacityFailure(req.ID, 1)
 			}
 		}
 	}
@@ -299,7 +302,7 @@ func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, en
 				if len(ids) >= 2 {
 					prevHash = kvc.Blocks[ids[len(ids)-2]].Hash
 				}
-				h := hash.HashBlock(prevHash, latestBlk.Tokens)
+				h := kvc.hashBlock(prevHash, latestBlk.Tokens)
 				latestBlk.Hash = h
 				kvc.HashToBlock[h] = latestBlk.ID
 			}
@@ -349,11 +352,11 @@ func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, en
 				blk.InUse = true
 				kvc.CacheMisses++
 
-				if util.Len64(blk.Tokens) == kvc.BlockSizeTokens && req.ProgressIndex < req.InputLen() {
+				if util.Len64(blk.Tokens) == kvc.BlockSizeTokens && req.ProgressIndex < req.PrefillEnd() {
 					// Only compute prefix hash during prefill (not decode).
 					// During decode, blocks hold output tokens that should not
 					// participate in prefix caching (input sequences only).
-					h := hash.HashBlock(prevHash, blk.Tokens)
+					h := kvc.hashBlock(prevHash, blk.Tokens)
 					blk.Hash = h
 					kvc.HashToBlock[h] = blk.ID
 					prevHash = h
