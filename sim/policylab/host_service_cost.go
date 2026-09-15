@@ -12,6 +12,7 @@ import (
 // RegistrationUS is additional controller work, not native add_request's base
 // cost. Worker reset and unwrapped native-loop residuals are separate.
 type CapacityHostServiceCostConfig struct {
+	profileReporter
 	RegistrationBaseUS   int64               `json:"registration_base_us,omitempty"`
 	CompletionRatesUS    []int64             `json:"completion_rates_us,omitempty"`
 	RegistrationUS       *int64              `json:"registration_us,omitempty"`
@@ -31,16 +32,17 @@ func newCapacityHostServiceCost(c Config) (*capacityHostServiceCost, error) {
 		return nil, fmt.Errorf("capacity host services require the capacity engine-phase path with control steps")
 	}
 	p := *c.DecisionPolicy.HostServiceCost
+	p.profileReporter = c.profile("capacity_host", p.Provenance)
 	if p.RegistrationBaseUS < 0 || p.RegistrationBaseUS > 0 && (p.RegistrationUS == nil || c.BatchCost == nil || c.BatchCost.EnqueueUS != 0) {
 		return nil, fmt.Errorf("serialized registration base cost requires registration service and zero external enqueue cost")
 	}
-	if p.MaxInputTokens <= 0 || p.MaxOutputTokens <= 0 || len(c.Instances) != 1 || p.HBMBlocks != c.Instances[0].HBMBlocks || p.Shape != serviceShape(c) || strings.TrimSpace(p.Provenance) == "" {
+	if !validServiceShape(p.Shape) || p.MaxInputTokens <= 0 || p.MaxOutputTokens <= 0 || len(c.Instances) != 1 || p.HBMBlocks <= 0 || strings.TrimSpace(p.Provenance) == "" {
 		return nil, fmt.Errorf("invalid host service geometry, input/output bounds or provenance")
 	}
-	for _, r := range c.Requests {
-		if int64(len(r.Input)) > p.MaxInputTokens || r.MaxOutputTokens <= 0 || r.MaxOutputTokens > p.MaxOutputTokens {
-			return nil, fmt.Errorf("request exceeds host service profile coverage")
-		}
+	p.equal("hbm_blocks", c.Instances[0].HBMBlocks, p.HBMBlocks)
+	p.profileReporter.shape(p.Shape, serviceShape(c))
+	if err := p.requests(c, p.MaxInputTokens, p.MaxOutputTokens); err != nil {
+		return nil, err
 	}
 	if p.CompletionRatesUS == nil && p.RegistrationUS == nil {
 		return nil, fmt.Errorf("host service profile has no enabled stage")
@@ -75,9 +77,11 @@ func (m *capacityHostServiceCost) EstimateHostService(w sim.HostServiceWork) (si
 		}
 		total += p.RegistrationBaseUS
 	case "completion":
-		if len(p.CompletionRatesUS) != 3 || int64(len(w.Requests)) > p.MaxGrantedRequests || int64(len(w.Finishing)) > p.MaxFinishingRequests {
-			return sim.DecisionCostEstimate{}, fmt.Errorf("completion work exceeds profile coverage")
+		if len(p.CompletionRatesUS) != 3 {
+			return sim.DecisionCostEstimate{}, fmt.Errorf("missing completion cost formula")
 		}
+		p.above("granted_requests", int64(len(w.Requests)), p.MaxGrantedRequests)
+		p.above("finishing_requests", int64(len(w.Finishing)), p.MaxFinishingRequests)
 		requests := map[string]bool{}
 		for _, id := range w.Requests {
 			if requests[id] {

@@ -12,12 +12,14 @@ var decodeFillPrepareNames = [...]string{"fixed", "visible", "waiting", "pending
 var decodeFillExecutionNames = [...]string{"fixed", "visible", "waiting", "grants", "new_workers", "holds"}
 
 type DecodeFillServiceCurve struct {
+	profileReporter
 	CoefficientsNS []int64 `json:"coefficients_ns"`
 	MaxFeatures    []int64 `json:"max_features"`
 }
 
 // This prices only the measured controller envelopes, not all engine/driver CPU.
 type DecodeFillServiceCostConfig struct {
+	profileReporter
 	Policy             string                 `json:"policy"`
 	Prepare            DecodeFillServiceCurve `json:"prepare"`
 	Execution          DecodeFillServiceCurve `json:"execution"`
@@ -48,22 +50,25 @@ func newDecodeFillServiceCost(c Config) (*decodeFillServiceCost, error) {
 		return nil, fmt.Errorf("decode-fill service cannot reuse another controller profile or unmeasured policy/observer")
 	}
 	p := *d.DecodeFillServiceCost
+	p.profileReporter = c.profile("decode_fill_service", p.Provenance)
 	want := "balanced"
 	if d.BalancedBatch.DecodeFill {
 		want = "decode_fill"
 	}
-	if p.Policy != want || p.Shape != serviceShape(c) || p.HBMBlocks != c.Instances[0].HBMBlocks || p.PoolCapacityBlocks != c.Pools[0].CapacityBlocks ||
-		p.BlockBytes != c.EnginePhases.BlockBytes || p.MaxInputTokens <= 0 || p.MaxOutputTokens <= 0 || p.MaxPromotionBlocks < 0 ||
+	if !validServiceShape(p.Shape) || p.Policy != want || p.HBMBlocks <= 0 || p.PoolCapacityBlocks <= 0 || p.BlockBytes <= 0 || p.MaxInputTokens <= 0 || p.MaxOutputTokens <= 0 || p.MaxPromotionBlocks < 0 ||
 		strings.TrimSpace(p.Provenance) == "" || strings.TrimSpace(p.Coverage) == "" {
 		return nil, fmt.Errorf("decode-fill service policy/geometry/envelope/provenance mismatch")
 	}
-	for _, r := range c.Requests {
-		if int64(len(r.Input)) > p.MaxInputTokens || r.MaxOutputTokens <= 0 || r.MaxOutputTokens > p.MaxOutputTokens {
-			return nil, fmt.Errorf("decode-fill service request exceeds observed scope")
-		}
+	p.profileReporter.shape(p.Shape, serviceShape(c))
+	p.equal("hbm_blocks", c.Instances[0].HBMBlocks, p.HBMBlocks)
+	p.equal("pool_capacity_blocks", c.Pools[0].CapacityBlocks, p.PoolCapacityBlocks)
+	p.equal("block_bytes", c.EnginePhases.BlockBytes, p.BlockBytes)
+	if err := p.requests(c, p.MaxInputTokens, p.MaxOutputTokens); err != nil {
+		return nil, err
 	}
 	curves := []*DecodeFillServiceCurve{&p.Prepare, &p.Execution}
 	for i, curve := range curves {
+		curve.profileReporter = c.profile([]string{"decode_fill_prepare", "decode_fill_execution"}[i], p.Provenance)
 		n := len(decodeFillPrepareNames)
 		if i == 1 {
 			n = len(decodeFillExecutionNames)
@@ -133,9 +138,10 @@ func priceDecodeFillCurve(c DecodeFillServiceCurve, f []int64) (int64, error) {
 	}
 	var ns int64
 	for i, n := range f {
-		if n < 0 || n > c.MaxFeatures[i] {
-			return 0, fmt.Errorf("decode-fill service feature %d exceeds measured scope: %d > %d", i, n, c.MaxFeatures[i])
+		if n < 0 {
+			return 0, fmt.Errorf("negative decode-fill service feature %d: %d", i, n)
 		}
+		c.above(fmt.Sprintf("feature_%d", i), n, c.MaxFeatures[i])
 		if c.CoefficientsNS[i] < 0 || n > 0 && c.CoefficientsNS[i] > (math.MaxInt64-999-ns)/n {
 			return 0, fmt.Errorf("decode-fill service nanosecond sum overflows")
 		}
@@ -156,14 +162,14 @@ func (c *decodeFillServiceCost) check(v sim.DecisionView, p sim.DecisionPlan) er
 	for _, a := range p.Promotions {
 		promoted += a.MaxPrefixBlocks
 	}
-	if promoted > c.profile.MaxPromotionBlocks {
-		return fmt.Errorf("decode-fill promotion work exceeds measured envelope")
-	}
+	c.profile.above("promotion_blocks", promoted, c.profile.MaxPromotionBlocks)
 	for _, group := range [][]sim.DecisionRequest{v.Waiting, v.Running} {
 		for _, r := range group {
-			if r.InputTokens > c.profile.MaxInputTokens || r.ClientOutputLimit <= 0 || r.ClientOutputLimit > c.profile.MaxOutputTokens || r.RecomputeUntilTokens > r.InputTokens {
+			if r.ClientOutputLimit <= 0 || r.RecomputeUntilTokens > r.InputTokens {
 				return fmt.Errorf("unmeasured request history in decode-fill service")
 			}
+			c.profile.above("input_tokens", r.InputTokens, c.profile.MaxInputTokens)
+			c.profile.above("client_output_limit", int64(r.ClientOutputLimit), int64(c.profile.MaxOutputTokens))
 		}
 	}
 	return nil

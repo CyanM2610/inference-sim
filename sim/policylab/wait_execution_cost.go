@@ -12,6 +12,7 @@ import (
 // restore matches, token-reserve visits. ActionUS is the disjoint preempt/free
 // interval. Decision, completion, idle/driver and registration stay separate.
 type WaitExecutionCostConfig struct {
+	profileReporter
 	Family          string              `json:"family"`
 	RatesUS         []int64             `json:"rates_us"`
 	ActionUS        int64               `json:"action_us"`
@@ -30,6 +31,7 @@ func newWaitExecutionCost(c Config) (*waitExecutionCost, error) {
 		return nil, fmt.Errorf("wait execution profile requires resident waits, control steps, one restore engine-phase instance and no other execution profile")
 	}
 	p := *c.DecisionPolicy.WaitExecutionCost
+	p.profileReporter = c.profile("wait_execution", p.Provenance)
 	if err := validateWaitServiceScope(c, p.Family, p.Shape, p.HBMBlocks, p.MaxInputTokens, p.MaxOutputTokens, p.Provenance); err != nil {
 		return nil, err
 	}
@@ -135,8 +137,11 @@ func (m *waitExecutionCost) EstimateExecution(w sim.BatchExecutionWork, preempti
 	}
 	var total int64
 	for i, n := range counts {
-		if n < 0 || i > 0 && n > m.config.MaxCounts[i-1] {
-			return sim.DecisionCostEstimate{}, fmt.Errorf("wait execution feature %d exceeds profile coverage: %d", i, n)
+		if n < 0 {
+			return sim.DecisionCostEstimate{}, fmt.Errorf("negative wait execution feature %d: %d", i, n)
+		}
+		if i > 0 {
+			m.config.above(fmt.Sprintf("feature_%d", i), n, m.config.MaxCounts[i-1])
 		}
 		rate := m.config.RatesUS[i]
 		if n > 0 && rate > (math.MaxInt64-total)/n {

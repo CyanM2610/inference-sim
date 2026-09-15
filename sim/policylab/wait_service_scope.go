@@ -15,13 +15,11 @@ func validateWaitServiceScope(c Config, family string, shape RestoreServiceShape
 	if c.DecisionPolicy.CapacityPreemption {
 		want = "capacity"
 	}
-	if family != want || hbm != c.Instances[0].HBMBlocks || shape != serviceShape(c) || input <= 0 || output <= 0 || strings.TrimSpace(provenance) == "" {
+	if !validServiceShape(shape) || family != want || hbm <= 0 || input <= 0 || output <= 0 || strings.TrimSpace(provenance) == "" {
 		return fmt.Errorf("invalid wait service family, geometry or coverage")
 	}
-	for _, r := range c.Requests {
-		if int64(len(r.Input)) > input || r.MaxOutputTokens <= 0 || r.MaxOutputTokens > output {
-			return fmt.Errorf("request exceeds wait service profile coverage")
-		}
-	}
-	return nil
+	report := c.profile("wait_service", provenance)
+	report.equal("hbm_blocks", c.Instances[0].HBMBlocks, hbm)
+	report.shape(shape, serviceShape(c))
+	return report.requests(c, input, output)
 }

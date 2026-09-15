@@ -46,6 +46,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	logrus.SetLevel(logrus.ErrorLevel)
 	c, err := policylab.Decode(data)
 	if err != nil {
 		return err
@@ -66,6 +67,14 @@ func run() error {
 	}
 	if err = os.MkdirAll(*output, 0755); err != nil {
 		return err
+	}
+	if len(r.ProfileWarnings) > 0 {
+		if err = writeJSON(filepath.Join(*output, "profile-warnings.json"), r.ProfileWarnings); err != nil {
+			return err
+		}
+		for _, w := range r.ProfileWarnings {
+			fmt.Fprintf(os.Stderr, "WARNING profile extrapolation: %s.%s observed=[%d,%d] measured=[%d,%d]; unchanged formula, not native validated\n", w.Component, w.Parameter, w.ObservedMin, w.ObservedMax, w.ProfileMin, w.ProfileMax)
+		}
 	}
 	if *requestPlugin != "" || *peerPlugin != "" || *poolPlugin != "" || *transferPlugin != "" {
 		selection := map[string]string{"request": *requestPlugin, "kv": *peerPlugin, "pool": *poolPlugin}

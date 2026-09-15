@@ -87,8 +87,12 @@ func TestPrefixSharingCostRejectsOldCoverageAndCountsObservationWork(t *testing.
 		t.Fatal("sharing work should charge observed entries, not unique content", e, err)
 	}
 	c.Limits.MaxPrefixBlocks = 47
-	if _, err := c.Estimate(v, DecisionPlan{}); err == nil {
-		t.Fatal("sharing work escaped profile bound")
+	warned := false
+	c.SetProfileWarningObserver(func(parameter string, observed, maximum int64) {
+		warned = parameter == "prefix_blocks" && observed == 48 && maximum == 47
+	})
+	if cost, err := c.Estimate(v, DecisionPlan{}); err != nil || cost.ExtraUS != 96 || !warned {
+		t.Fatal("sharing extrapolation clipped, rejected or silent", cost, err)
 	}
 	c.Limits = nil
 	c.PerPrefixBlockUS = math.MaxInt64

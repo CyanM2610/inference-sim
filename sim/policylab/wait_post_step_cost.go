@@ -12,6 +12,7 @@ import (
 // add the preceding condition/bookkeeping/arrival-loop work. Driver/observer
 // residuals remain outside this component.
 type WaitPostStepCostConfig struct {
+	profileReporter
 	PreStepRatesUS     []int64             `json:"pre_step_rates_us,omitempty"`
 	Family             string              `json:"family"`
 	BookkeepingUS      int64               `json:"bookkeeping_us"`
@@ -32,6 +33,7 @@ func newWaitPostStepCost(c Config) (*waitPostStepCost, error) {
 		return nil, fmt.Errorf("missing wait post-step profile")
 	}
 	p := *c.DecisionPolicy.WaitPostStepCost
+	p.profileReporter = c.profile("wait_post_step", p.Provenance)
 	if p.PreStepRatesUS != nil && len(p.PreStepRatesUS) != 3 {
 		return nil, fmt.Errorf("pre-step driver requires condition, bookkeeping and arrivals rates")
 	}
@@ -89,9 +91,7 @@ func (m *waitPostStepCost) EstimatePostStep(w sim.PostStepWork) (sim.DecisionCos
 			delete(seen, id)
 		}
 		for i, n := range counts {
-			if n > p.MaxIdleCounts[i] {
-				return sim.DecisionCostEstimate{}, fmt.Errorf("idle feature %d exceeds profile coverage: %d", i, n)
-			}
+			p.above(fmt.Sprintf("idle.feature_%d", i), n, p.MaxIdleCounts[i])
 		}
 	default:
 		return sim.DecisionCostEstimate{}, fmt.Errorf("unsupported post-step stage %q", w.Stage)

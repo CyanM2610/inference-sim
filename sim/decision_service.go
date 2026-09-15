@@ -5,6 +5,8 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 const ExplicitDecisionCostCoverage = "explicit_extra_service_sim_time_uncalibrated"
@@ -41,6 +43,7 @@ type DecisionService struct {
 // LinearDecisionCost is an explicit sensitivity model, not a calibration claim.
 // FixedUS applies once per decision, including decisions later superseded.
 type LinearDecisionCost struct {
+	profileWarning       func(parameter string, observed, maximum int64)
 	PerPrefillWaitUS     int64               `json:"per_prefill_wait_us,omitempty"`
 	PerRestoreChoiceUS   int64               `json:"per_restore_choice_us,omitempty"`
 	PerPreemptionUS      int64               `json:"per_preemption_us,omitempty"`
@@ -55,7 +58,8 @@ type LinearDecisionCost struct {
 }
 
 // DecisionCostLimits bounds a declared partial profile's observed state shapes.
-// Exceeding it is an error, never an implicit extrapolation or zero-cost action.
+// Numeric bounds produce extrapolation warnings; capability and data contracts
+// remain errors. Pricing uses actual work with the original coefficients.
 type DecisionCostLimits struct {
 	RequirePrefillWaits       bool   `json:"require_prefill_waits,omitempty"`
 	MaxRestoreChoices         int64  `json:"max_restore_choices,omitempty"`
@@ -100,7 +104,7 @@ func (l DecisionCostLimits) validate() error {
 	return nil
 }
 
-func (l DecisionCostLimits) check(v DecisionView) error {
+func (l DecisionCostLimits) check(v DecisionView, warn func(string, int64, int64)) error {
 	if v.Capabilities.PrefillWaits != l.RequirePrefillWaits {
 		return fmt.Errorf("decision cost profile does not cover resident prefill waits")
 	}
@@ -112,9 +116,7 @@ func (l DecisionCostLimits) check(v DecisionView) error {
 		for _, r := range v.Estimates.Requests {
 			count += int64(len(r.Choices))
 		}
-		if count > l.MaxRestoreChoices {
-			return fmt.Errorf("restore choice cost exceeds profile coverage")
-		}
+		warn("restore_choices", count, l.MaxRestoreChoices)
 	}
 	if v.Capabilities.PrefillPreemption != l.RequirePrefillPreemption {
 		return fmt.Errorf("decision cost profile does not cover prefill preemption observation")
@@ -123,27 +125,34 @@ func (l DecisionCostLimits) check(v DecisionView) error {
 		return fmt.Errorf("decision cost profile does not match prefix sharing observation work")
 	}
 	if l.RequirePrefixSharing {
-		remaining := l.MaxPrefixBlocks
+		var blocks int64
 		for _, r := range v.KV.Requests {
-			if int64(len(r.PrefixBlocks)) > remaining {
-				return fmt.Errorf("decision prefix sharing blocks exceed profile coverage")
+			if int64(len(r.PrefixBlocks)) > math.MaxInt64-blocks {
+				return fmt.Errorf("decision prefix block count overflow")
 			}
-			remaining -= int64(len(r.PrefixBlocks))
+			blocks += int64(len(r.PrefixBlocks))
 		}
+		warn("prefix_blocks", blocks, l.MaxPrefixBlocks)
 	}
 	if l.RequirePromotionRetention != "" && (!v.Capabilities.Promotions || v.Capabilities.PromotionRetention != l.RequirePromotionRetention) {
 		return fmt.Errorf("decision cost profile requires matching promotion retention")
 	}
-	if int64(len(v.Waiting)+len(v.Running)) > l.MaxVisibleRequests || !v.KV.TransfersKnown || int64(len(v.KV.PendingTransfers)) > l.MaxPendingTransfers {
-		return fmt.Errorf("decision view exceeds profile request/transfer coverage or has unknown transfer state")
+	if !v.KV.TransfersKnown {
+		return fmt.Errorf("decision cost requires known transfer state")
 	}
+	warn("visible_requests", int64(len(v.Waiting)+len(v.Running)), l.MaxVisibleRequests)
+	warn("pending_transfers", int64(len(v.KV.PendingTransfers)), l.MaxPendingTransfers)
 	for _, group := range [][]DecisionRequest{v.Waiting, v.Running} {
 		for _, r := range group {
-			if r.InputTokens > l.MaxInputTokens {
-				return fmt.Errorf("decision input exceeds profile coverage")
+			if r.InputTokens < 0 {
+				return fmt.Errorf("negative decision input tokens")
 			}
-			if l.MaxOutputTokens > 0 && (r.ClientOutputLimit <= 0 || int64(r.ClientOutputLimit) > l.MaxOutputTokens) {
-				return fmt.Errorf("decision output budget is unknown or exceeds profile coverage")
+			warn("input_tokens", r.InputTokens, l.MaxInputTokens)
+			if l.MaxOutputTokens > 0 {
+				if r.ClientOutputLimit <= 0 {
+					return fmt.Errorf("decision output budget is unknown")
+				}
+				warn("client_output_limit", int64(r.ClientOutputLimit), l.MaxOutputTokens)
 			}
 		}
 	}
@@ -176,26 +185,23 @@ func (c LinearDecisionCost) Estimate(v DecisionView, plan DecisionPlan) (Decisio
 		return DecisionCostEstimate{}, err
 	}
 	if c.Limits != nil {
-		if err := c.Limits.check(v); err != nil {
+		if err := c.Limits.check(v, c.warnProfile); err != nil {
 			return DecisionCostEstimate{}, err
 		}
-		if plan.BatchTokenCap > c.Limits.MaxBatchTokenCap {
-			return DecisionCostEstimate{}, fmt.Errorf("batch token cap action is outside decision cost coverage")
-		}
-		if int64(len(plan.Preemptions)) > c.Limits.MaxPreemptions {
-			return DecisionCostEstimate{}, fmt.Errorf("preemption action is outside decision cost coverage")
-		}
-		if limit := c.Limits.MaxPromotionActions; limit > 0 && int64(len(plan.Promotions)) > limit {
-			return DecisionCostEstimate{}, fmt.Errorf("decision promotion actions exceed profile coverage")
+		c.warnProfile("batch_token_cap", plan.BatchTokenCap, c.Limits.MaxBatchTokenCap)
+		c.warnProfile("preemptions", int64(len(plan.Preemptions)), c.Limits.MaxPreemptions)
+		if limit := c.Limits.MaxPromotionActions; limit > 0 {
+			c.warnProfile("promotion_actions", int64(len(plan.Promotions)), limit)
 		}
 		if limit := c.Limits.MaxPromotionBlocks; limit > 0 {
 			var blocks int64
 			for _, action := range plan.Promotions {
-				if action.MaxPrefixBlocks < 0 || action.MaxPrefixBlocks > limit-blocks {
-					return DecisionCostEstimate{}, fmt.Errorf("decision promotion blocks exceed profile coverage")
+				if action.MaxPrefixBlocks < 0 || action.MaxPrefixBlocks > math.MaxInt64-blocks {
+					return DecisionCostEstimate{}, fmt.Errorf("invalid or overflowing promotion blocks")
 				}
 				blocks += action.MaxPrefixBlocks
 			}
+			c.warnProfile("promotion_blocks", blocks, limit)
 		}
 	}
 	if c.PerPendingTransferUS > 0 && !v.KV.TransfersKnown {
@@ -252,6 +258,23 @@ func (c LinearDecisionCost) Estimate(v DecisionView, plan DecisionPlan) (Decisio
 		extra += count * c.PerPrefixBlockUS
 	}
 	return DecisionCostEstimate{ExtraUS: extra, Provenance: c.Provenance}, nil
+}
+
+// SetProfileWarningObserver attaches run-local reporting without exposing the
+// mutable model or input snapshot to the observer. It does not change pricing.
+func (c *LinearDecisionCost) SetProfileWarningObserver(observer func(string, int64, int64)) {
+	c.profileWarning = observer
+}
+
+func (c LinearDecisionCost) warnProfile(parameter string, observed, maximum int64) {
+	if observed <= maximum {
+		return
+	}
+	if c.profileWarning != nil {
+		c.profileWarning(parameter, observed, maximum)
+	} else {
+		logrus.Warnf("profile extrapolation: linear_decision.%s observed=%d measured_max=%d; unchanged cost formula", parameter, observed, maximum)
+	}
 }
 
 func (s *Simulator) SetDecisionCostModel(model DecisionCostModel) error {

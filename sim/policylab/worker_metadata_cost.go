@@ -67,9 +67,8 @@ func (c EnginePhaseCostConfig) PredictEngineStepWithMetadata(work []sim.BatchWor
 			f[5]++
 		}
 	}
-	if f[5] > float64(p.MaxNewRequests) {
-		return kv.EngineStepTiming{}, fmt.Errorf("worker-new count outside profile: %v", f[5])
-	}
+	report := profileReporter{c.warnings, "worker_metadata", p.Provenance}
+	report.above("new_requests", int64(f[5]), p.MaxNewRequests)
 	x := p.Compute
 	if single {
 		x = p.SingleToken

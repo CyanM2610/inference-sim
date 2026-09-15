@@ -25,13 +25,16 @@ func TestPromotionDecisionCostChargesAttemptsAndBoundsRetention(t *testing.T) {
 	}
 	v.Capabilities.PromotionRetention = "request"
 	c.Limits.MaxPromotionBlocks = 5
-	if _, err = c.Estimate(v, p); err == nil {
-		t.Fatal("promotion block range silently extrapolated")
+	warned := ""
+	c.SetProfileWarningObserver(func(parameter string, _, _ int64) { warned = parameter })
+	if fee, err := c.Estimate(v, p); err != nil || fee.ExtraUS != 47 || warned != "promotion_blocks" {
+		t.Fatal("promotion block extrapolation rejected, clipped or silent", fee, err)
 	}
 	c.Limits.MaxPromotionBlocks = 6
 	c.Limits.MaxPromotionActions = 1
-	if _, err = c.Estimate(v, p); err == nil {
-		t.Fatal("promotion action count silently extrapolated")
+	warned = ""
+	if fee, err := c.Estimate(v, p); err != nil || fee.ExtraUS != 47 || warned != "promotion_actions" {
+		t.Fatal("promotion count extrapolation rejected, clipped or silent", fee, err)
 	}
 	c.Limits.MaxPromotionActions = 2
 	c.PerPromotionBlockUS = math.MaxInt64

@@ -14,6 +14,7 @@ import (
 // for residual metadata/worker bookkeeping, never their full parent intervals.
 // An explicit zero selects the lower sensitivity endpoint, not a measured zero.
 type SpillServiceCostConfig struct {
+	profileReporter
 	Mode                     string                       `json:"mode"`
 	Stages                   map[string]QueueServiceCurve `json:"stages"`
 	MaxRequests              int                          `json:"max_requests"`
@@ -38,16 +39,18 @@ func configureSpillService(c Config, p *QueueServiceCostConfig) error {
 		return nil
 	}
 	x := *p.Spill
+	x.profileReporter = c.profile("spill_service", x.Provenance)
 	if !d.RequestSpill || d.PreemptionStorage == nil || d.PreemptionStorage.Mode != x.Mode ||
 		(x.Mode != "spill" && x.Mode != "recompute" && x.Mode != "budget") ||
 		c.DecisionEstimates == nil || !c.DecisionEstimates.Spill || d.BudgetRestore.ReestimateOnDecodeDrop ||
 		c.Mechanisms == nil || c.Mechanisms.BackgroundStoreMode != "on_preemption" || c.Mechanisms.BackgroundStorePool != "dram" ||
 		len(c.Pools) != 1 || c.Pools[0].ID != "dram" || c.BlockTokens != 16 ||
-		x.MaxRequests <= 0 || len(c.Requests) > x.MaxRequests || x.MaxSourceBlocks <= 0 ||
+		x.MaxRequests <= 0 || x.MaxSourceBlocks <= 0 ||
 		x.NativeBoundaryExtraUS == nil || *x.NativeBoundaryExtraUS < 0 || strings.TrimSpace(x.NativeBoundaryProvenance) == "" ||
 		strings.TrimSpace(x.Provenance) == "" || strings.TrimSpace(x.Coverage) == "" {
 		return fmt.Errorf("spill service requires a declared on-preemption DRAM policy, estimates, scope and residual allowance")
 	}
+	x.above("requests", int64(len(c.Requests)), int64(x.MaxRequests))
 	if p.Stages["action"].CoefficientsUS == nil {
 		return fmt.Errorf("spill service requires a measured native preempt action in the base profile")
 	}
@@ -127,6 +130,10 @@ func SpillDecisionCounts(v sim.DecisionView, p sim.DecisionPlan, mode string) (m
 // component data cover fresh complete prefixes, successful full STORE or explicit
 // recompute. Partial/reused/pending/capacity-fallback actions need new coverage.
 func SpillExecutionCounts(v sim.DecisionView, p sim.DecisionPlan, f sim.DecisionFeedback, maxSourceBlocks int64) (map[string][]int64, error) {
+	return spillExecutionCounts(v, p, f, maxSourceBlocks, profileReporter{component: "spill_service"})
+}
+
+func spillExecutionCounts(v sim.DecisionView, p sim.DecisionPlan, f sim.DecisionFeedback, maxSourceBlocks int64, report profileReporter) (map[string][]int64, error) {
 	if v.Version != p.Version || f.Version != v.Version || f.Status != "applied" || !v.Capabilities.RequestSpill ||
 		len(f.Preemptions) != len(f.PreemptionStorage) || maxSourceBlocks <= 0 {
 		return nil, fmt.Errorf("spill service requires complete actual preemption feedback")
@@ -168,12 +175,13 @@ func SpillExecutionCounts(v sim.DecisionView, p sim.DecisionPlan, f sim.Decision
 				}
 			}
 		}
-		if target == nil || target.CompleteBlocks <= 0 || target.CompleteBlocks > maxSourceBlocks ||
+		if target == nil || target.CompleteBlocks <= 0 ||
 			target.MissingBlocks != target.CompleteBlocks || target.ReadyBlocks != 0 || target.PendingBlocks != 0 ||
 			v.BlockTokens <= 0 || victim.ComputedTokensBefore/v.BlockTokens != target.CompleteBlocks ||
 			victim.ComputedTokensBefore%v.BlockTokens != target.TailTokens {
 			return nil, fmt.Errorf("actual spill source is outside evaluated fresh-prefix scope")
 		}
+		report.above("source_blocks", target.CompleteBlocks, maxSourceBlocks)
 		switch a.Mode {
 		case "spill":
 			if a.Pool != "dram" || o.Pool != a.Pool || o.Status != "spill_pending" || o.NewBlocks != target.CompleteBlocks ||
@@ -208,9 +216,10 @@ func (m *queueServiceCost) addSpillService(base sim.DecisionCostEstimate, counts
 			return sim.DecisionCostEstimate{}, fmt.Errorf("missing spill work %s", name)
 		}
 		for i, n := range work {
-			if n < 0 || n > curve.MaxCounts[i] {
-				return sim.DecisionCostEstimate{}, fmt.Errorf("spill %s feature %d exceeds evaluated scope: %d", name, i, n)
+			if n < 0 {
+				return sim.DecisionCostEstimate{}, fmt.Errorf("negative spill %s feature %d: %d", name, i, n)
 			}
+			p.above(fmt.Sprintf("%s.feature_%d", name, i), n, curve.MaxCounts[i])
 			total += float64(n) * curve.CoefficientsUS[i]
 		}
 	}

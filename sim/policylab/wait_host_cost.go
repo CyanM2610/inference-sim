@@ -11,6 +11,7 @@ import (
 // RegistrationUS is the complete measured registration service and REPLACES
 // external enqueue. Nil stages are disabled; zero is an explicit observation.
 type WaitHostServiceCostConfig struct {
+	profileReporter
 	Family              string              `json:"family"`
 	CompletionRatesUS   []int64             `json:"completion_rates_us,omitempty"`
 	MaxCompletionCounts []int64             `json:"max_completion_counts,omitempty"`
@@ -29,6 +30,7 @@ func newWaitHostServiceCost(c Config) (*waitHostServiceCost, error) {
 		return nil, fmt.Errorf("wait host profile cannot share a boundary with an existing host profile")
 	}
 	p := *c.DecisionPolicy.WaitHostServiceCost
+	p.profileReporter = c.profile("wait_host", p.Provenance)
 	if err := validateWaitServiceScope(c, p.Family, p.Shape, p.HBMBlocks, p.MaxInputTokens, p.MaxOutputTokens, p.Provenance); err != nil {
 		return nil, err
 	}
@@ -101,9 +103,7 @@ func (m *waitHostServiceCost) EstimateHostService(w sim.HostServiceWork) (sim.De
 			return sim.DecisionCostEstimate{}, err
 		}
 		for i, n := range counts {
-			if n > p.MaxCompletionCounts[i] {
-				return sim.DecisionCostEstimate{}, fmt.Errorf("wait completion feature %d exceeds profile coverage: %d", i, n)
-			}
+			p.above(fmt.Sprintf("completion.feature_%d", i), n, p.MaxCompletionCounts[i])
 			rate := p.CompletionRatesUS[i]
 			if n > 0 && rate > (math.MaxInt64-total)/n {
 				return sim.DecisionCostEstimate{}, fmt.Errorf("wait completion fee overflow")
