@@ -322,6 +322,19 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 	if e := p.entries[hash]; e != nil {
 		return e, false
 	}
+	if policy, ok := p.policy.(PoolAdmissionPolicy); ok {
+		decision := policy.Admit(PoolAdmissionContext{Hash: hash, CapacityBlocks: p.config.CapacityBlocks,
+			UsedBlocks: int64(len(p.entries)), Candidates: p.evictionCandidates()})
+		accepted := int64(0)
+		if decision.Accept {
+			accepted = 1
+		}
+		f.emit(PeerRecord{Time: now, Name: "l2_admission_decision", Destination: pool, Hash: hash,
+			Reason: decision.Reason, Counters: map[string]int64{"accepted": accepted}})
+		if !decision.Accept {
+			return nil, false
+		}
+	}
 	if int64(len(p.entries)) == p.config.CapacityBlocks {
 		victim := p.evictionVictim()
 		if victim == nil {

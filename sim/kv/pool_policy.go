@@ -31,6 +31,22 @@ type PoolEvictionPolicy interface {
 	Victim([]PoolEvictionCandidate) string
 }
 
+// PoolAdmissionPolicy is optional. It receives an independent snapshot before
+// an incoming block can evict a copy or reserve capacity. Existing hits/joined
+// stores bypass admission; they require no new physical allocation.
+type PoolAdmissionContext struct {
+	Hash                       string
+	CapacityBlocks, UsedBlocks int64
+	Candidates                 []PoolEvictionCandidate
+}
+type PoolAdmissionDecision struct {
+	Accept bool
+	Reason string
+}
+type PoolAdmissionPolicy interface {
+	Admit(PoolAdmissionContext) PoolAdmissionDecision
+}
+
 // TimestampLRU preserves the original time/hash tie-break for frozen baselines.
 type TimestampLRU struct{}
 
@@ -133,18 +149,14 @@ func (f *PeerFabric) poolPolicyEvent(pool, kind, request string, keys []string, 
 }
 
 func (p *peerPool) evictionVictim() *peerEntry {
-	var candidates []PoolEvictionCandidate
+	candidates := p.evictionCandidates()
 	allowed := map[string]bool{}
-	for _, e := range p.entries {
-		if e.ready && e.readers == 0 {
-			candidates = append(candidates, PoolEvictionCandidate{Hash: e.hash, LastAccessUS: e.last})
-			allowed[e.hash] = true
-		}
+	for _, c := range candidates {
+		allowed[c.Hash] = true
 	}
 	if len(candidates) == 0 {
 		return nil
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Hash < candidates[j].Hash })
 	key := p.policy.Victim(candidates)
 	if key == "" {
 		return nil
@@ -153,6 +165,17 @@ func (p *peerPool) evictionVictim() *peerEntry {
 		panic("pool policy selected a non-evictable copy")
 	}
 	return p.entries[key]
+}
+
+func (p *peerPool) evictionCandidates() []PoolEvictionCandidate {
+	var candidates []PoolEvictionCandidate
+	for _, e := range p.entries {
+		if e.ready && e.readers == 0 {
+			candidates = append(candidates, PoolEvictionCandidate{Hash: e.hash, LastAccessUS: e.last})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Hash < candidates[j].Hash })
+	return candidates
 }
 
 // touchRequestPools reports currently resident input-prefix accesses, not

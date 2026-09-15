@@ -15,12 +15,14 @@ type PeerTarget struct {
 	QueueUS   int64
 }
 type PeerReclaimContext struct {
-	Candidates []PeerCandidate
-	Targets    []PeerTarget
+	Candidates     []PeerCandidate
+	Targets        []PeerTarget
+	ResidentHashes []string // includes protected resident descendants
 }
 type PeerDecision struct {
 	BlockID int64
 	Pool    string
+	Decline bool // no eligible victim; runtime waits instead of fabricating space
 } // empty Pool means drop
 type PeerPolicy interface {
 	// Choose receives a detached candidate/target snapshot. The runtime retains
@@ -30,8 +32,9 @@ type PeerPolicy interface {
 
 func cloneReclaimContext(c PeerReclaimContext) PeerReclaimContext {
 	copy := PeerReclaimContext{
-		Candidates: append([]PeerCandidate(nil), c.Candidates...),
-		Targets:    append([]PeerTarget(nil), c.Targets...),
+		Candidates:     append([]PeerCandidate(nil), c.Candidates...),
+		Targets:        append([]PeerTarget(nil), c.Targets...),
+		ResidentHashes: append([]string(nil), c.ResidentHashes...),
 	}
 	for i := range copy.Candidates {
 		copy.Candidates[i].ReadyCopies = append([]string(nil), c.Candidates[i].ReadyCopies...)

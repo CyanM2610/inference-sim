@@ -340,32 +340,34 @@ func (p *PeerEnginePhases) begin(now int64, work []sim.BatchWork, done func(int6
 				post := base + t.PostForwardUS + delay
 				p.schedule(post, func(at int64) {
 					p.emit(at, "engine_post_forward", nil)
-					loadEnd := p.submit(at, gpuReady, true)
-					p.schedule(loadEnd+t.PollUS, func(poll int64) {
-						p.emit(poll, "engine_worker_poll", nil)
-						completed := p.completed() // only this poll's snapshot can be adopted
-						end := max(poll, outputReady) + t.TailUS
-						p.schedule(end, func(at int64) {
-							publish := func(at int64) {
-								for _, j := range completed {
-									p.emit(at, "transfer_adopted", j)
-									j.done(at)
-									delete(p.jobs, j.record.Transaction)
-									p.store.fabric.notifyDecisionTransfer(at, j)
+					p.store.afterHotPrefixPlacement(at, work, func(at int64) {
+						loadEnd := p.submit(at, gpuReady, true)
+						p.schedule(loadEnd+t.PollUS, func(poll int64) {
+							p.emit(poll, "engine_worker_poll", nil)
+							completed := p.completed() // only this poll's snapshot can be adopted
+							end := max(poll, outputReady) + t.TailUS
+							p.schedule(end, func(at int64) {
+								publish := func(at int64) {
+									for _, j := range completed {
+										p.emit(at, "transfer_adopted", j)
+										j.done(at)
+										delete(p.jobs, j.record.Transaction)
+										p.store.fabric.notifyDecisionTransfer(at, j)
+									}
+									p.emit(at, "engine_adopt", nil)
+									p.store.fabric.wakeStores(at)
+									p.active = false
+									if p.observe != nil {
+										p.observe(now, at, work)
+									}
+									done(at)
 								}
-								p.emit(at, "engine_adopt", nil)
-								p.store.fabric.wakeStores(at)
-								p.active = false
-								if p.observe != nil {
-									p.observe(now, at, work)
+								if p.completionBarrier != nil {
+									p.completionBarrier(at, work, publish)
+								} else {
+									publish(at)
 								}
-								done(at)
-							}
-							if p.completionBarrier != nil {
-								p.completionBarrier(at, work, publish)
-							} else {
-								publish(at)
-							}
+							})
 						})
 					})
 				})

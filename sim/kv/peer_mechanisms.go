@@ -11,9 +11,9 @@ import (
 // PeerMechanisms contains opt-in control/scheduling experiments. Zero values
 // preserve the original peer-L2 behavior and deterministic event stream.
 type PeerMechanisms struct {
-	// Empty/continuous preserves eager background saving. on_preemption still
-	// publishes completed HBM blocks, but skips background copies. Reclaim policy
-	// remains separate and can also initiate a store.
+	// Empty/continuous preserves eager background saving. on_preemption and
+	// on_reclaim publish completed HBM blocks but skip eager copies. The former
+	// allows explicit request-spill decisions; the latter stores on reclamation.
 	BackgroundStoreMode string `json:"background_store_mode,omitempty"`
 	// BackgroundStorePool saves computed full input blocks without evicting the
 	// HBM copy. Reclaim remains a separate policy decision; empty preserves the
@@ -48,9 +48,9 @@ type PeerOnlinePromotion struct {
 func (m PeerMechanisms) Validate() error {
 	switch m.BackgroundStoreMode {
 	case "", "continuous":
-	case "on_preemption":
+	case "on_preemption", "on_reclaim":
 		if m.BackgroundStorePool == "" {
-			return fmt.Errorf("on_preemption storage requires a background store pool")
+			return fmt.Errorf("%s storage requires a background store pool", m.BackgroundStoreMode)
 		}
 	default:
 		return fmt.Errorf("unknown background store mode %q", m.BackgroundStoreMode)
