@@ -5,12 +5,23 @@ package hash
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"strconv"
 
 	"github.com/inference-sim/inference-sim/sim/internal/tokenid"
 )
+
+// HashTokenLineage preserves the native runtime's causal token identity format:
+// 32 raw previous-digest bytes followed by one little-endian uint32 token. This
+// is distinct from HashBlock's textual block encoding; do not interchange them.
+func HashTokenLineage(previous [32]byte, token tokenid.TokenID) [32]byte {
+	var input [36]byte
+	copy(input[:32], previous[:])
+	binary.LittleEndian.PutUint32(input[32:], uint32(token))
+	return sha256.Sum256(input[:])
+}
 
 // HashBlock computes a SHA256 hash of a token block chained with the previous block's hash.
 // Format: prevHash bytes, then for each token: "tokenN" + "|" (pipe AFTER each token).
