@@ -66,6 +66,9 @@ type SimConfig struct {
 	// Simulation control (no sub-config — no factory uses only these)
 	Horizon int64
 	Seed    int64
+	// BatchCompletionEvents separates execution from completion for shared KV experiments.
+	// The default retains the original step model.
+	BatchCompletionEvents bool
 
 	// Module-scoped sub-configs (R16)
 	KVCacheConfig
@@ -106,8 +109,10 @@ type Simulator struct {
 	// In vLLM, running is a list (not queue) of requests, hence we don't call it RunningQ here.
 	// Requests are ordered by First-Come-First-Served in WaitQ, and the same order is maintained
 	// while adding requests to RunningBatch
-	RunningBatch *Batch
-	Metrics      *Metrics
+	RunningBatch          *Batch
+	Metrics               *Metrics
+	EventObserver         func(Event, bool) // before/after execution; observation only
+	batchCompletionEvents bool
 	// max number of requests RunningBatch can hold
 	maxNumSeqs int64
 	// max total number of new tokens across all requests in RunningBatch
@@ -118,9 +123,9 @@ type Simulator struct {
 	// map of request IDs to total num computed tokens (including cached tokens)
 	reqNumComputedTokens map[string]int64
 	batchFormation       BatchFormation
-	model       string
-	gpu         string
-	maxModelLen int64 // max total sequence length (0 = unlimited)
+	model                string
+	gpu                  string
+	maxModelLen          int64 // max total sequence length (0 = unlimited)
 	// Speculative decoding / MTP (#1528). specEnabled gates ALL spec-decode behavior;
 	// when false every decode path is byte-identical to a pre-feature build (INV-6).
 	// specTokensPerStep is the mean accepted tokens/step (1+α·K) consumed by the
@@ -130,6 +135,9 @@ type Simulator struct {
 	rng               *PartitionedRNG // partitioned RNG for deterministic multi-subsystem simulation
 	sloMap            *SLOPriorityMap // vLLM-convention priority mapping for instance-level scheduling
 	scheduler         InstanceScheduler
+	decision          *decisionRuntime
+	hostServices      *hostServiceRuntime
+	postStep          *postStepRuntime
 	latencyModel      LatencyModel
 	// residentAdapters tracks this instance's finite resident LoRA adapter slots
 	// (capacity-bounded LRU). nil when the LoRA subsystem is inert (no adapters /
@@ -194,6 +202,7 @@ func NewSimulator(cfg SimConfig, kvStore KVStore, latencyModel LatencyModel) (*S
 
 	s := &Simulator{
 		Clock:                     0,
+		batchCompletionEvents:     cfg.BatchCompletionEvents,
 		Horizon:                   cfg.Horizon,
 		eventQueue:                make(EventQueue, 0),
 		WaitQ:                     &WaitQueue{},
@@ -325,7 +334,14 @@ func (sim *Simulator) ProcessNextEvent() Event {
 
 	sim.Clock = ev.Timestamp()
 	logrus.Debugf("[tick %07d] Executing %T", sim.Clock, ev)
+	if sim.EventObserver != nil {
+		sim.EventObserver(ev, true)
+	}
 	ev.Execute(sim)
+	sim.refreshDecisionTimer(sim.Clock)
+	if sim.EventObserver != nil {
+		sim.EventObserver(ev, false)
+	}
 	return ev
 }
 
@@ -496,7 +512,17 @@ func (sim *Simulator) SimHorizon() int64 { return sim.Horizon }
 // with pending work. Used by gateway eviction to maintain INV-8 after removing
 // the last request from RunningBatch.
 func (sim *Simulator) ScheduleStepIfIdle(time int64) {
-	if sim.stepEvent == nil && sim.WaitQ.Len() > 0 {
+	work := sim.WaitQ.Len() > 0 || sim.pendingRegistrations() ||
+		(sim.decision != nil && (sim.decision.prefillWaits || sim.decision.prefillDeferrals) && sim.RunningBatch != nil && len(sim.RunningBatch.Requests) > 0)
+	if sim.postStep != nil && sim.postStep.active {
+		sim.postStep.revisit = sim.postStep.revisit || work
+		return
+	}
+	if sim.hostServices != nil && sim.hostServices.pending != nil && work {
+		sim.hostServices.pending.revisit = true
+		return
+	}
+	if sim.stepEvent == nil && work {
 		step := &StepEvent{time: time}
 		sim.stepEvent = step
 		sim.Schedule(step)
@@ -532,6 +558,7 @@ func (sim *Simulator) PostDecodeFixedOverhead() int64 {
 // before entering the engine. The control plane never peeks at len(OutputTokens) —
 // respecting the oracle knowledge boundary (INV-9, #567).
 func (sim *Simulator) EnqueueRequest(r *Request) {
+	sim.notePostStepInput(r)
 	// Guard -1: Already timed out (race: TimeoutEvent fired before QueuedEvent).
 	// Request was timed out during the queueing delay (alpha overhead) before the server
 	// processed the input. TotalInputTokens is NOT counted for this path.
@@ -614,6 +641,7 @@ func (sim *Simulator) EnqueueRequest(r *Request) {
 	if r.Deadline > 0 && r.Deadline <= sim.Clock {
 		r.State = StateTimedOut
 		sim.Metrics.TimedOutRequests++
+		sim.notifyDecisionEvent(DecisionEvent{Kind: "request_timed_out", OccurredUS: sim.Clock, Request: r.ID, Reason: "past_due_at_enqueue"})
 		if sim.OnRequestDone != nil {
 			for _, next := range sim.OnRequestDone(r, sim.Clock) {
 				sim.InjectArrival(next)
@@ -632,7 +660,7 @@ func (sim *Simulator) EnqueueRequest(r *Request) {
 	}
 	r.Priority = float64(sim.sloMap.InvertForVLLM(r.SLOClass))
 
-	sim.WaitQ.Enqueue(r)
+	sim.registerOrEnqueue(r)
 
 	// Schedule timeout event (after all guards + enqueue — BC-5)
 	// Skip scheduling when deadline > horizon (perf: avoids orphaned events)
@@ -660,6 +688,7 @@ func (sim *Simulator) EnqueueDecodeSubRequest(r *Request, clusterTime int64) {
 	r.Priority = float64(sim.sloMap.InvertForVLLM(r.SLOClass))
 
 	sim.WaitQ.Enqueue(r)
+	sim.notifyDecisionEvent(DecisionEvent{Kind: "request_arrived", OccurredUS: max(sim.Clock, clusterTime), Request: r.ID})
 	// Do NOT add len(r.InputTokens) to TotalInputTokens — already counted by prefill sub-request.
 
 	// Schedule timeout for decode sub-request (R23: parity with EnqueueRequest)
@@ -817,23 +846,112 @@ func (sim *Simulator) recordRequestCompletion(req *Request) {
 // sim.stepEvent here prevents future QueuedEvent INV-8 guards from seeing a stale
 // non-nil pointer and skipping their step-scheduling.
 func (sim *Simulator) Step(now int64) {
-	if sim.RunningBatch == nil && sim.WaitQ.Len() == 0 {
-		sim.stepEvent = nil
+	if sim.postStep != nil && sim.postStep.active {
 		return
 	}
-	sim.scheduleBatch(now)
+	if sim.hostServices != nil && sim.hostServices.pending != nil {
+		return
+	}
+	if sim.decision != nil && sim.decision.executionPending != nil {
+		return
+	}
+	if sim.decision != nil && sim.decision.pending != nil {
+		return // The decision service owns the next formation, not a wakeup.
+	}
+	if sim.beginDriverLoop(now) {
+		return
+	}
+	if sim.beginRegistrationService(now) {
+		return
+	}
+	if sim.postStep != nil && sim.postStep.loopCosts && !sim.driverHasCurrentWork() {
+		// An empty Batch pointer is not an engine operation. This is the
+		// synchronous runner's no-work gate, including cancelled input.
+		sim.finishDriverWithoutOutput(now)
+		return
+	}
+	if sim.decision != nil && sim.decision.controlSteps && sim.WaitQ.Len() == 0 && (sim.RunningBatch == nil || len(sim.RunningBatch.Requests) == 0) {
+		sim.RunningBatch = nil
+		if pendingEngineWork(sim.KVCache) || sim.pendingDecisionControl() {
+			sim.beginDecisionControl(now)
+			return
+		}
+		sim.finishDriverWithoutOutput(now)
+		return
+	}
+	if sim.RunningBatch == nil && sim.WaitQ.Len() == 0 {
+		if sim.batchCompletionEvents && pendingEngineWork(sim.KVCache) && sim.beginAsyncBatch(now) {
+			return
+		}
+		sim.finishDriverWithoutOutput(now)
+		return
+	}
+	preemptionsBefore := sim.Metrics.PreemptionCount
+	if !sim.scheduleBatch(now) {
+		return
+	}
+	sim.executeScheduledBatch(now, preemptionsBefore)
+}
+
+func (sim *Simulator) executeScheduledBatch(now int64, preemptionsBefore int64) {
+	if sim.decision != nil && sim.decision.executionPending != nil {
+		return
+	}
+	if sim.batchCompletionEvents {
+		if len(sim.RunningBatch.Requests) == 0 || sim.prefillWaitsLeaveNoWork() {
+			if pendingEngineWork(sim.KVCache) && sim.beginAsyncBatch(now) {
+				return
+			}
+			sim.completeHostService(now, nil, func(at int64) {
+				sim.finishPostStep(at, func(end int64) { sim.finishEmptyScheduledBatch(end, preemptionsBefore) })
+			})
+			return
+		}
+		if sim.beginAsyncBatch(now) {
+			return
+		}
+		if sim.hostServices != nil && sim.hostServices.completion {
+			panic("completion service backend declined a nonempty batch")
+		}
+		duration := sim.batchStepDuration()
+		ev := &BatchCompleteEvent{At: now + duration, Start: now, Duration: duration}
+		for _, r := range sim.RunningBatch.Requests {
+			if r.NumNewTokens > 0 {
+				ev.Requests = append(ev.Requests, r.ID)
+			}
+		}
+		sim.Schedule(ev)
+		sim.stepEvent = ev
+		return
+	}
 	currStepAdvance := sim.executeBatchStep(now)
-	// Mirror in-use blocks to CPU tier (no-op for single-tier KVCacheState).
-	// Runs after execution (new full blocks exist) and before completions
-	// (completing requests' blocks are still in-use and can be mirrored).
+	// Mirror before completion releases request ownership.
 	sim.KVCache.MirrorToCPU(sim.RunningBatch.Requests)
 	remaining := sim.processCompletions(now, currStepAdvance)
 	sim.scheduleNextStep(now, currStepAdvance, remaining)
 }
 
+func (sim *Simulator) finishEmptyScheduledBatch(now, preemptionsBefore int64) {
+	if sim.Metrics.PreemptionCount > preemptionsBefore && sim.WaitQ.Len() > 0 {
+		// Preemption freed capacity but the current formation pass
+		// deliberately skips waiting admissions. Retry that pass;
+		// there may be no pending transfer/arrival to wake us later.
+		// Retry only after actual progress, never spin on a blocked KV.
+		sim.stepEvent = &StepEvent{time: now}
+		sim.Schedule(sim.stepEvent)
+		return
+	}
+	// A KV completion or a new arrival will wake the engine.
+	sim.stepEvent = nil
+	if sim.pendingRegistrations() {
+		sim.ScheduleStepIfIdle(now)
+	}
+	sim.resumeExpiredPrefillWait(now)
+}
+
 // scheduleBatch handles Phase 1: priority assignment, queue reordering, batch formation,
 // and event scheduling for preemptions and newly scheduled requests.
-func (sim *Simulator) scheduleBatch(now int64) {
+func (sim *Simulator) scheduleBatch(now int64) bool {
 	sim.stepCount += 1
 
 	// Synchronize KV cache clock for thrashing detection (no-op for single-tier KVCacheState)
@@ -845,6 +963,20 @@ func (sim *Simulator) scheduleBatch(now int64) {
 	sim.WaitQ.Reorder(func(reqs []*Request) {
 		sim.scheduler.OrderQueue(reqs, now)
 	})
+	tokenCaps := sim.prepareDecision(now)
+	if sim.decision != nil && sim.decision.pending != nil {
+		return false
+	}
+	sim.formScheduledBatch(now, tokenCaps, nil)
+	return true
+}
+
+// late requests arrived while the decision service was busy. They are excluded
+// from this formation only, then restored before observations or execution.
+func (sim *Simulator) formScheduledBatch(now int64, tokenCaps map[string]int64, late []*Request) {
+	if backend, ok := sim.KVCache.(BatchPrefixStore); ok && backend.BatchPrefixReuseEnabled() && !sim.batchCompletionEvents {
+		panic("same-batch prefix reuse requires batch completion events")
+	}
 
 	// Cold-load pre-admission gate (LoRA, #1466): if the wait-queue head is a cold
 	// adapter request and no load is in flight, start a serialized per-instance
@@ -867,6 +999,22 @@ func (sim *Simulator) scheduleBatch(now int64) {
 		Now:                   now,
 		StepCount:             sim.stepCount,
 		ComputedTokens:        sim.reqNumComputedTokens,
+		TokenLimits:           tokenCaps,
+		RunningEligible:       sim.runningWaitGate(now),
+	}
+	if sim.decision != nil && sim.decision.batchTokenCap > 0 {
+		batchCtx.MaxNumBatchedTokens = min(batchCtx.MaxNumBatchedTokens, sim.decision.batchTokenCap)
+	}
+	if sim.decision != nil {
+		batchCtx.ObserveExecutionWork = sim.decision.executionWork
+		batchCtx.PrefillPreemptions = sim.decision.prefillPreemptions
+		batchCtx.PreemptionStorage = sim.decision.preemptionStorage
+		batchCtx.CapacityVictims = sim.decision.capacityVictims
+	}
+	if sim.decision != nil && (len(sim.decision.waits) > 0 || sim.decision.admission != nil) {
+		batchCtx.WaitingEligible = func(r *Request) bool {
+			return sim.decisionWaitsUntil(r.ID) <= now && (sim.decision.admission == nil || sim.decision.admission[r.ID])
+		}
 	}
 	if sim.residentAdapters != nil {
 		batchCtx.AdapterResident = sim.residentAdapters.IsResident
@@ -880,11 +1028,20 @@ func (sim *Simulator) scheduleBatch(now int64) {
 
 	// Apply result: update running batch
 	sim.RunningBatch = batchResult.RunningBatch
+	for _, req := range late {
+		sim.WaitQ.Enqueue(req)
+	}
+	sim.prepareExecutionService(now, batchResult, false)
+	sim.finishDecision(batchResult)
 
 	// Record preemption metrics and emit debug log for each preempted request
 	for _, p := range batchResult.Preempted {
 		logrus.Debugf("<< Preemption: %s at %d ticks", p.Request.ID, now)
 		sim.Metrics.PreemptionCount++
+		if p.Reason == "policy_prefill" || p.Reason == "policy_capacity_prefill" {
+			sim.notifyDecisionEvent(DecisionEvent{Kind: "request_preempted", Request: p.Request.ID, OccurredUS: now, Reason: p.Reason,
+				Batch: []DecisionProgress{{Request: p.Request.ID, ComputedTokens: p.ComputedTokensBefore}}})
+		}
 	}
 
 	// Schedule events for newly scheduled requests and record scheduling metrics
@@ -1042,6 +1199,10 @@ func (sim *Simulator) commitDecodeTokens(req *Request) {
 // executeBatchStep handles Phase 2: model execution (prefill + decode) for all requests
 // in the running batch. Returns the step time advance in ticks.
 func (sim *Simulator) executeBatchStep(now int64) int64 {
+	return sim.executeBatchDuration(now, sim.batchStepDuration())
+}
+
+func (sim *Simulator) batchStepDuration() int64 {
 	// Match vLLM's scheduled_running_reqs: only requests that were allocated
 	// tokens by FormBatch participate in the forward pass latency computation.
 	// Requests with NumNewTokens=0 (past Phase 1 break point, token budget
@@ -1066,19 +1227,30 @@ func (sim *Simulator) executeBatchStep(now int64) int64 {
 	// All LatencyModel implementations must return >= 1 per interface contract;
 	// this floor catches violations that would cause infinite livelock.
 	currStepAdvance = max(1, currStepAdvance)
+	return currStepAdvance
+}
+
+func (sim *Simulator) executeBatchDuration(now, currStepAdvance int64) int64 {
 
 	// Subprocess: Model Execution - this could be prefill or decode depending on the request.
 	// similar to vLLM's execute_model()
 	// Note: Per-request TTFT fields (FirstTokenTime, RequestTTFTs) are recorded inline
 	// because they are tightly coupled to the prefill/decode state transitions in this
-	// loop. Safety across preemption comes from the !req.TTFTSet guard below (TTFTSet is
-	// reset to false on preemption by batch_formation.go), not from overwrite idempotency —
-	// the guard ensures the block fires exactly once per prefill completion so FirstTokenTime
-	// always reflects the final re-prefill. TTFTSum and TotalOutputTokens are computed at
-	// completion time in recordRequestCompletion to avoid double-counting when a preempted
-	// request re-runs from ProgressIndex=0.
+	// loop. History-aware backends preserve TTFT and emitted tokens across KV
+	// eviction; their replay branch rebuilds KV without re-emitting known output.
+	// Legacy backends retain their existing reset semantics. Aggregate TTFT and
+	// output counts are still recorded once at request completion.
 	for _, req := range sim.RunningBatch.Requests {
-		if req.ProgressIndex < req.InputLen() {
+		if req.recomputeUntil > 0 && req.ProgressIndex < req.recomputeUntil {
+			req.ProgressIndex = sim.reqNumComputedTokens[req.ID]
+			if req.ProgressIndex == req.recomputeUntil && req.NumNewTokens > 0 {
+				// Replaying the final observed token produces the next output.
+				// Intermediate chunks only rebuild KV and never emit duplicates.
+				at := now + currStepAdvance + sim.latencyModel.OutputTokenProcessingTime()
+				req.ITL = append(req.ITL, at-req.lastOutputTime)
+				req.lastOutputTime = at
+			}
+		} else if req.ProgressIndex < req.InputLen() {
 			req.ProgressIndex = sim.reqNumComputedTokens[req.ID]
 			// ToDo: Go through the newly allocated blocks for this request;
 			// Make sure they are cached, if they're full
@@ -1093,7 +1265,13 @@ func (sim *Simulator) executeBatchStep(now int64) int64 {
 				// per output token, so a step emitting g tokens pays g×OTPT. At the
 				// feature-off default NumNewTokens==1 ⇒ +=1 and 1×OTPT ⇒ byte-identical.
 				req.ProgressIndex += int64(req.NumNewTokens)
-				req.ITL = append(req.ITL, currStepAdvance+int64(req.NumNewTokens)*sim.latencyModel.OutputTokenProcessingTime())
+				at := now + currStepAdvance + int64(req.NumNewTokens)*sim.latencyModel.OutputTokenProcessingTime()
+				interval := currStepAdvance + int64(req.NumNewTokens)*sim.latencyModel.OutputTokenProcessingTime()
+				if req.preservedOutputTokens > 0 {
+					interval = at - req.lastOutputTime
+				}
+				req.ITL = append(req.ITL, interval)
+				req.lastOutputTime = at
 				if sim.specEnabled {
 					// Commit the carry with the GRANTED count (after FormBatch caps), so a
 					// budget/MaxModelLen-capped step keeps the ungranted fraction — no drift.
@@ -1101,15 +1279,12 @@ func (sim *Simulator) executeBatchStep(now int64) int64 {
 				}
 			}
 		}
-		// !req.TTFTSet guard: fires once per prefill completion (including re-prefill after
-		// preemption). TTFTSet is reset to false on preemption (batch_formation.go) so this
-		// block fires again on re-prefill, overwriting FirstTokenTime with the correct
-		// post-preemption TTFT. req.FirstTokenTime is a scalar assignment (not an
-		// accumulation), so overwriting it is safe. TTFTSum is not accumulated here;
-		// it is accumulated exactly once at completion time in recordRequestCompletion.
+		// A history-aware replay retains TTFTSet and cannot overwrite the first
+		// observed output. Legacy re-prefill keeps its previous behavior here.
 		if req.ProgressIndex == req.InputLen() && !req.TTFTSet {
 			req.TTFTSet = true
 			req.FirstTokenTime = now + currStepAdvance + sim.latencyModel.OutputTokenProcessingTime() - req.ArrivalTime
+			req.lastOutputTime = req.ArrivalTime + req.FirstTokenTime
 			sim.Metrics.RequestTTFTs[req.ID] = float64(req.FirstTokenTime)
 		}
 	}
@@ -1152,7 +1327,9 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 			// for the final token.
 			// ITL is NOT appended here — executeBatchStep already recorded it
 			// for this decode step (fix for #524 phantom ITL entry).
-			if len(req.OutputTokens) > 0 && req.ProgressIndex < req.InputLen()+util.Len64(req.OutputTokens) {
+			// In completion-event mode the final generated token has never been
+			// fed back through attention, so it has no KV to allocate or store.
+			if !sim.batchCompletionEvents && len(req.OutputTokens) > 0 && req.ProgressIndex < req.InputLen()+util.Len64(req.OutputTokens) {
 				ok := sim.KVCache.AllocateKVBlocks(req, req.ProgressIndex, req.ProgressIndex+1, []int64{})
 				if !ok {
 					logrus.Errorf("[tick %07d] KV allocation failed for completing request %s (request will still complete) — this indicates a cache accounting bug", now, req.ID)
@@ -1172,6 +1349,7 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 
 			// Record completion metrics
 			sim.recordRequestCompletion(req)
+			sim.notifyDecisionEvent(DecisionEvent{Kind: "request_completed", OccurredUS: now + currStepAdvance, Request: req.ID})
 
 			// Invoke completion callback for session management
 			if sim.OnRequestDone != nil {
@@ -1213,6 +1391,7 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 				Request: req,
 			})
 			sim.recordRequestCompletion(req)
+			sim.notifyDecisionEvent(DecisionEvent{Kind: "request_completed", OccurredUS: now + currStepAdvance, Request: req.ID, Reason: "length_capped"})
 
 			// Invoke completion callback for session management (length-capped)
 			if sim.OnRequestDone != nil {
@@ -1256,7 +1435,7 @@ func (sim *Simulator) scheduleNextStep(now, currStepAdvance int64, remaining []*
 		// AdapterLoadCompletionEvent — which re-forms a step on completion via
 		// ScheduleStepIfIdle. Scheduling an empty step here instead would spin one
 		// step per tick for the whole load. Inert when no LoRA (loadingAdapter == "").
-		if sim.WaitQ.Len() > 0 && sim.loadingAdapter == "" {
+		if (sim.WaitQ.Len() > 0 || pendingEngineWork(sim.KVCache) || sim.pendingDecisionControl() || sim.pendingRegistrations()) && sim.loadingAdapter == "" {
 			pbe := StepEvent{time: now + currStepAdvance}
 			sim.Schedule(&pbe)
 			sim.stepEvent = &pbe
