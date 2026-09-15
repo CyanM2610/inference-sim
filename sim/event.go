@@ -221,6 +221,8 @@ func (e *TimeoutEvent) Execute(sim *Simulator) {
 		sim.stepEvent = pbe
 	}
 
+	sim.notifyDecisionEvent(DecisionEvent{Kind: "request_timed_out", OccurredUS: e.time, Request: e.Request.ID})
+
 	// Invoke completion callback for session management
 	if sim.OnRequestDone != nil {
 		for _, next := range sim.OnRequestDone(e.Request, e.time) {
