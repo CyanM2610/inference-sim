@@ -36,6 +36,7 @@ func (s *PeerCache) PromoteRequestPrefix(q sim.DecisionKVQuery, endpoint int64) 
 	if !s.promotionControl || q.ID == "" || endpoint <= 0 || endpoint > int64(max(0, len(q.Input)-1))/s.BlockSizeTokens {
 		panic("invalid trusted prefix promotion")
 	}
+	s.observeCacheLookup(q.ID, q.Input)
 	out := sim.DecisionPromotionOutcome{Request: q.ID, MaxPrefixBlocks: endpoint, Reason: "ready_or_pending"}
 	if len(s.RequestMap[q.ID]) > 0 || (len(s.holds[q.ID]) > 0 && s.readPending[q.ID] == 0) {
 		out.BlockedBlocks, out.Reason = endpoint, "request_has_owned_kv"
