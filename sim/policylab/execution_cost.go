@@ -13,6 +13,7 @@ import (
 // actual preemptions, restore matches]; ActionUS prices native preempt/free once.
 // Other stages and worker reset remain separate coverage obligations.
 type CapacityExecutionCostConfig struct {
+	profileReporter
 	MaxInputTokens  int64               `json:"max_input_tokens"`
 	MaxOutputTokens int                 `json:"max_output_tokens"`
 	HBMBlocks       int64               `json:"hbm_blocks"`
@@ -30,15 +31,16 @@ func newCapacityExecutionCost(c Config) (*capacityExecutionCost, error) {
 		return nil, fmt.Errorf("capacity execution cost requires the single-instance capacity engine-phase path")
 	}
 	p := *c.DecisionPolicy.ExecutionCost
-	if p.MaxInputTokens <= 0 || p.MaxOutputTokens <= 0 || len(c.Instances) != 1 || p.HBMBlocks != c.Instances[0].HBMBlocks {
+	p.profileReporter = c.profile("capacity_execution", p.Provenance)
+	if !validServiceShape(p.Shape) || p.MaxInputTokens <= 0 || p.MaxOutputTokens <= 0 || len(c.Instances) != 1 || p.HBMBlocks <= 0 {
 		return nil, fmt.Errorf("execution profile requires matching HBM geometry and positive input/output bounds")
 	}
-	for _, r := range c.Requests {
-		if int64(len(r.Input)) > p.MaxInputTokens || r.MaxOutputTokens <= 0 || r.MaxOutputTokens > p.MaxOutputTokens {
-			return nil, fmt.Errorf("request exceeds execution profile input/output coverage")
-		}
+	p.equal("hbm_blocks", c.Instances[0].HBMBlocks, p.HBMBlocks)
+	p.profileReporter.shape(p.Shape, serviceShape(c))
+	if err := p.requests(c, p.MaxInputTokens, p.MaxOutputTokens); err != nil {
+		return nil, err
 	}
-	if len(p.RatesUS) != 5 || len(p.MaxCounts) != 4 || p.ActionUS < 0 || strings.TrimSpace(p.Provenance) == "" || p.Shape != serviceShape(c) {
+	if len(p.RatesUS) != 5 || len(p.MaxCounts) != 4 || p.ActionUS < 0 || strings.TrimSpace(p.Provenance) == "" {
 		return nil, fmt.Errorf("invalid capacity execution rates, limits, provenance or geometry")
 	}
 	for _, rates := range [][]int64{p.RatesUS, p.MaxCounts} {
@@ -81,9 +83,10 @@ func (m *capacityExecutionCost) EstimateExecution(w sim.BatchExecutionWork, pree
 		}
 	}
 	for i, n := range counts {
-		if n < 0 || n > m.config.MaxCounts[i] {
-			return sim.DecisionCostEstimate{}, fmt.Errorf("execution feature %d exceeds declared profile coverage: %d", i, n)
+		if n < 0 {
+			return sim.DecisionCostEstimate{}, fmt.Errorf("negative execution feature %d: %d", i, n)
 		}
+		m.config.above(fmt.Sprintf("feature_%d", i), n, m.config.MaxCounts[i])
 	}
 	extra := m.config.RatesUS[0]
 	for i, n := range counts {

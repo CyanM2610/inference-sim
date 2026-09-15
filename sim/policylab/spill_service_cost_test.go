@@ -111,9 +111,11 @@ func TestSpillServiceRejectsUnmeasuredExecutionAndConfiguration(t *testing.T) {
 	if len(active.Feedback.PreemptionStorage) != 1 {
 		t.Fatal("missing actual victim")
 	}
-	if _, err := SpillExecutionCounts(active.View, active.Plan, active.Feedback, 1); err == nil {
-		t.Fatal("source block scope ignored")
+	warnings := &profileWarnings{}
+	if _, err := spillExecutionCounts(active.View, active.Plan, active.Feedback, 1, profileReporter{warnings: warnings, component: "spill_service"}); err != nil {
+		t.Fatal("valid larger spill rejected", err)
 	}
+	requireProfileWarning(t, warnings.snapshot(), "spill_service", "source_blocks")
 	for _, mutate := range []func(*sim.DecisionFeedback){
 		func(f *sim.DecisionFeedback) { f.PreemptionStorage = nil },
 		func(f *sim.DecisionFeedback) { f.PreemptionStorage[0].Request = "other" },
@@ -132,7 +134,7 @@ func TestSpillServiceRejectsUnmeasuredExecutionAndConfiguration(t *testing.T) {
 		func(c *Config) { c.DecisionPolicy.QueueServiceCost.Spill = nil },
 		func(c *Config) { c.DecisionPolicy.QueueServiceCost.Spill.NativeBoundaryExtraUS = nil },
 		func(c *Config) { c.DecisionPolicy.QueueServiceCost.Spill.NativeBoundaryProvenance = "" },
-		func(c *Config) { c.DecisionPolicy.QueueServiceCost.Spill.MaxRequests = 1 },
+		func(c *Config) { c.DecisionPolicy.QueueServiceCost.Spill.MaxRequests = 0 },
 		func(c *Config) { c.DecisionPolicy.QueueServiceCost.Spill.Mode = "budget" },
 		func(c *Config) { c.DecisionPolicy.RequestSpill = false },
 		func(c *Config) { c.Mechanisms.BackgroundStoreMode = "continuous" },

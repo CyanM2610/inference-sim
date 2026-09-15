@@ -17,6 +17,7 @@ type QueueServiceCurve struct {
 }
 
 type QueueServiceCostConfig struct {
+	profileReporter
 	Spill *SpillServiceCostConfig `json:"spill,omitempty"`
 	// The base stages exclude refresh work. This declared per-decision
 	// increment is also charged on scans which produce no budget update.
@@ -33,7 +34,10 @@ type QueueServiceCostConfig struct {
 	Coverage             string                       `json:"coverage"`
 }
 
-type queueServiceCost struct{ profile QueueServiceCostConfig }
+type queueServiceCost struct {
+	profile QueueServiceCostConfig
+	shape   RestoreServiceShape
+}
 
 var queueStageSizes = map[string]int{"decision": 6, "reservation_view": 3, "estimate": 3,
 	"execution": 7, "feedback": 5, "completion": 3, "registration": 1, "action": 1}
@@ -52,6 +56,7 @@ func newQueueServiceCost(c Config) (*queueServiceCost, error) {
 		return nil, fmt.Errorf("queue service profile does not cover waits, promotion, sharing or a different execution backend")
 	}
 	p := *d.QueueServiceCost
+	p.profileReporter = c.profile("queue_service", p.Provenance)
 	if d.BudgetRestore.ReestimateOnDecodeDrop {
 		if p.ReestimateExtraUS <= 0 || strings.TrimSpace(p.ReestimateProvenance) == "" {
 			return nil, fmt.Errorf("queue service profile requires explicit additional budget reestimate service and provenance")
@@ -59,8 +64,8 @@ func newQueueServiceCost(c Config) (*queueServiceCost, error) {
 	} else if p.ReestimateExtraUS != 0 || p.ReestimateProvenance != "" {
 		return nil, fmt.Errorf("budget reestimate service requires the enabled policy option")
 	}
-	if (p.Family != "budget_pressure" && p.Family != "budget_queues") || p.Family != d.BudgetRestore.Mode ||
-		len(c.Instances) != 1 || len(c.Pools) != 1 || p.HBMBlocks != c.Instances[0].HBMBlocks || p.Shape != serviceShape(c) ||
+	if !validServiceShape(p.Shape) || (p.Family != "budget_pressure" && p.Family != "budget_queues") || p.Family != d.BudgetRestore.Mode ||
+		len(c.Instances) != 1 || len(c.Pools) != 1 || p.HBMBlocks <= 0 ||
 		p.MaxInputTokens <= 0 || p.MaxOutputTokens <= 0 || strings.TrimSpace(p.Provenance) == "" || strings.TrimSpace(p.Coverage) == "" {
 		return nil, fmt.Errorf("queue service family, geometry, bounds or provenance mismatch")
 	}
@@ -71,10 +76,10 @@ func newQueueServiceCost(c Config) (*queueServiceCost, error) {
 	if p.EstimatorFamily != wantEstimator || c.BatchCost == nil || c.BatchCost.EnqueueUS != 0 {
 		return nil, fmt.Errorf("queue service requires its measured estimator family and full registration replacing enqueue cost")
 	}
-	for _, r := range c.Requests {
-		if int64(len(r.Input)) > p.MaxInputTokens || r.MaxOutputTokens <= 0 || r.MaxOutputTokens > p.MaxOutputTokens {
-			return nil, fmt.Errorf("queue request exceeds declared input/output coverage")
-		}
+	p.equal("hbm_blocks", c.Instances[0].HBMBlocks, p.HBMBlocks)
+	p.profileReporter.shape(p.Shape, serviceShape(c))
+	if err := p.requests(c, p.MaxInputTokens, p.MaxOutputTokens); err != nil {
+		return nil, err
 	}
 	if len(p.Stages) != len(queueStageSizes) {
 		return nil, fmt.Errorf("queue service requires all eight disjoint stages")
@@ -98,7 +103,7 @@ func newQueueServiceCost(c Config) (*queueServiceCost, error) {
 	if err := configureSpillService(c, &p); err != nil {
 		return nil, err
 	}
-	return &queueServiceCost{profile: p}, nil
+	return &queueServiceCost{profile: p, shape: serviceShape(c)}, nil
 }
 
 func (m *queueServiceCost) price(counts map[string][]int64, names ...string) (sim.DecisionCostEstimate, error) {
@@ -110,9 +115,10 @@ func (m *queueServiceCost) price(counts map[string][]int64, names ...string) (si
 			return sim.DecisionCostEstimate{}, fmt.Errorf("missing queue work stage %s", name)
 		}
 		for i, n := range work {
-			if n < 0 || n > x.MaxCounts[i] {
-				return sim.DecisionCostEstimate{}, fmt.Errorf("queue %s feature %d exceeds evaluated scope: %d", name, i, n)
+			if n < 0 {
+				return sim.DecisionCostEstimate{}, fmt.Errorf("negative queue %s feature %d: %d", name, i, n)
 			}
+			m.profile.above(fmt.Sprintf("%s.feature_%d", name, i), n, x.MaxCounts[i])
 			if x.CoefficientsUS == nil {
 				if n != 0 {
 					return sim.DecisionCostEstimate{}, fmt.Errorf("queue action %s has no measured nonzero work", name)
@@ -129,7 +135,7 @@ func (m *queueServiceCost) price(counts map[string][]int64, names ...string) (si
 }
 
 func (m *queueServiceCost) Estimate(v sim.DecisionView, p sim.DecisionPlan) (sim.DecisionCostEstimate, error) {
-	counts, err := queueDecisionCounts(m.profile.Shape, v, p)
+	counts, err := queueDecisionCounts(m.shape, v, p)
 	if err != nil {
 		return sim.DecisionCostEstimate{}, err
 	}
@@ -171,7 +177,7 @@ func (m *queueServiceCost) EstimateExecutionOutcome(v sim.DecisionView, p sim.De
 		return sim.DecisionCostEstimate{}, err
 	}
 	if m.profile.Spill != nil {
-		work, err := SpillExecutionCounts(v, p, f, m.profile.Spill.MaxSourceBlocks)
+		work, err := spillExecutionCounts(v, p, f, m.profile.Spill.MaxSourceBlocks, m.profile.Spill.profileReporter)
 		if err != nil {
 			return sim.DecisionCostEstimate{}, err
 		}

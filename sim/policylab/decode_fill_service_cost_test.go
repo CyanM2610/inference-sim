@@ -116,8 +116,8 @@ func TestDecodeFillServiceRejectsUnmeasuredOrDuplicateProfiles(t *testing.T) {
 		"wrong policy":         func(c *Config) { c.DecisionPolicy.BalancedBatch.DecodeFill = false },
 		"new branch":           func(c *Config) { c.DecisionPolicy.BalancedBatch.ReadyComputeBudget = true },
 		"reservation observer": func(c *Config) { c.DecisionPolicy.CapacityReservationView = true },
-		"shape":                func(c *Config) { c.DecisionPolicy.DecodeFillServiceCost.Shape.MaxBatchTokens++ },
-		"request":              func(c *Config) { c.Requests[0].MaxOutputTokens = 65 },
+		"shape":                func(c *Config) { c.DecisionPolicy.DecodeFillServiceCost.Shape.BlockTokens = 0 },
+		"request":              func(c *Config) { c.Requests[0].MaxOutputTokens = -1 },
 		"negative":             func(c *Config) { c.DecisionPolicy.DecodeFillServiceCost.Execution.CoefficientsNS[0] = -1 },
 		"overflow":             func(c *Config) { c.DecisionPolicy.DecodeFillServiceCost.Prepare.CoefficientsNS[0] = math.MaxInt64 },
 	} {
@@ -142,8 +142,12 @@ func TestDecodeFillServiceRejectsUnmeasuredOrDuplicateProfiles(t *testing.T) {
 	if m.profile.Prepare.CoefficientsNS[0] != 0 {
 		t.Fatal("caller mutated installed model")
 	}
-	// A zero fitted rate is still bounded by measured work coverage.
-	if _, err := priceDecodeFillCurve(DecodeFillServiceCurve{CoefficientsNS: []int64{0}, MaxFeatures: []int64{0}}, []int64{1}); err == nil {
-		t.Fatal("unmeasured work silently free")
+	// Zero fitted rates remain explicitly unvalidated beyond their envelope.
+	warnings := &profileWarnings{}
+	curve := DecodeFillServiceCurve{CoefficientsNS: []int64{0}, MaxFeatures: []int64{0},
+		profileReporter: profileReporter{warnings: warnings, component: "decode_fill_prepare"}}
+	if cost, err := priceDecodeFillCurve(curve, []int64{1}); err != nil || cost != 0 {
+		t.Fatal("declared formula was replaced", cost, err)
 	}
+	requireProfileWarning(t, warnings.snapshot(), "decode_fill_prepare", "feature_0")
 }

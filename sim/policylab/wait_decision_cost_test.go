@@ -19,6 +19,7 @@ func waitDecisionFixture(c Config) *WaitDecisionCostConfig {
 
 func TestWaitDecisionPricesAdmissionAndResidentUpdatesIncludingClear(t *testing.T) {
 	c := pressureBudgetConfig()
+	c.profileWarnings = &profileWarnings{}
 	c.DecisionPolicy.PrefillWaits = true
 	c.DecisionPolicy.WaitDecisionCost = waitDecisionFixture(c)
 	m, err := newWaitDecisionCost(c)
@@ -43,9 +44,10 @@ func TestWaitDecisionPricesAdmissionAndResidentUpdatesIncludingClear(t *testing.
 	}
 	v.Estimates = &sim.DecisionEstimates{Requests: []sim.DecisionRequestEstimate{{Choices: []sim.DecisionRestoreEstimate{{}, {}}}}}
 	m.config.MaxCounts[2] = 1
-	if _, err := m.Estimate(v, plan); err == nil {
-		t.Fatal("zero-rate restore feature escaped coverage limits")
+	if extrapolated, err := m.Estimate(v, plan); err != nil || extrapolated.ExtraUS != fee.ExtraUS {
+		t.Fatal("zero-rate extrapolation changed formula", extrapolated, err)
 	}
+	requireProfileWarning(t, c.profileWarnings.snapshot(), "wait_decision", "feature_2")
 	v.Estimates = nil
 	v.KV.TransfersKnown = false
 	if _, err := m.Estimate(v, plan); err == nil {

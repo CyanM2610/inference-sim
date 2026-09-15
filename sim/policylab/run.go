@@ -41,6 +41,7 @@ type PromotionConfig struct {
 	Budget   int           `json:"block_budget"`
 }
 type Config struct {
+	profileWarnings           *profileWarnings
 	HotPrefix                 *kv.HotPrefixConfig        `json:"hotprefix,omitempty"`
 	DirectionalTransferOrder  bool                       `json:"directional_transfer_order,omitempty"`
 	TransferSubmissionPolicy  string                     `json:"transfer_submission_policy,omitempty"`
@@ -92,6 +93,8 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	ProfileWarnings                     []ProfileWarning              `json:"profile_warnings,omitempty"`
+	ProfileCostCoverage                 string                        `json:"profile_cost_coverage,omitempty"`
 	VLLMNativeRevision                  string                        `json:"vllm_native_revision,omitempty"`
 	VLLMNativeCostCoverage              string                        `json:"vllm_native_cost_coverage,omitempty"`
 	HotPrefixCostCoverage               string                        `json:"hotprefix_cost_coverage,omitempty"`
@@ -539,6 +542,13 @@ func RunWithDecisionPolicy(c Config, factory func(instance string) sim.DecisionP
 }
 
 func run(c Config, factories PolicyFactories) (*Result, error) {
+	warnings := &profileWarnings{}
+	c.profileWarnings = warnings
+	if c.EnginePhases != nil {
+		phase := *c.EnginePhases
+		phase.profileReporter = c.profile("engine_phases", phase.Provenance)
+		c.EnginePhases = &phase
+	}
 	if c.RequestScheduler == "vllm_native" && factories.Decision != nil {
 		return nil, fmt.Errorf("vllm_native cannot combine with an injected request controller")
 	}
@@ -566,6 +576,12 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 		return nil, err
 	}
 	out := &Result{Config: c, BlockBytes: int64(math.Ceil(bytes * float64(c.BlockTokens))), Counts: map[string]int64{}, CPU: map[string]CPUProfile{}, HBM: map[string]map[string]int64{}}
+	defer func() {
+		out.ProfileWarnings = warnings.snapshot()
+		if len(out.ProfileWarnings) > 0 {
+			out.ProfileCostCoverage = "extrapolated_outside_measured_envelopes; see profile_warnings; no new native validation"
+		}
+	}()
 	if c.RequestScheduler == "vllm_native" {
 		out.VLLMNativeRevision = sim.VLLMNativeRevision
 		out.VLLMNativeCostCoverage = "native_decision_control_flow; simulator_allocator_and_execution; scheduler_cpu_cost_not_independently_calibrated"
@@ -1066,6 +1082,7 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 			}
 			if c.DecisionPolicy.ExtraCost != nil {
 				model := *c.DecisionPolicy.ExtraCost
+				model.SetProfileWarningObserver(c.profile("linear_decision", model.Provenance).above)
 				if e := inst.SetDecisionCostModel(model); e != nil {
 					panic(e)
 				}

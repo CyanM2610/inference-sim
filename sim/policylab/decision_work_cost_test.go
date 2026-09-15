@@ -18,8 +18,9 @@ func serviceProfile(c Config) *RestoreServiceCostConfig {
 	return p
 }
 
-func TestRestoreServiceChargesCandidateWorkAndRejectsExtrapolation(t *testing.T) {
+func TestRestoreServiceChargesCandidateWorkAndWarnsOnExtrapolation(t *testing.T) {
 	c := budgetLabConfig()
+	c.profileWarnings = &profileWarnings{}
 	c.DecisionPolicy.RestoreServiceCost = serviceProfile(c)
 	c.DecisionPolicy.RestoreServiceCost.RatesUS["compute_steps"] = 2
 	m, err := newRestoreServiceCost(c)
@@ -53,9 +54,10 @@ func TestRestoreServiceChargesCandidateWorkAndRejectsExtrapolation(t *testing.T)
 		t.Fatal("service not based on predictor work")
 	}
 	m.config.MaxWork["candidates"] = 0
-	if _, err = m.Estimate(v, sim.DecisionPlan{}); err == nil {
-		t.Fatal("unprofiled work silently accepted")
+	if extrapolated, err := m.Estimate(v, sim.DecisionPlan{}); err != nil || extrapolated.ExtraUS != b.ExtraUS {
+		t.Fatal("profile envelope changed the formula", extrapolated, err)
 	}
+	requireProfileWarning(t, c.profileWarnings.snapshot(), "restore_service", "candidates")
 }
 
 func TestRestoreServiceFlowsThroughEventsAndZeroRetainsBehavior(t *testing.T) {
@@ -104,7 +106,7 @@ func TestRestoreServiceProfileValidation(t *testing.T) {
 		func(p *RestoreServiceCostConfig) { p.RatesUS["fixed"] = -1 },
 		func(p *RestoreServiceCostConfig) { p.RatesUS["extra"] = 1 },
 		func(p *RestoreServiceCostConfig) { p.Coverage = "" },
-		func(p *RestoreServiceCostConfig) { p.Shape.PrefillChunk++ },
+		func(p *RestoreServiceCostConfig) { p.Shape.BlockTokens = 0 },
 	} {
 		c := budgetLabConfig()
 		c.DecisionPolicy.RestoreServiceCost = serviceProfile(c)

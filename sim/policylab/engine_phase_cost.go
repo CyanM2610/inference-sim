@@ -18,6 +18,7 @@ type EnginePhaseCurve struct {
 }
 
 type EnginePhaseCostConfig struct {
+	profileReporter
 	WorkerMetadata *WorkerMetadataCostConfig `json:"worker_metadata,omitempty"`
 	Compute        EnginePhaseCurve          `json:"compute"`
 	LoadPlanning   *EngineLoadPlanningCost   `json:"load_planning,omitempty"`
@@ -46,9 +47,12 @@ func (c EnginePhaseCostConfig) PredictLoadPlanning(loads, blocks int64) (int64, 
 	if p == nil || (loads == 0 && blocks == 0) {
 		return 0, nil
 	}
-	if loads <= 0 || blocks < loads || loads > p.MaxLoads || blocks > p.MaxBlocks {
-		return 0, fmt.Errorf("load planning outside profile: loads=%d blocks=%d", loads, blocks)
+	if loads <= 0 || blocks < loads {
+		return 0, fmt.Errorf("invalid load planning shape: loads=%d blocks=%d", loads, blocks)
 	}
+	report := profileReporter{c.warnings, "load_planning", p.Provenance}
+	report.above("loads", loads, p.MaxLoads)
+	report.above("blocks", blocks, p.MaxBlocks)
 	return phaseCost(p.Coefficients, []float64{1, float64(loads), float64(blocks)}), nil
 }
 

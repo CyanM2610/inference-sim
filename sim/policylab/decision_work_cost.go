@@ -24,8 +24,9 @@ type RestoreServiceShape struct {
 
 // RestoreServiceCostConfig contains independently profiled CPU operation rates.
 // It does not calibrate GPU work or silently treat unmeasured host work as free:
-// Coverage must describe exclusions. MaxWork rejects unmeasured extrapolation.
+// Coverage must describe exclusions. MaxWork records the measured envelope.
 type RestoreServiceCostConfig struct {
+	profileReporter
 	RatesUS    map[string]float64  `json:"rates_us"`
 	MaxWork    map[string]int64    `json:"max_work"`
 	Shape      RestoreServiceShape `json:"shape"`
@@ -33,7 +34,10 @@ type RestoreServiceCostConfig struct {
 	Coverage   string              `json:"coverage"`
 }
 
-type restoreServiceCost struct{ config RestoreServiceCostConfig }
+type restoreServiceCost struct {
+	config RestoreServiceCostConfig
+	shape  RestoreServiceShape
+}
 
 func serviceShape(c Config) RestoreServiceShape {
 	cap := int64(0)
@@ -52,11 +56,13 @@ func newRestoreServiceCost(c Config) (*restoreServiceCost, error) {
 		return nil, fmt.Errorf("restore service cost requires restore estimates and a decision policy")
 	}
 	p := *c.DecisionPolicy.RestoreServiceCost
+	p.profileReporter = c.profile("restore_service", p.Provenance)
 	want := serviceShape(c)
 	want.MaxInputTokens = p.Shape.MaxInputTokens
-	if p.Shape != want || want.MaxInputTokens <= 0 || strings.TrimSpace(p.Provenance) == "" || strings.TrimSpace(p.Coverage) == "" {
+	if !validServiceShape(p.Shape) || want.MaxInputTokens <= 0 || strings.TrimSpace(p.Provenance) == "" || strings.TrimSpace(p.Coverage) == "" {
 		return nil, fmt.Errorf("restore service profile shape/provenance/coverage mismatch")
 	}
+	p.profileReporter.shape(p.Shape, want)
 	if len(p.RatesUS) != len(restoreWorkNames) || len(p.MaxWork) != len(restoreWorkNames) {
 		return nil, fmt.Errorf("restore service profile requires all known work counters")
 	}
@@ -70,7 +76,7 @@ func newRestoreServiceCost(c Config) (*restoreServiceCost, error) {
 		rates[name], bounds[name] = rate, bound
 	}
 	p.RatesUS, p.MaxWork = rates, bounds
-	return &restoreServiceCost{config: p}, nil
+	return &restoreServiceCost{config: p, shape: serviceShape(c)}, nil
 }
 
 // RestoreDecisionWork counts operations performed by restoreEstimator using only
@@ -177,15 +183,13 @@ func restoreDecisionWork(shape RestoreServiceShape, v sim.DecisionView) (map[str
 
 func (m *restoreServiceCost) Estimate(v sim.DecisionView, _ sim.DecisionPlan) (sim.DecisionCostEstimate, error) {
 	p := m.config
-	shape := p.Shape
+	shape := m.shape
 	if v.BlockTokens != shape.BlockTokens || v.MaxBatchTokens != shape.MaxBatchTokens || v.MaxSequences != shape.MaxSequences || v.PrefillChunk != shape.PrefillChunk {
-		return sim.DecisionCostEstimate{}, fmt.Errorf("decision view outside service profile geometry")
+		return sim.DecisionCostEstimate{}, fmt.Errorf("decision view mismatches configured execution geometry")
 	}
 	for _, group := range [][]sim.DecisionRequest{v.Waiting, v.Running} {
 		for _, r := range group {
-			if r.InputTokens > shape.MaxInputTokens {
-				return sim.DecisionCostEstimate{}, fmt.Errorf("request outside service profile prompt range")
-			}
+			p.above("input_tokens", r.InputTokens, p.Shape.MaxInputTokens)
 		}
 	}
 	w, err := restoreDecisionWork(shape, v)
@@ -194,9 +198,7 @@ func (m *restoreServiceCost) Estimate(v sim.DecisionView, _ sim.DecisionPlan) (s
 	}
 	total := 0.0
 	for _, name := range restoreWorkNames {
-		if w[name] > p.MaxWork[name] {
-			return sim.DecisionCostEstimate{}, fmt.Errorf("decision work outside service profile: %s", name)
-		}
+		p.above(name, w[name], p.MaxWork[name])
 		total += float64(w[name]) * p.RatesUS[name]
 	}
 	if math.IsInf(total, 0) || math.IsNaN(total) || total >= float64(math.MaxInt64) {

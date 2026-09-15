@@ -168,7 +168,7 @@ func TestQueueServiceRetainsBaseStagesAndAddsExplicitRefreshService(t *testing.T
 		func(c *Config) { c.DecisionPolicy.QueueServiceCost.ReestimateExtraUS = 0 },
 		func(c *Config) { c.DecisionPolicy.QueueServiceCost.ReestimateProvenance = " " },
 		func(c *Config) { c.DecisionPolicy.BudgetRestore.ReestimateOnDecodeDrop = false },
-		func(c *Config) { c.DecisionPolicy.QueueServiceCost.HBMBlocks++ },
+		func(c *Config) { c.DecisionPolicy.QueueServiceCost.HBMBlocks = 0 },
 	} {
 		bad := queueCostFixture(1)
 		bad.DecisionPolicy.BudgetRestore.ReestimateOnDecodeDrop = true

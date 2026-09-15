@@ -7,6 +7,7 @@ import (
 
 func TestCapacityExecutionCostUsesActualReservationAndAdoptionSemantics(t *testing.T) {
 	c := pressureBudgetConfig()
+	c.profileWarnings = &profileWarnings{}
 	// This unit test uses the synthetic fixture's own declared geometry.
 	c.DecisionPolicy.ExecutionCost = &CapacityExecutionCostConfig{RatesUS: []int64{10, 55, 8, 25, 6}, ActionUS: 21, MaxCounts: []int64{4, 1, 1, 2}, Shape: serviceShape(c), Provenance: "synthetic operation rates"}
 	c.DecisionPolicy.ExecutionCost.MaxInputTokens, c.DecisionPolicy.ExecutionCost.MaxOutputTokens, c.DecisionPolicy.ExecutionCost.HBMBlocks = 64, 4, c.Instances[0].HBMBlocks
@@ -31,7 +32,8 @@ func TestCapacityExecutionCostUsesActualReservationAndAdoptionSemantics(t *testi
 	if _, err = m.EstimateExecution(w, 1); err == nil {
 		t.Fatal("unsupported wait mapping silently extrapolated")
 	}
-	if _, err = m.EstimateExecution(sim.BatchExecutionWork{}, 2); err == nil {
-		t.Fatal("unsupported actual victim count accepted")
+	if cost, err := m.EstimateExecution(sim.BatchExecutionWork{}, 2); err != nil || cost.ExtraUS != 10+2*(25+21) {
+		t.Fatal("victim extrapolation changed formula", cost, err)
 	}
+	requireProfileWarning(t, c.profileWarnings.snapshot(), "capacity_execution", "feature_2")
 }

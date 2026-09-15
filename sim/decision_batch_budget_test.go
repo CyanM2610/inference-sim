@@ -99,8 +99,12 @@ func TestReadyBudgetSeparatesExpectedComputeFromLoadingAdmission(t *testing.T) {
 	}
 	model := LinearDecisionCost{Provenance: "old profile", Limits: &DecisionCostLimits{MaxVisibleRequests: 3, MaxInputTokens: 256}}
 	v.KV.TransfersKnown = true
-	if _, err := model.Estimate(v, plan); err == nil {
-		t.Fatal("old fee model silently accepted new batch budget action")
+	warned := false
+	model.SetProfileWarningObserver(func(parameter string, observed, maximum int64) {
+		warned = parameter == "batch_token_cap" && observed == 128 && maximum == 0
+	})
+	if _, err := model.Estimate(v, plan); err != nil || !warned {
+		t.Fatal("batch budget extrapolation rejected or silent", err)
 	}
 	model.Limits.MaxBatchTokenCap = 128
 	if _, err := model.Estimate(v, plan); err != nil {

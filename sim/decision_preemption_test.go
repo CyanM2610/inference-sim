@@ -228,8 +228,12 @@ func TestPrefillPreemptionCostCoverageAndOverflow(t *testing.T) {
 		t.Fatal("old profile accepted new capability")
 	}
 	c.Limits.RequirePrefillPreemption = true
-	if _, err := c.Estimate(v, p); err == nil {
-		t.Fatal("old profile silently priced new action")
+	warned := false
+	c.SetProfileWarningObserver(func(parameter string, observed, maximum int64) {
+		warned = parameter == "preemptions" && observed == 1 && maximum == 0
+	})
+	if cost, err := c.Estimate(v, p); err != nil || cost.ExtraUS != 10 || !warned {
+		t.Fatal("preemption extrapolation rejected, silent or uncharged", cost, err)
 	}
 	c.Limits.MaxPreemptions = 1
 	if got, err := c.Estimate(v, p); err != nil || got.ExtraUS != 10 {

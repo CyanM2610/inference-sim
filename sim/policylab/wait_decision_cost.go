@@ -11,6 +11,7 @@ import (
 // Features are attempts, visible requests, restore choices, all wait updates,
 // and pending transfers. A superseded attempt still consumes its full service.
 type WaitDecisionCostConfig struct {
+	profileReporter
 	Family          string              `json:"family"`
 	RatesUS         []int64             `json:"rates_us"`
 	MaxCounts       []int64             `json:"max_counts"`
@@ -28,6 +29,7 @@ func newWaitDecisionCost(c Config) (*waitDecisionCost, error) {
 		return nil, fmt.Errorf("wait decision profile requires no other decision cost profile")
 	}
 	p := *c.DecisionPolicy.WaitDecisionCost
+	p.profileReporter = c.profile("wait_decision", p.Provenance)
 	if err := validateWaitServiceScope(c, p.Family, p.Shape, p.HBMBlocks, p.MaxInputTokens, p.MaxOutputTokens, p.Provenance); err != nil {
 		return nil, err
 	}
@@ -65,14 +67,17 @@ func WaitDecisionCounts(v sim.DecisionView, plan sim.DecisionPlan) ([]int64, err
 
 func (m *waitDecisionCost) Estimate(v sim.DecisionView, plan sim.DecisionPlan) (sim.DecisionCostEstimate, error) {
 	p := m.config
-	if v.Capabilities.CapacityPreemption != (p.Family == "capacity") || v.HBMCapacityBlocks != p.HBMBlocks || len(plan.Promotions) > 0 || len(plan.Preemptions) > 0 {
+	if v.Capabilities.CapacityPreemption != (p.Family == "capacity") || len(plan.Promotions) > 0 || len(plan.Preemptions) > 0 {
 		return sim.DecisionCostEstimate{}, fmt.Errorf("decision is outside wait profile family or action coverage")
 	}
+	p.equal("hbm_blocks", v.HBMCapacityBlocks, p.HBMBlocks)
 	for _, group := range [][]sim.DecisionRequest{v.Waiting, v.Running} {
 		for _, r := range group {
-			if r.InputTokens > p.MaxInputTokens || r.ClientOutputLimit <= 0 || r.ClientOutputLimit > p.MaxOutputTokens || r.RecomputeUntilTokens > r.InputTokens {
+			if r.ClientOutputLimit <= 0 || r.RecomputeUntilTokens > r.InputTokens {
 				return sim.DecisionCostEstimate{}, fmt.Errorf("decision request is outside wait profile input, output or recompute coverage")
 			}
+			p.above("input_tokens", r.InputTokens, p.MaxInputTokens)
+			p.above("client_output_limit", int64(r.ClientOutputLimit), int64(p.MaxOutputTokens))
 		}
 	}
 	counts, err := WaitDecisionCounts(v, plan)
@@ -81,9 +86,7 @@ func (m *waitDecisionCost) Estimate(v sim.DecisionView, plan sim.DecisionPlan) (
 	}
 	var total int64
 	for i, n := range counts {
-		if n > p.MaxCounts[i] {
-			return sim.DecisionCostEstimate{}, fmt.Errorf("wait decision feature %d exceeds profile coverage: %d", i, n)
-		}
+		p.above(fmt.Sprintf("feature_%d", i), n, p.MaxCounts[i])
 		if n > 0 && p.RatesUS[i] > (math.MaxInt64-total)/n {
 			return sim.DecisionCostEstimate{}, fmt.Errorf("wait decision fee overflow")
 		}

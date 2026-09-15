@@ -77,13 +77,15 @@ func TestWaitExecutionServiceUsesRuntimeAndZeroPreservesEvents(t *testing.T) {
 		}
 	}
 	c.DecisionPolicy.WaitExecutionCost.MaxCounts[4] = 0
+	c.profileWarnings = &profileWarnings{}
 	model, err := newWaitExecutionCost(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := model.EstimateExecution(sim.BatchExecutionWork{TokenChecksKnown: true, TokenChecks: []sim.ExecutionTokenCheck{{Phase: "running", Held: true}}}, 0); err == nil {
-		t.Fatal("unmeasured reserve count accepted")
+	if _, err := model.EstimateExecution(sim.BatchExecutionWork{TokenChecksKnown: true, TokenChecks: []sim.ExecutionTokenCheck{{Phase: "running", Held: true}}}, 0); err != nil {
+		t.Fatal("larger reserve count rejected", err)
 	}
+	requireProfileWarning(t, c.profileWarnings.snapshot(), "wait_execution", "feature_5")
 	c.DecisionPolicy.WaitExecutionCost.Family = "capacity"
 	if err := c.Validate(); err == nil {
 		t.Fatal("mismatched wrapper family accepted")

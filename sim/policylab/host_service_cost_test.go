@@ -77,9 +77,11 @@ func TestHostCostRejectsUncoveredGeometryAndInvalidFinishSets(t *testing.T) {
 		}
 	}
 	c.DecisionPolicy.HostServiceCost.HBMBlocks++
-	if _, err := newCapacityHostServiceCost(c); err == nil {
-		t.Fatal("different geometry accepted")
+	c.profileWarnings = &profileWarnings{}
+	if _, err := newCapacityHostServiceCost(c); err != nil {
+		t.Fatal("measured geometry became a capacity limit", err)
 	}
+	requireProfileWarning(t, c.profileWarnings.snapshot(), "capacity_host", "hbm_blocks")
 }
 
 func TestRegistrationBaseCannotBeChargedTwice(t *testing.T) {
