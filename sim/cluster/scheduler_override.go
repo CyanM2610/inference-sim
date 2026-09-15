@@ -2,6 +2,10 @@ package cluster
 
 import "github.com/inference-sim/inference-sim/sim"
 
+func (i *InstanceSimulator) SetVLLMNativeScheduler() error {
+	return i.sim.SetVLLMNativeScheduler()
+}
+
 func (i *InstanceSimulator) SetDecisionEstimator(model sim.DecisionEstimator) error {
 	return i.sim.SetDecisionEstimator(model)
 }

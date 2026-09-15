@@ -92,6 +92,8 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	VLLMNativeRevision                  string                        `json:"vllm_native_revision,omitempty"`
+	VLLMNativeCostCoverage              string                        `json:"vllm_native_cost_coverage,omitempty"`
 	HotPrefixCostCoverage               string                        `json:"hotprefix_cost_coverage,omitempty"`
 	DirectionalTransferOrderCoverage    string                        `json:"directional_transfer_order_coverage,omitempty"`
 	TransferSubmissions                 []kv.TransferSubmissionRecord `json:"-"`
@@ -146,6 +148,11 @@ type Result struct {
 }
 
 func (c Config) Validate() error {
+	if c.RequestScheduler == "vllm_native" {
+		if err := c.validateVLLMNative(); err != nil {
+			return err
+		}
+	}
 	if c.PrefixCopySelection != "" && c.PrefixCopySelection != "first_published" {
 		return fmt.Errorf("prefix_copy_selection must be omitted or first_published")
 	}
@@ -367,7 +374,7 @@ func (c Config) Validate() error {
 		}
 		order := c.DecisionPolicy.QueueOrder
 		if order == "" {
-			order = c.RequestScheduler
+			order = c.decisionQueueOrder()
 		}
 		if _, err := sim.NewQueueDecisionPolicy(order, c.DecisionPolicy.PrefillTokenCap); err != nil {
 			return err
@@ -435,9 +442,9 @@ func (c Config) Validate() error {
 		return fmt.Errorf("native profiling supports one Qwen2.5-7B BF16 GQA instance")
 	}
 	switch c.RequestScheduler {
-	case "", "fcfs", "sjf", "edf":
+	case "", "fcfs", "sjf", "edf", "vllm_native":
 	default:
-		return fmt.Errorf("request_scheduler must be fcfs, sjf or edf")
+		return fmt.Errorf("request_scheduler must be fcfs, sjf, edf or vllm_native")
 	}
 	if c.Mechanisms != nil {
 		if c.Mechanisms.BackgroundStoreMode == "on_preemption" && (c.DecisionPolicy == nil || !c.DecisionPolicy.RequestSpill) {
@@ -532,6 +539,9 @@ func RunWithDecisionPolicy(c Config, factory func(instance string) sim.DecisionP
 }
 
 func run(c Config, factories PolicyFactories) (*Result, error) {
+	if c.RequestScheduler == "vllm_native" && factories.Decision != nil {
+		return nil, fmt.Errorf("vllm_native cannot combine with an injected request controller")
+	}
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
@@ -556,6 +566,10 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 		return nil, err
 	}
 	out := &Result{Config: c, BlockBytes: int64(math.Ceil(bytes * float64(c.BlockTokens))), Counts: map[string]int64{}, CPU: map[string]CPUProfile{}, HBM: map[string]map[string]int64{}}
+	if c.RequestScheduler == "vllm_native" {
+		out.VLLMNativeRevision = sim.VLLMNativeRevision
+		out.VLLMNativeCostCoverage = "native_decision_control_flow; simulator_allocator_and_execution; scheduler_cpu_cost_not_independently_calibrated"
+	}
 	out.FirstTokenUS = map[string]int64{}
 	out.FinishedUS = map[string]int64{}
 	requestConfig := map[string]RequestConfig{}
@@ -825,7 +839,7 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 		if c.DecisionPolicy != nil {
 			order := c.DecisionPolicy.QueueOrder
 			if order == "" {
-				order = c.RequestScheduler
+				order = c.decisionQueueOrder()
 			}
 			if order == "" {
 				order = "fcfs"
@@ -1116,7 +1130,7 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 				out.PrefillDeferralCostCoverage = "controller_profile_covers_scoped_deferral_work; see declared coverage"
 				out.PromotionCostCoverage = "controller_profile_excludes_engine_owned_promotion_work; base engine fees retained"
 			}
-		} else if c.RequestScheduler != "" {
+		} else if c.RequestScheduler != "" && c.RequestScheduler != "vllm_native" {
 			deadlines := make(map[string]int64)
 			for _, r := range c.Requests {
 				if r.TTFTSLOUS > 0 {
@@ -1124,6 +1138,11 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 				}
 			}
 			inst.SetInstanceScheduler(&requestScheduler{name: c.RequestScheduler, instance: string(id), deadlines: deadlines, sink: sink})
+		}
+		if c.RequestScheduler == "vllm_native" {
+			if err := inst.SetVLLMNativeScheduler(); err != nil {
+				panic(err) // validated before instance construction
+			}
 		}
 		var started time.Time
 		inst.SetEventObserver(func(e sim.Event, before bool) {

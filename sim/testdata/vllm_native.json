@@ -1,0 +1,2765 @@
+{
+  "revision": "79d3c28f53ea18a4a117ecb246dd6c96638041dd",
+  "source_sha256": "eb86a2f969c1a9e08fedabae4c9eac7c998336f6e788f044ea4188197d196aac",
+  "queue_sha256": "b0b119cd1f0792b312ada392be2317ab396d97a96b16ba667c0a741584471ddc",
+  "coverage": "unmodified native schedule decision body with scripted allocator/connector and synchronous output completion",
+  "cases": [
+    {
+      "name": "fcfs_chunks",
+      "budget": 7,
+      "chunk": 4,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 6,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 3,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 4,
+            "b": 3
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 4,
+            "b": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 4,
+            "b": 3
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 8,
+            "b": 6
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 1,
+            "c": 3
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 9,
+            "b": 7,
+            "c": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 1,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "resident_prefill_before_decode",
+      "budget": 4,
+      "running": [
+        {
+          "id": "p",
+          "prompt": 16,
+          "computed": 4,
+          "emitted": 0
+        },
+        {
+          "id": "d",
+          "prompt": 4,
+          "computed": 4,
+          "emitted": 1
+        }
+      ],
+      "steps": [
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "p": 4
+          },
+          "running": [
+            "p",
+            "d"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "p": 8,
+            "d": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "p": 0,
+            "d": 1
+          }
+        },
+        {
+          "grants": {
+            "p": 4
+          },
+          "running": [
+            "p",
+            "d"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "p": 12,
+            "d": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "p": 0,
+            "d": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "zero_work_continues",
+      "budget": 4,
+      "running": [
+        {
+          "id": "idle",
+          "prompt": 4,
+          "computed": 4,
+          "emitted": 0
+        },
+        {
+          "id": "d",
+          "prompt": 4,
+          "computed": 4,
+          "emitted": 1
+        }
+      ],
+      "waiting": [
+        {
+          "id": "w",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "d": 1,
+            "w": 3
+          },
+          "running": [
+            "idle",
+            "d",
+            "w"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "idle": 4,
+            "d": 5,
+            "w": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "idle": 0,
+            "d": 1,
+            "w": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sequence_limit",
+      "budget": 32,
+      "max_seqs": 2,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {
+          "complete": [
+            "a"
+          ]
+        }
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 5,
+            "b": 5
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 5,
+            "b": 5
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "b": 1,
+            "c": 5
+          },
+          "running": [
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "b": 6,
+            "c": 5
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 1,
+            "b": 1,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "local_hit_logits_replay",
+      "budget": 8,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 8,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 8,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {
+          "prefixes": {
+            "a": 7,
+            "b": 4
+          }
+        }
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 1,
+            "b": 4
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 8,
+            "b": 8
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "waiting_capacity_hol",
+      "budget": 16,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 8,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 2,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {
+          "failures": {
+            "a": 1
+          }
+        },
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {},
+          "running": [],
+          "waiting": [
+            "a",
+            "b"
+          ],
+          "skipped": [],
+          "computed": {},
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 8,
+            "b": 2
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 8,
+            "b": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "tail_preemption",
+      "budget": 16,
+      "chunk": 4,
+      "running": [
+        {
+          "id": "a",
+          "prompt": 16,
+          "computed": 4,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 4,
+          "computed": 5,
+          "emitted": 2
+        },
+        {
+          "id": "c",
+          "prompt": 16,
+          "computed": 4,
+          "emitted": 0
+        }
+      ],
+      "waiting": [
+        {
+          "id": "w",
+          "prompt": 2,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {
+          "failures": {
+            "a": 2
+          }
+        },
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 4
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c",
+            "w"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 8
+          },
+          "preempted": [
+            "b",
+            "c"
+          ],
+          "emitted": {
+            "a": 0,
+            "b": 2,
+            "c": 0,
+            "w": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 4,
+            "b": 4,
+            "c": 4,
+            "w": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c",
+            "w"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 12,
+            "b": 4,
+            "c": 4,
+            "w": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 2,
+            "c": 0,
+            "w": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 4,
+            "b": 2,
+            "c": 4,
+            "w": 1
+          },
+          "running": [
+            "a",
+            "b",
+            "c",
+            "w"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 16,
+            "b": 6,
+            "c": 8,
+            "w": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 2,
+            "c": 0,
+            "w": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "self_preemption",
+      "budget": 8,
+      "running": [
+        {
+          "id": "a",
+          "prompt": 4,
+          "computed": 5,
+          "emitted": 2
+        }
+      ],
+      "waiting": [
+        {
+          "id": "w",
+          "prompt": 2,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {
+          "failures": {
+            "a": 1
+          }
+        },
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {},
+          "running": [],
+          "waiting": [
+            "a",
+            "w"
+          ],
+          "skipped": [],
+          "computed": {},
+          "preempted": [
+            "a"
+          ],
+          "emitted": {
+            "a": 2,
+            "w": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 6,
+            "w": 2
+          },
+          "running": [
+            "a",
+            "w"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 6,
+            "w": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 2,
+            "w": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "w": 1
+          },
+          "running": [
+            "a",
+            "w"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 7,
+            "w": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 3,
+            "w": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "keep_earlier_grants",
+      "budget": 8,
+      "running": [
+        {
+          "id": "a",
+          "prompt": 4,
+          "computed": 4,
+          "emitted": 1
+        },
+        {
+          "id": "b",
+          "prompt": 4,
+          "computed": 5,
+          "emitted": 2
+        }
+      ],
+      "steps": [
+        {
+          "failures": {
+            "b": 1
+          }
+        },
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 5
+          },
+          "preempted": [
+            "b"
+          ],
+          "emitted": {
+            "a": 1,
+            "b": 2
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 6
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 6,
+            "b": 6
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 2,
+            "b": 2
+          }
+        }
+      ]
+    },
+    {
+      "name": "repeat_history_preemption",
+      "budget": 2,
+      "chunk": 2,
+      "running": [
+        {
+          "id": "a",
+          "prompt": 4,
+          "computed": 6,
+          "emitted": 3
+        }
+      ],
+      "steps": [
+        {
+          "failures": {
+            "a": 1
+          }
+        },
+        {},
+        {
+          "failures": {
+            "a": 1
+          }
+        },
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {},
+          "running": [],
+          "waiting": [
+            "a"
+          ],
+          "skipped": [],
+          "computed": {},
+          "preempted": [
+            "a"
+          ],
+          "emitted": {
+            "a": 3
+          }
+        },
+        {
+          "grants": {
+            "a": 2
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 3
+          }
+        },
+        {
+          "grants": {},
+          "running": [],
+          "waiting": [
+            "a"
+          ],
+          "skipped": [],
+          "computed": {},
+          "preempted": [
+            "a"
+          ],
+          "emitted": {
+            "a": 3
+          }
+        },
+        {
+          "grants": {
+            "a": 2
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 3
+          }
+        },
+        {
+          "grants": {
+            "a": 2
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 3
+          }
+        },
+        {
+          "grants": {
+            "a": 2
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 6
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 3
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 7
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 3
+          }
+        }
+      ]
+    },
+    {
+      "name": "model_length_zero_continues",
+      "budget": 8,
+      "max_model_len": 8,
+      "running": [
+        {
+          "id": "end",
+          "prompt": 4,
+          "computed": 7,
+          "emitted": 4
+        },
+        {
+          "id": "d",
+          "prompt": 4,
+          "computed": 4,
+          "emitted": 1
+        }
+      ],
+      "steps": [
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "d": 1
+          },
+          "running": [
+            "end",
+            "d"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "end": 7,
+            "d": 5
+          },
+          "preempted": [],
+          "emitted": {
+            "end": 4,
+            "d": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "deferred_does_not_block",
+      "budget": 8,
+      "waiting": [
+        {
+          "id": "load",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "w",
+          "prompt": 3,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {
+          "loads": {
+            "load": 8
+          }
+        },
+        {
+          "blocked": [
+            "load"
+          ],
+          "arrivals": [
+            {
+              "id": "new",
+              "prompt": 2,
+              "computed": 0,
+              "emitted": 0
+            }
+          ]
+        },
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "w": 3
+          },
+          "running": [
+            "w"
+          ],
+          "waiting": [
+            "load"
+          ],
+          "skipped": [
+            "load"
+          ],
+          "computed": {
+            "w": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "load": 0,
+            "w": 0
+          }
+        },
+        {
+          "grants": {
+            "w": 1,
+            "new": 2
+          },
+          "running": [
+            "w",
+            "new"
+          ],
+          "waiting": [
+            "load"
+          ],
+          "skipped": [
+            "load"
+          ],
+          "computed": {
+            "w": 4,
+            "new": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "load": 0,
+            "w": 1,
+            "new": 0
+          }
+        },
+        {
+          "grants": {
+            "w": 1,
+            "new": 1,
+            "load": 1
+          },
+          "running": [
+            "w",
+            "new",
+            "load"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "w": 5,
+            "new": 3,
+            "load": 9
+          },
+          "preempted": [],
+          "emitted": {
+            "load": 0,
+            "w": 2,
+            "new": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "skipped_before_preempted",
+      "budget": 8,
+      "running": [
+        {
+          "id": "a",
+          "prompt": 4,
+          "computed": 4,
+          "emitted": 1
+        }
+      ],
+      "skipped": [
+        {
+          "id": "load",
+          "prompt": 9,
+          "computed": 8,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {
+          "failures": {
+            "a": 1
+          },
+          "blocked": [
+            "load"
+          ]
+        },
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {},
+          "running": [],
+          "waiting": [
+            "load",
+            "a"
+          ],
+          "skipped": [
+            "load"
+          ],
+          "computed": {},
+          "preempted": [
+            "a"
+          ],
+          "emitted": {
+            "a": 1,
+            "load": 0
+          }
+        },
+        {
+          "grants": {
+            "load": 1,
+            "a": 5
+          },
+          "running": [
+            "load",
+            "a"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "load": 9,
+            "a": 5
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 1,
+            "load": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "skipped_stable_order",
+      "budget": 5,
+      "chunk": 3,
+      "skipped": [
+        {
+          "id": "x",
+          "prompt": 9,
+          "computed": 6,
+          "emitted": 0
+        },
+        {
+          "id": "y",
+          "prompt": 9,
+          "computed": 6,
+          "emitted": 0
+        },
+        {
+          "id": "z",
+          "prompt": 9,
+          "computed": 6,
+          "emitted": 0
+        }
+      ],
+      "waiting": [
+        {
+          "id": "w",
+          "prompt": 2,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {
+          "blocked": [
+            "x",
+            "z"
+          ]
+        },
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "y": 3,
+            "w": 2
+          },
+          "running": [
+            "y",
+            "w"
+          ],
+          "waiting": [
+            "x",
+            "z"
+          ],
+          "skipped": [
+            "x",
+            "z"
+          ],
+          "computed": {
+            "y": 9,
+            "w": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "w": 0,
+            "x": 0,
+            "y": 0,
+            "z": 0
+          }
+        },
+        {
+          "grants": {
+            "y": 1,
+            "w": 1,
+            "x": 3
+          },
+          "running": [
+            "y",
+            "w",
+            "x"
+          ],
+          "waiting": [
+            "z"
+          ],
+          "skipped": [
+            "z"
+          ],
+          "computed": {
+            "y": 10,
+            "w": 3,
+            "x": 9
+          },
+          "preempted": [],
+          "emitted": {
+            "w": 1,
+            "x": 0,
+            "y": 1,
+            "z": 0
+          }
+        },
+        {
+          "grants": {
+            "y": 1,
+            "w": 1,
+            "x": 1,
+            "z": 2
+          },
+          "running": [
+            "y",
+            "w",
+            "x",
+            "z"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "y": 11,
+            "w": 4,
+            "x": 10,
+            "z": 8
+          },
+          "preempted": [],
+          "emitted": {
+            "w": 2,
+            "x": 1,
+            "y": 2,
+            "z": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_1_0",
+      "budget": 1,
+      "chunk": 0,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 1
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_1_2",
+      "budget": 1,
+      "chunk": 2,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 1
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_1_7",
+      "budget": 1,
+      "chunk": 7,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 1
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_3_0",
+      "budget": 3,
+      "chunk": 0,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 3
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 3
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 6
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 3
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 9
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 3
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 12
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_3_2",
+      "budget": 3,
+      "chunk": 2,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 2,
+            "b": 1
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 2,
+            "b": 1
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 1
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 4,
+            "b": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 1
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 6,
+            "b": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 1
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 8,
+            "b": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_3_7",
+      "budget": 3,
+      "chunk": 7,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 3
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 3
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 6
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 3
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 9
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 3
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 12
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_8_0",
+      "budget": 8,
+      "chunk": 0,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 8
+          },
+          "running": [
+            "a"
+          ],
+          "waiting": [
+            "b",
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 8
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 5,
+            "b": 3
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 13,
+            "b": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 2,
+            "c": 5
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 14,
+            "b": 5,
+            "c": 5
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 1,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 1,
+            "c": 4
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 15,
+            "b": 6,
+            "c": 9
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 2,
+            "b": 1,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_8_2",
+      "budget": 8,
+      "chunk": 2,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 2,
+            "b": 2,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 2,
+            "b": 2,
+            "c": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 2,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 4,
+            "b": 4,
+            "c": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 1,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 6,
+            "b": 5,
+            "c": 6
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 1,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 8,
+            "b": 6,
+            "c": 8
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 1,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_8_7",
+      "budget": 8,
+      "chunk": 7,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 7,
+            "b": 1
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 7,
+            "b": 1
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 6,
+            "b": 2
+          },
+          "running": [
+            "a",
+            "b"
+          ],
+          "waiting": [
+            "c"
+          ],
+          "skipped": [],
+          "computed": {
+            "a": 13,
+            "b": 3
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 2,
+            "c": 5
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 14,
+            "b": 5,
+            "c": 5
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 1,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 1,
+            "c": 4
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 15,
+            "b": 6,
+            "c": 9
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 2,
+            "b": 1,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_32_0",
+      "budget": 32,
+      "chunk": 0,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 13,
+            "b": 5,
+            "c": 9
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 13,
+            "b": 5,
+            "c": 9
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 1,
+            "c": 1
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 14,
+            "b": 6,
+            "c": 10
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 1,
+            "b": 1,
+            "c": 1
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 1,
+            "c": 1
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 15,
+            "b": 7,
+            "c": 11
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 2,
+            "b": 2,
+            "c": 2
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 1,
+            "c": 1
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 16,
+            "b": 8,
+            "c": 12
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 3,
+            "b": 3,
+            "c": 3
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_32_2",
+      "budget": 32,
+      "chunk": 2,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 2,
+            "b": 2,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 2,
+            "b": 2,
+            "c": 2
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 2,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 4,
+            "b": 4,
+            "c": 4
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 1,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 6,
+            "b": 5,
+            "c": 6
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 2,
+            "b": 1,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 8,
+            "b": 6,
+            "c": 8
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 1,
+            "c": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "sweep_32_7",
+      "budget": 32,
+      "chunk": 7,
+      "max_seqs": 3,
+      "waiting": [
+        {
+          "id": "a",
+          "prompt": 13,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "b",
+          "prompt": 5,
+          "computed": 0,
+          "emitted": 0
+        },
+        {
+          "id": "c",
+          "prompt": 9,
+          "computed": 0,
+          "emitted": 0
+        }
+      ],
+      "steps": [
+        {},
+        {},
+        {},
+        {}
+      ],
+      "expected": [
+        {
+          "grants": {
+            "a": 7,
+            "b": 5,
+            "c": 7
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 7,
+            "b": 5,
+            "c": 7
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 0,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 6,
+            "b": 1,
+            "c": 2
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 13,
+            "b": 6,
+            "c": 9
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 0,
+            "b": 1,
+            "c": 0
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 1,
+            "c": 1
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 14,
+            "b": 7,
+            "c": 10
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 1,
+            "b": 2,
+            "c": 1
+          }
+        },
+        {
+          "grants": {
+            "a": 1,
+            "b": 1,
+            "c": 1
+          },
+          "running": [
+            "a",
+            "b",
+            "c"
+          ],
+          "waiting": [],
+          "skipped": [],
+          "computed": {
+            "a": 15,
+            "b": 8,
+            "c": 11
+          },
+          "preempted": [],
+          "emitted": {
+            "a": 2,
+            "b": 3,
+            "c": 2
+          }
+        }
+      ]
+    }
+  ]
+}
