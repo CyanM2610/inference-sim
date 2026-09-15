@@ -51,7 +51,12 @@ func run() error {
 		return err
 	}
 	logrus.SetLevel(logrus.ErrorLevel)
-	factories, err := policyFactories(*requestPlugin, *peerPlugin, *poolPlugin, *transferPlugin)
+	selectedRequest := *requestPlugin
+	if selectedRequest == "vllm_native" {
+		c.RequestScheduler = selectedRequest
+		selectedRequest = "" // complete batch strategy, not a DecisionPolicy alias
+	}
+	factories, err := policyFactories(selectedRequest, *peerPlugin, *poolPlugin, *transferPlugin)
 	if err != nil {
 		return err
 	}
