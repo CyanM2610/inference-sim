@@ -27,6 +27,8 @@ type PolicyConfig struct {
 	MaxStoreUS   int64  `json:"max_store_us"`
 }
 type RequestConfig struct {
+	AfterRequest    string        `json:"after_request,omitempty"`
+	ThinkTimeUS     int64         `json:"think_time_us,omitempty"`
 	ID              string        `json:"id"`
 	At              int64         `json:"at_us"`
 	Input           []sim.TokenID `json:"input_tokens"`
@@ -93,6 +95,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	ArrivalUS                           map[string]int64              `json:"arrival_us,omitempty"`
 	ProfileWarnings                     []ProfileWarning              `json:"profile_warnings,omitempty"`
 	ProfileCostCoverage                 string                        `json:"profile_cost_coverage,omitempty"`
 	VLLMNativeRevision                  string                        `json:"vllm_native_revision,omitempty"`
@@ -151,6 +154,9 @@ type Result struct {
 }
 
 func (c Config) Validate() error {
+	if err := c.validateConversationArrivals(); err != nil {
+		return err
+	}
 	if c.RequestScheduler == "vllm_native" {
 		if err := c.validateVLLMNative(); err != nil {
 			return err
@@ -589,8 +595,17 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 	out.FirstTokenUS = map[string]int64{}
 	out.FinishedUS = map[string]int64{}
 	requestConfig := map[string]RequestConfig{}
+	requestDeadlines := map[string]int64{}
+	closedLoop := false
 	for _, r := range c.Requests {
 		requestConfig[r.ID] = r
+		closedLoop = closedLoop || r.AfterRequest != ""
+		if r.TTFTSLOUS > 0 {
+			requestDeadlines[r.ID] = r.At + r.TTFTSLOUS
+		}
+	}
+	if closedLoop {
+		out.ArrivalUS = map[string]int64{}
 	}
 	sink := func(r kv.PeerRecord) { out.Events = append(out.Events, r); out.Counts[r.Name]++ }
 	fabric, err := kv.NewPeerFabric(c.Resources, c.Pools, out.BlockBytes, sink)
@@ -823,9 +838,21 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 			requests[len(requests)-1].SLOTargetUs = r.TTFTSLOUS
 			requests[len(requests)-1].MaxOutputLen = r.MaxOutputTokens
 		}
-		sink(kv.PeerRecord{Time: r.At, Name: "external_arrival", Request: r.ID})
+		if !closedLoop {
+			sink(kv.PeerRecord{Time: r.At, Name: "external_arrival", Request: r.ID})
+		}
 	}
 	sort.SliceStable(requests, func(i, j int) bool { return requests[i].ArrivalTime < requests[j].ArrivalTime })
+	conversation := newConversationArrivals(c, requests, requestConfig, requestDeadlines)
+	initial := requests
+	if closedLoop {
+		initial = nil
+		for _, r := range requests {
+			if requestConfig[r.ID].AfterRequest == "" {
+				initial = append(initial, r)
+			}
+		}
+	}
 	scfg := sim.SimConfig{Horizon: math.MaxInt64, Seed: c.Seed, BatchCompletionEvents: true,
 		KVCacheConfig:       sim.NewKVCacheConfig(c.Instances[0].HBMBlocks, c.BlockTokens, 0, 0, 0, 0),
 		BatchConfig:         sim.NewBatchConfig(c.MaxSequences, c.MaxBatchTokens, c.PrefillChunk),
@@ -1148,13 +1175,7 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 				out.PromotionCostCoverage = "controller_profile_excludes_engine_owned_promotion_work; base engine fees retained"
 			}
 		} else if c.RequestScheduler != "" && c.RequestScheduler != "vllm_native" {
-			deadlines := make(map[string]int64)
-			for _, r := range c.Requests {
-				if r.TTFTSLOUS > 0 {
-					deadlines[r.ID] = r.At + r.TTFTSLOUS
-				}
-			}
-			inst.SetInstanceScheduler(&requestScheduler{name: c.RequestScheduler, instance: string(id), deadlines: deadlines, sink: sink})
+			inst.SetInstanceScheduler(&requestScheduler{name: c.RequestScheduler, instance: string(id), deadlines: requestDeadlines, sink: sink})
 		}
 		if c.RequestScheduler == "vllm_native" {
 			if err := inst.SetVLLMNativeScheduler(); err != nil {
@@ -1218,7 +1239,17 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 		})
 		return inst
 	}
-	cs := cluster.NewClusterSimulator(dcfg, cluster.NewSliceRequestSource(requests), nil)
+	var onDone func(*sim.Request, int64) []*sim.Request
+	if closedLoop {
+		onDone = conversation.complete
+	}
+	cs := cluster.NewClusterSimulator(dcfg, cluster.NewSliceRequestSource(initial), onDone)
+	if closedLoop {
+		cs.SetArrivalHook(func(r *sim.Request) {
+			out.ArrivalUS[r.ID] = r.ArrivalTime
+			sink(kv.PeerRecord{Time: r.ArrivalTime, Name: "external_arrival", Request: r.ID})
+		})
+	}
 	for _, s := range stores {
 		s.StartOnlinePromotion()
 	}
@@ -1227,6 +1258,9 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 	}
 	if err := cs.Run(); err != nil {
 		return out, err
+	}
+	if conversation.err != nil {
+		return out, conversation.err
 	}
 	for _, request := range requests {
 		if request.PrefillEnd() > request.InputLen() {
