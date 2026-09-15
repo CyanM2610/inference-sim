@@ -41,6 +41,7 @@ type PromotionConfig struct {
 	Budget   int           `json:"block_budget"`
 }
 type Config struct {
+	HotPrefix                 *kv.HotPrefixConfig        `json:"hotprefix,omitempty"`
 	DirectionalTransferOrder  bool                       `json:"directional_transfer_order,omitempty"`
 	TransferSubmissionPolicy  string                     `json:"transfer_submission_policy,omitempty"`
 	TransferSubmissionCost    *kv.TransferSubmissionCost `json:"transfer_submission_cost,omitempty"`
@@ -91,6 +92,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	HotPrefixCostCoverage               string                        `json:"hotprefix_cost_coverage,omitempty"`
 	DirectionalTransferOrderCoverage    string                        `json:"directional_transfer_order_coverage,omitempty"`
 	TransferSubmissions                 []kv.TransferSubmissionRecord `json:"-"`
 	TransferSubmissionCostCoverage      string                        `json:"transfer_submission_cost_coverage,omitempty"`
@@ -455,12 +457,17 @@ func (c Config) Validate() error {
 		return fmt.Errorf("runner supports round-robin or least-loaded routing")
 	}
 	switch c.Policy.Name {
-	case "lru_drop", "lfu_store", "ready_first", "cost_aware":
+	case "lru_drop", "lfu_store", "ready_first", "cost_aware", "hotprefix":
 	default:
 		return fmt.Errorf("unknown peer policy %q", c.Policy.Name)
 	}
 	if c.Policy.MinFrequency < 0 || c.Policy.MaxStoreUS < 0 {
 		return fmt.Errorf("policy thresholds must be nonnegative")
+	}
+	if c.Policy.Name == "hotprefix" || c.HotPrefix != nil {
+		if err := c.validateHotPrefix(); err != nil {
+			return err
+		}
 	}
 	if c.Model.NumLocalExperts != 0 || c.Model.KVLoraRank != 0 || c.Model.KVBearingLayers != 0 {
 		return fmt.Errorf("this runner's calibrated scope is homogeneous dense MHA/GQA, TP=1")
@@ -529,6 +536,9 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 		return nil, err
 	}
 	hasSubmissionPolicy := factories.TransferSubmission != nil || c.TransferSubmissionPolicy != ""
+	if c.HotPrefix != nil && (factories.Peer != nil || factories.PoolEviction != nil || hasSubmissionPolicy) {
+		return nil, fmt.Errorf("HotPrefix owns coupled KV/pool placement; conflicting placement/transfer overrides are unsupported")
+	}
 	if hasSubmissionPolicy && c.EnginePhases == nil {
 		return nil, fmt.Errorf("transfer submission factory requires engine_phases")
 	}
@@ -622,6 +632,12 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 				return nil, err
 			}
 			out.PrefixCopyCostCoverage = "duplicate_prefix_index_not_independently_calibrated"
+		}
+		if c.HotPrefix != nil {
+			if err := stores[i].ConfigureHotPrefix(*c.HotPrefix); err != nil {
+				return nil, err
+			}
+			out.HotPrefixCostCoverage = "block_granular_exact_history; declared_planner_us_only; heat_reclaim_admission_late_load_planning_and_worker_metadata_overhead_unmeasured; native_ranking_unvalidated"
 		}
 	}
 	requests := make([]*sim.Request, 0, len(c.Requests))

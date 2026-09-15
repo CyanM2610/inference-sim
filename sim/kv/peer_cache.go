@@ -10,6 +10,7 @@ import (
 // PeerCache wraps BLIS's physical HBM allocator. DRAM and CXL are peers in
 // access, not stages in a chain. Only completed full input blocks are reusable.
 type PeerCache struct {
+	hotprefix            *hotPrefixRuntime
 	prefixCopies         map[string][]int64
 	decodeTargets        map[string]int64
 	allocationFailure    sim.AllocationFailure
@@ -226,7 +227,15 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 	promised := s.reclaimingBlocks(protect)
 	s.spaceWait[req] = int64(len(empty)) < n
 	for int64(len(empty))+promised < n && len(candidates) > 0 {
-		d := s.policy.Choose(cloneReclaimContext(PeerReclaimContext{Candidates: candidates, Targets: s.targets()}))
+		context := PeerReclaimContext{Candidates: candidates, Targets: s.targets()}
+		if s.hotprefix != nil {
+			context.ResidentHashes = s.hotPrefixResidents()
+		}
+		d := s.policy.Choose(cloneReclaimContext(context))
+		if d.Decline {
+			s.emit("reclaim_declined", req, "", "hbm", "", "no_eligible_victim")
+			break
+		}
 		idx := -1
 		for i, c := range candidates {
 			if c.ID == d.BlockID {
@@ -238,6 +247,9 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 			panic("peer policy selected a non-candidate block")
 		}
 		b := s.Blocks[d.BlockID]
+		if s.hotprefix != nil {
+			s.hotPrefixRecord("hotprefix_reclaim", req, b.Hash, d.Pool)
+		}
 		candidates = append(candidates[:idx], candidates[idx+1:]...)
 		s.emit("reclaim_decision", req, b.Hash, "hbm", d.Pool, "policy")
 		if d.Pool != "" && s.store(b, d.Pool, req) {
@@ -475,6 +487,7 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		b.Tokens = append([]sim.TokenID(nil), e.tokens...)
 		s.HashToBlock[h] = b.ID
 		s.publishReadyCopy(b)
+		s.releaseHotPrefixParent(h)
 		e.readers--
 		e.last = now
 		s.fabric.poolPolicyEvent(a.Pool, "ready", req, []string{h}, now)
@@ -484,7 +497,7 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 			delete(s.readPending, req)
 		}
 		if (background && !retainRequest) || s.cancelledRestores[req] {
-			if s.fabric.mechanisms.Online != nil {
+			if s.fabric.mechanisms.Online != nil || s.hotprefix != nil {
 				s.promoted[b.ID] = true
 			}
 			s.unpin(b)
@@ -539,6 +552,9 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 			s.touchRequestPools(req.ID, req.FullInputTokens())
 		}
 		if !s.observed[req.ID] {
+			if s.hotprefix != nil {
+				s.observeHotPrefix(req)
+			}
 			for _, h := range hashes {
 				s.frequency[h]++
 			}
@@ -695,6 +711,9 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	// Compatibility method name in KVStore; peer mode publishes computed HBM
 	// blocks here. An explicitly configured background pool also receives them.
 	for _, req := range batch {
+		if s.hotprefix != nil {
+			s.hotprefix.policy.remember(s.hotPrefixKeys(req.PrefillTokens()))
+		}
 		stored := false
 		if s.fabric.mechanisms.GroupTransfers {
 			s.fabric.beginTransferGroup()
@@ -712,7 +731,7 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 					s.fabric.native.computed(s.clock, id, b.Hash)
 				}
 				s.publishReadyCopy(b)
-				if pool := s.fabric.mechanisms.BackgroundStorePool; pool != "" && s.fabric.mechanisms.BackgroundStoreMode != "on_preemption" {
+				if pool := s.fabric.mechanisms.BackgroundStorePool; pool != "" && (s.fabric.mechanisms.BackgroundStoreMode == "" || s.fabric.mechanisms.BackgroundStoreMode == "continuous") {
 					if s.backgroundOffered[req.ID] == nil {
 						s.backgroundOffered[req.ID] = map[string]bool{}
 					}
@@ -731,6 +750,10 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 		}
 		if s.fabric.mechanisms.GroupTransfers {
 			s.fabric.endTransferGroup(s.clock)
+		}
+		if h := s.hotprefix; h != nil && req.ProgressIndex >= req.PrefillEnd() && !h.prefills[req.ID] {
+			h.prefills[req.ID] = true
+			h.wantPromotion = h.policy.config.PromotionBlocks > 0
 		}
 	}
 }
@@ -852,6 +875,12 @@ func (s *PeerCache) promotePrefix(tokens []sim.TokenID, budget int, attempted ma
 }
 func (s *PeerCache) PeerSnapshot() map[string]int64 {
 	m := map[string]int64{"capacity": s.TotalBlocks, "free": s.FreeBlockCnt, "active_or_pinned": s.TotalBlocks - s.FreeBlockCnt, "ready": int64(len(s.ready)), "pending_reads": int64(len(s.restoring)), "held_restores": 0}
+	if s.hotprefix != nil {
+		m["hotprefix_history_nodes"] = int64(len(s.hotprefix.policy.nodes))
+		m["hotprefix_requests_observed"] = s.hotprefix.policy.requests
+		m["hotprefix_parent_pins"] = int64(len(s.hotprefix.parentHolds))
+		m["promoted_unconsumed_resident"] = int64(len(s.promoted))
+	}
 	if p := s.fabric.phases; p != nil && p.workerResidents != nil {
 		m["worker_resident_requests"] = int64(len(p.workerResidents))
 	}
