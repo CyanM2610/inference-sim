@@ -424,7 +424,7 @@ func NewClusterSimulator(config DeploymentConfig, requestSource RequestSource, o
 			// of the node(s) this instance actually landed on) so the latency model can
 			// price cross-node collective traffic. Inert when unresolvable.
 			cs.applyPlacementTopology(&simCfg, gpuIDs)
-			inst := NewInstanceSimulator(id, simCfg)
+			inst := cs.newInstance(id, simCfg)
 			inst.Model = config.Model
 			inst.nodeID = nodeID
 			inst.allocatedGPUIDs = gpuIDs
@@ -453,7 +453,7 @@ func NewClusterSimulator(config DeploymentConfig, requestSource RequestSource, o
 			// DeploymentConfig's embedded SimConfig) is the authoritative source (backward-compat).
 			// simCfg.GPU is already set — resolveConfigForRole returns config.SimConfig as-is
 			// for the default role, preserving ModelHardwareConfig.GPU from the CLI flag.
-			inst := NewInstanceSimulator(id, simCfg)
+			inst := cs.newInstance(id, simCfg)
 			inst.Model = config.Model
 			inst.warmUpRemaining = config.InstanceLifecycle.WarmUpRequestCount
 			if inst.warmUpRemaining > 0 {
@@ -1207,7 +1207,7 @@ func (cs *ClusterSimulator) addLiveInstance(
 	tpDegree int,
 	costPerHour float64,
 ) bool {
-	inst := NewInstanceSimulator(id, simCfg)
+	inst := cs.newInstance(id, simCfg)
 	inst.Model = model
 	inst.nodeID = nodeID
 	inst.allocatedGPUIDs = gpuIDs
