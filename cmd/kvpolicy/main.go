@@ -92,6 +92,24 @@ func run() error {
 		}
 	}
 	if runErr == nil {
+		if len(r.HotPrefixDiagnostics) > 0 {
+			f, err := os.Create(filepath.Join(*output, "hotprefix-choices.jsonl"))
+			if err != nil {
+				return err
+			}
+			enc := json.NewEncoder(f)
+			for _, d := range r.HotPrefixDiagnostics {
+				for _, choice := range d.Records {
+					if err := enc.Encode(choice); err != nil {
+						f.Close()
+						return err
+					}
+				}
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
+		}
 		var measured []string
 		if *utilizationRequests != "" {
 			if err = json.Unmarshal([]byte(*utilizationRequests), &measured); err != nil || len(measured) == 0 {

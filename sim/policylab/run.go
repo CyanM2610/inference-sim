@@ -95,47 +95,48 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
-	StoreSourceReuseContract            string                        `json:"store_source_reuse_contract,omitempty"`
-	EnginePhaseObservations             []kv.EnginePhaseObservation   `json:"-"`
-	CacheMetrics                        CacheMetrics                  `json:"cache_metrics"`
-	ArrivalUS                           map[string]int64              `json:"arrival_us,omitempty"`
-	ProfileWarnings                     []ProfileWarning              `json:"profile_warnings,omitempty"`
-	ProfileCostCoverage                 string                        `json:"profile_cost_coverage,omitempty"`
-	VLLMNativeRevision                  string                        `json:"vllm_native_revision,omitempty"`
-	VLLMNativeCostCoverage              string                        `json:"vllm_native_cost_coverage,omitempty"`
-	HotPrefixCostCoverage               string                        `json:"hotprefix_cost_coverage,omitempty"`
-	DirectionalTransferOrderCoverage    string                        `json:"directional_transfer_order_coverage,omitempty"`
-	TransferSubmissions                 []kv.TransferSubmissionRecord `json:"-"`
-	TransferSubmissionCostCoverage      string                        `json:"transfer_submission_cost_coverage,omitempty"`
-	DecodeFillServiceCostCoverage       string                        `json:"decode_fill_service_cost_coverage,omitempty"`
-	SpillEstimateCoverage               string                        `json:"spill_estimate_coverage,omitempty"`
-	RequestSpillCostCoverage            string                        `json:"request_spill_cost_coverage,omitempty"`
-	QueueServiceCostCoverage            string                        `json:"queue_service_cost_coverage,omitempty"`
-	WorkerMetadataCostCoverage          string                        `json:"worker_metadata_cost_coverage,omitempty"`
-	PostStepServices                    []sim.PostStepRecord          `json:"-"`
-	PostStepCostCoverage                string                        `json:"post_step_cost_coverage,omitempty"`
-	WaitExecutionCostCoverage           string                        `json:"wait_execution_cost_coverage,omitempty"`
-	RequestRecomputeCostCoverage        string                        `json:"request_recompute_cost_coverage,omitempty"`
-	HostServices                        []sim.HostServiceRecord       `json:"-"`
-	HostServiceCostCoverage             string                        `json:"host_service_cost_coverage,omitempty"`
-	PrefixCopyCostCoverage              string                        `json:"prefix_copy_cost_coverage,omitempty"`
-	DecodeCapacityCostCoverage          string                        `json:"decode_capacity_cost_coverage,omitempty"`
-	CapacityReservationViewCostCoverage string                        `json:"capacity_reservation_view_cost_coverage,omitempty"`
-	DecisionAdditionalCostCoverage      string                        `json:"decision_additional_cost_coverage,omitempty"`
-	PrefillPreemptionCostCoverage       string                        `json:"prefill_preemption_cost_coverage,omitempty"`
-	PrefillWaitCostCoverage             string                        `json:"prefill_wait_cost_coverage,omitempty"`
-	PrefillDeferralCostCoverage         string                        `json:"prefill_deferral_cost_coverage,omitempty"`
-	PromotionCostCoverage               string                        `json:"promotion_cost_coverage,omitempty"`
-	InjectedPolicies                    map[string]map[string]string  `json:"injected_policies,omitempty"`
-	KVPolicyCostCoverage                string                        `json:"kv_policy_cost_coverage,omitempty"`
-	BatchPrefixCostCoverage             string                        `json:"batch_prefix_cost_coverage,omitempty"`
-	DecisionEstimateCoverage            string                        `json:"decision_estimate_coverage,omitempty"`
-	RestoreCostCoverage                 string                        `json:"restore_cost_coverage,omitempty"`
-	PolicyDecisions                     []sim.DecisionRecord          `json:"-"`
-	DecisionCostCoverage                string                        `json:"decision_cost_coverage,omitempty"`
-	PolicyEvents                        []sim.DecisionEventRecord     `json:"-"`
-	DecisionEventCostCoverage           string                        `json:"decision_event_cost_coverage,omitempty"`
-	BatchShapes                         []BatchCostObservation        `json:"batch_shapes,omitempty"`
+	HotPrefixDiagnostics                map[string]*kv.HotPrefixDiagnostics `json:"hotprefix_diagnostics,omitempty"`
+	StoreSourceReuseContract            string                              `json:"store_source_reuse_contract,omitempty"`
+	EnginePhaseObservations             []kv.EnginePhaseObservation         `json:"-"`
+	CacheMetrics                        CacheMetrics                        `json:"cache_metrics"`
+	ArrivalUS                           map[string]int64                    `json:"arrival_us,omitempty"`
+	ProfileWarnings                     []ProfileWarning                    `json:"profile_warnings,omitempty"`
+	ProfileCostCoverage                 string                              `json:"profile_cost_coverage,omitempty"`
+	VLLMNativeRevision                  string                              `json:"vllm_native_revision,omitempty"`
+	VLLMNativeCostCoverage              string                              `json:"vllm_native_cost_coverage,omitempty"`
+	HotPrefixCostCoverage               string                              `json:"hotprefix_cost_coverage,omitempty"`
+	DirectionalTransferOrderCoverage    string                              `json:"directional_transfer_order_coverage,omitempty"`
+	TransferSubmissions                 []kv.TransferSubmissionRecord       `json:"-"`
+	TransferSubmissionCostCoverage      string                              `json:"transfer_submission_cost_coverage,omitempty"`
+	DecodeFillServiceCostCoverage       string                              `json:"decode_fill_service_cost_coverage,omitempty"`
+	SpillEstimateCoverage               string                              `json:"spill_estimate_coverage,omitempty"`
+	RequestSpillCostCoverage            string                              `json:"request_spill_cost_coverage,omitempty"`
+	QueueServiceCostCoverage            string                              `json:"queue_service_cost_coverage,omitempty"`
+	WorkerMetadataCostCoverage          string                              `json:"worker_metadata_cost_coverage,omitempty"`
+	PostStepServices                    []sim.PostStepRecord                `json:"-"`
+	PostStepCostCoverage                string                              `json:"post_step_cost_coverage,omitempty"`
+	WaitExecutionCostCoverage           string                              `json:"wait_execution_cost_coverage,omitempty"`
+	RequestRecomputeCostCoverage        string                              `json:"request_recompute_cost_coverage,omitempty"`
+	HostServices                        []sim.HostServiceRecord             `json:"-"`
+	HostServiceCostCoverage             string                              `json:"host_service_cost_coverage,omitempty"`
+	PrefixCopyCostCoverage              string                              `json:"prefix_copy_cost_coverage,omitempty"`
+	DecodeCapacityCostCoverage          string                              `json:"decode_capacity_cost_coverage,omitempty"`
+	CapacityReservationViewCostCoverage string                              `json:"capacity_reservation_view_cost_coverage,omitempty"`
+	DecisionAdditionalCostCoverage      string                              `json:"decision_additional_cost_coverage,omitempty"`
+	PrefillPreemptionCostCoverage       string                              `json:"prefill_preemption_cost_coverage,omitempty"`
+	PrefillWaitCostCoverage             string                              `json:"prefill_wait_cost_coverage,omitempty"`
+	PrefillDeferralCostCoverage         string                              `json:"prefill_deferral_cost_coverage,omitempty"`
+	PromotionCostCoverage               string                              `json:"promotion_cost_coverage,omitempty"`
+	InjectedPolicies                    map[string]map[string]string        `json:"injected_policies,omitempty"`
+	KVPolicyCostCoverage                string                              `json:"kv_policy_cost_coverage,omitempty"`
+	BatchPrefixCostCoverage             string                              `json:"batch_prefix_cost_coverage,omitempty"`
+	DecisionEstimateCoverage            string                              `json:"decision_estimate_coverage,omitempty"`
+	RestoreCostCoverage                 string                              `json:"restore_cost_coverage,omitempty"`
+	PolicyDecisions                     []sim.DecisionRecord                `json:"-"`
+	DecisionCostCoverage                string                              `json:"decision_cost_coverage,omitempty"`
+	PolicyEvents                        []sim.DecisionEventRecord           `json:"-"`
+	DecisionEventCostCoverage           string                              `json:"decision_event_cost_coverage,omitempty"`
+	BatchShapes                         []BatchCostObservation              `json:"batch_shapes,omitempty"`
 	// Absolute first observation, captured once before any possible re-prefill
 	// overwrites legacy core TTFT fields. These are the ranking API timestamps.
 	FirstTokenUS      map[string]int64            `json:"first_token_us"`
@@ -1298,6 +1299,12 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 	out.RoutingTrace = cs.Trace()
 	for i, s := range stores {
 		out.HBM[fmt.Sprintf("instance_%d", i)] = s.PeerSnapshot()
+		if diagnostics := s.HotPrefixDiagnostics(); diagnostics != nil {
+			if out.HotPrefixDiagnostics == nil {
+				out.HotPrefixDiagnostics = map[string]*kv.HotPrefixDiagnostics{}
+			}
+			out.HotPrefixDiagnostics[fmt.Sprintf("instance_%d", i)] = diagnostics
+		}
 	}
 	// Sort only by simulated time; stable ties retain execution order.
 	sort.SliceStable(out.Events, func(i, j int) bool { return out.Events[i].Time < out.Events[j].Time })

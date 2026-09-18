@@ -236,6 +236,7 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 			context.ResidentHashes = s.hotPrefixResidents()
 		}
 		d := s.policy.Choose(cloneReclaimContext(context))
+		s.annotateHotPrefixChoice(req, n-int64(len(empty))-promised)
 		if d.Decline {
 			s.emit("reclaim_declined", req, "", "hbm", "", "no_eligible_victim")
 			break
