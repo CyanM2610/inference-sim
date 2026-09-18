@@ -220,10 +220,12 @@ func (c *PlacementCostSnapshot) access(path []string, reuseOffset int64, blockTo
 		}
 		index = end
 	}
-	compute := c.model.compute(int64(index)*blockTokens, int64(len(path)-index)*blockTokens+1)
+	compute := c.model.computeWithGPUWait(int64(index)*blockTokens, int64(len(path)-index)*blockTokens+1,
+		max(0, c.GPUWaitUS-reuseOffset-r.TotalUS))
 	r.TotalUS += compute.TotalUS
 	r.ComputeUS = compute.ComputeUS
 	r.ComputeSteps = compute.ComputeSteps
 	r.ComputedTokens = compute.ComputedTokens
+	r.ComputeInitialGPUWaitUS = compute.ComputeInitialGPUWaitUS
 	return r
 }

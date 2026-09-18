@@ -41,6 +41,29 @@ func TestPlacementComputeUsesEngineBoundariesAndChunkGPUCarry(t *testing.T) {
 	}
 }
 
+func TestPlacementAccessHonorsKnownGPUWaitForHBMHitsAndRecompute(t *testing.T) {
+	s := &PlacementCostSnapshot{HBM: map[string]int{"prefix": 1}, Host: map[string]PlacementHostCopy{},
+		model: costFixture(t), RestoreWindow: 4, GPUWaitUS: 1000}
+	hit := s.access([]string{"prefix"}, 0, 16)
+	if hit.TotalUS != 1035 || hit.ComputeInitialGPUWaitUS != 990 || hit.LoadedBlocks != 0 {
+		t.Fatal("HBM hit ignored already queued GPU work", hit)
+	}
+	delete(s.HBM, "prefix")
+	drop := s.access([]string{"prefix"}, 0, 16)
+	if drop.TotalUS != 1215 || drop.ComputeInitialGPUWaitUS != 990 || drop.ComputedTokens != 17 {
+		t.Fatal("recompute ignored the same known GPU queue", drop)
+	}
+	after := s.access([]string{"prefix"}, 1000, 16)
+	if after.TotalUS != 225 || after.ComputeInitialGPUWaitUS != 0 {
+		t.Fatal("expired queue charged again", after)
+	}
+	s.Host["prefix"] = PlacementHostCopy{Ready: true}
+	loaded := s.access([]string{"prefix"}, 0, 16)
+	if loaded.ComputeInitialGPUWaitUS != 0 || loaded.LoadedBlocks != 1 || loaded.LoadQueueUS <= 0 {
+		t.Fatal("LOAD and compute double charged the same GPU dependency", loaded)
+	}
+}
+
 func TestPlacementVectorCopyCostsAndDelayedAdoption(t *testing.T) {
 	p := costFixture(t)
 	if p.storeService(4) >= 4*p.storeService(1) {
