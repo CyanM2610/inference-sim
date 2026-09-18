@@ -13,6 +13,13 @@ import (
 	"github.com/inference-sim/inference-sim/sim/internal/tokenid"
 )
 
+// SHA256Hex identifies serialized diagnostic content. Cache blocks and native
+// token lineages retain their separate identity encodings below.
+func SHA256Hex(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
 // HashTokenLineage preserves the native runtime's causal token identity format:
 // 32 raw previous-digest bytes followed by one little-endian uint32 token. This
 // is distinct from HashBlock's textual block encoding; do not interchange them.

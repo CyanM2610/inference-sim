@@ -81,7 +81,7 @@ func (s *PeerCache) shadowHotPrefixDrop(hash, request string) {
 		return
 	}
 	n := h.policy.nodes[hash]
-	if n == nil || n.frequency == 0 || n.frequency >= h.policy.config.AdmissionThreshold {
+	if n == nil || n.frequency == 0 || n.frequency >= h.policy.shadowThreshold() {
 		return
 	}
 	if h.shadowTTL == 0 {
@@ -97,6 +97,19 @@ func (s *PeerCache) shadowHotPrefixDrop(hash, request string) {
 	heap.Push(&h.expiry, x)
 	s.fabric.emit(PeerRecord{Time: s.clock, Name: "hotprefix_shadow_create", Instance: s.id, Request: request, Hash: hash,
 		Reason: "frequency_below_threshold", Counters: map[string]int64{"frequency": n.frequency, "clock": n.clock, "expires_at_us": x.expires}})
+}
+
+// Legacy configurations couple low-frequency Shadow eligibility to admission.
+// An explicit threshold isolates this mechanism in admission experiments. A
+// common warmup must not accidentally use the target's threshold before switch.
+func (p *HotPrefixPolicy) shadowThreshold() int64 {
+	if p.config.ShadowThreshold != nil {
+		return *p.config.ShadowThreshold
+	}
+	if c := p.config.AdmissionCost; c != nil && c.WarmupUntilFullReady != nil && !p.admissionWarmupFinished {
+		return c.WarmupUntilFullReady.AdmissionThreshold
+	}
+	return p.config.AdmissionThreshold
 }
 
 // Use the same effective original-prefix range as cache reuse metrics, but
