@@ -4,6 +4,7 @@ package kv
 // Persistent heat and shadow identity stay with each physical prefix hash. A
 // segment does not sum its members' access counts or use cumulative depth as L.
 type hotPrefixLogicalSegment struct {
+	benefit *HotPrefixBenefitEstimate
 	members []PeerReclaimAction // tail to head; runtime preserves this order
 	hashes  []string
 	lru     int
@@ -81,6 +82,18 @@ func (p *HotPrefixPolicy) logicalSegments(c PeerReclaimContext) []hotPrefixLogic
 
 func (p *HotPrefixPolicy) chooseLogicalSegment(c PeerReclaimContext) PeerDecision {
 	segments := p.logicalSegments(c)
+	if p.config.Benefit != nil {
+		if c.BenefitCosts == nil {
+			panic("logical benefit choice lacks a current cost snapshot")
+		}
+		for i := range segments {
+			segments[i].benefit = p.assessBenefit(segments[i], c.BenefitCosts)
+			if p.config.HBMScore == "benefit_next" {
+				segments[i].score = segments[i].benefit.ValueUSPerByte
+			}
+		}
+	}
+	p.lastSegments = segments
 	best := -1
 	for i, g := range segments {
 		if best < 0 || g.score < segments[best].score || g.score == segments[best].score && g.lru < segments[best].lru {
@@ -97,10 +110,10 @@ func (p *HotPrefixPolicy) chooseLogicalSegment(c PeerReclaimContext) PeerDecisio
 func (p *HotPrefixPolicy) recordLogicalChoice(c PeerReclaimContext, r *HotPrefixChoice) {
 	r.CandidateUnit = "logical_segment"
 	r.PhysicalIdleBlocks = int64(len(c.Candidates))
-	for _, g := range p.logicalSegments(c) {
+	for _, g := range p.lastSegments {
 		x := HotPrefixChoiceCandidate{BlockID: g.members[0].BlockID, Hash: g.hashes[0], LRUIndex: g.lru,
 			Eligible: true, Frequency: g.freq, Clock: g.clock, LengthTokens: int64(len(g.members)) * p.blockTokens,
-			Depth: g.depth, Score: g.score, MemberHashes: append([]string(nil), g.hashes...)}
+			Depth: g.depth, Score: g.score, MemberHashes: append([]string(nil), g.hashes...), Benefit: g.benefit}
 		for _, a := range g.members {
 			x.MemberBlocks = append(x.MemberBlocks, a.BlockID)
 		}

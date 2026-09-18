@@ -133,6 +133,7 @@ func (s *PeerCache) completeHotPrefixReuse(req *sim.Request) {
 		if r.credited[use.hash] {
 			continue
 		}
+		s.completedBenefitReference(use.hash, req.ID)
 		h.policy.reuse(use.hash, r.shadowMatches[use.hash])
 		if _, matched := r.shadowMatches[use.hash]; matched {
 			s.hotPrefixRecord("hotprefix_shadow_reuse", req.ID, use.hash, "", "kv_reused")
@@ -157,6 +158,7 @@ func (s *PeerCache) publishHotPrefixCompute(req *sim.Request, b *KVBlock) {
 	if r.credited[b.Hash] {
 		return
 	}
+	s.completedBenefitReference(b.Hash, req.ID)
 	if frequency, matched := r.shadowMatches[b.Hash]; matched {
 		h.policy.reuse(b.Hash, frequency)
 		s.hotPrefixRecord("hotprefix_shadow_reuse", req.ID, b.Hash, "", "recomputed")

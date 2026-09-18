@@ -32,6 +32,12 @@ type EnginePhaseCostConfig struct {
 	Provenance         string              `json:"provenance"`
 }
 
+func (c EnginePhaseCostConfig) PlacementPredictionModel() kv.EnginePhaseModel {
+	// Predictive calls must not masquerade as execution coverage observations.
+	c.profileReporter = profileReporter{}
+	return c
+}
+
 // EngineLoadPlanningCost models [one active step, new load jobs, new blocks].
 // It must be measured above the existing phase baseline, not from total TTFT.
 type EngineLoadPlanningCost struct {

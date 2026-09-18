@@ -14,6 +14,9 @@ func (c Config) validateHotPrefix() error {
 	if err := c.HotPrefix.Validate(); err != nil {
 		return err
 	}
+	if c.HotPrefix.Benefit != nil && !c.RestoreControl {
+		return fmt.Errorf("benefit predictions require native restore semantics")
+	}
 	if len(c.Instances) != 1 || len(c.Pools) != 1 || c.Pools[0].ID != "dram" || len(c.Instances[0].Access) != 1 || c.Instances[0].Access[0].Pool != "dram" {
 		return fmt.Errorf("HotPrefix scope is one HBM instance and one DRAM pool")
 	}
