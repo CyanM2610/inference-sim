@@ -29,19 +29,20 @@ type PlacementPredictionModel interface {
 }
 
 type PlacementAccessCost struct {
-	TotalUS            int64 `json:"total_us"`
-	ComputeUS          int64 `json:"compute_us"`
-	ComputedTokens     int64 `json:"computed_tokens"`
-	ComputeSteps       int64 `json:"compute_steps"`
-	LoadReadyUS        int64 `json:"load_ready_us"`
-	LoadPlanningUS     int64 `json:"load_planning_us"`
-	LoadSubmitUS       int64 `json:"load_submit_us"`
-	LoadDataUS         int64 `json:"load_data_us"`
-	LoadQueueUS        int64 `json:"load_queue_us"`
-	LoadAdoptionWaitUS int64 `json:"load_adoption_wait_us"`
-	PendingStoreWaitUS int64 `json:"pending_store_wait_us"`
-	LoadedBlocks       int64 `json:"loaded_blocks"`
-	LoadGroups         int64 `json:"load_groups"`
+	ComputeInitialGPUWaitUS int64 `json:"compute_initial_gpu_wait_us,omitempty"`
+	TotalUS                 int64 `json:"total_us"`
+	ComputeUS               int64 `json:"compute_us"`
+	ComputedTokens          int64 `json:"computed_tokens"`
+	ComputeSteps            int64 `json:"compute_steps"`
+	LoadReadyUS             int64 `json:"load_ready_us"`
+	LoadPlanningUS          int64 `json:"load_planning_us"`
+	LoadSubmitUS            int64 `json:"load_submit_us"`
+	LoadDataUS              int64 `json:"load_data_us"`
+	LoadQueueUS             int64 `json:"load_queue_us"`
+	LoadAdoptionWaitUS      int64 `json:"load_adoption_wait_us"`
+	PendingStoreWaitUS      int64 `json:"pending_store_wait_us"`
+	LoadedBlocks            int64 `json:"loaded_blocks"`
+	LoadGroups              int64 `json:"load_groups"`
 }
 
 type PlacementLoadCost struct {
@@ -96,16 +97,23 @@ func (c *PlacementPhaseCosts) timing(prefix, query int64, fresh bool) EngineStep
 }
 
 func (c *PlacementPhaseCosts) compute(prefix, query int64) PlacementAccessCost {
-	if prefix < 0 || query <= 0 {
+	return c.computeWithGPUWait(prefix, query, 0)
+}
+
+func (c *PlacementPhaseCosts) computeWithGPUWait(prefix, query, initialGPUReady int64) PlacementAccessCost {
+	if prefix < 0 || query <= 0 || initialGPUReady < 0 {
 		panic("invalid conditional compute shape")
 	}
 	r := PlacementAccessCost{ComputedTokens: query}
-	gpuReady := int64(0)
+	gpuReady := initialGPUReady
 	for query > 0 {
 		q := min(c.chunk, query)
 		t := c.timing(prefix, q, r.ComputeSteps == 0)
 		base := r.TotalUS + c.decisionUS
 		gpuBase := max(base, gpuReady)
+		if r.ComputeSteps == 0 {
+			r.ComputeInitialGPUWaitUS = gpuBase - base
+		}
 		gpuReady = gpuBase + t.GPUReadyUS
 		r.TotalUS = max(base+t.PostForwardUS+t.PollUS, gpuBase+t.OutputReadyUS) + t.TailUS
 		r.ComputeSteps++
