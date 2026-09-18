@@ -10,17 +10,18 @@ import (
 // PeerCache wraps BLIS's physical HBM allocator. DRAM and CXL are peers in
 // access, not stages in a chain. Only completed full input blocks are reusable.
 type PeerCache struct {
-	cacheMetrics         *cacheMetricState
-	hotprefix            *hotPrefixRuntime
-	prefixCopies         map[string][]int64
-	decodeTargets        map[string]int64
-	allocationFailure    sim.AllocationFailure
-	promotionRetention   string
-	promotionControl     bool
-	batchPrefixes        *batchPrefixState
-	restoreControl       bool
-	restoreLimits        map[string]int64
-	restoredPrefixBlocks map[string]int64
+	nativeRestoreAdmission bool
+	cacheMetrics           *cacheMetricState
+	hotprefix              *hotPrefixRuntime
+	prefixCopies           map[string][]int64
+	decodeTargets          map[string]int64
+	allocationFailure      sim.AllocationFailure
+	promotionRetention     string
+	promotionControl       bool
+	batchPrefixes          *batchPrefixState
+	restoreControl         bool
+	restoreLimits          map[string]int64
+	restoredPrefixBlocks   map[string]int64
 	*KVCacheState
 	id                string
 	fabric            *PeerFabric
@@ -936,6 +937,10 @@ func (s *PeerCache) promotePrefix(tokens []sim.TokenID, budget int, attempted ma
 }
 func (s *PeerCache) PeerSnapshot() map[string]int64 {
 	m := map[string]int64{"capacity": s.TotalBlocks, "free": s.FreeBlockCnt, "active_or_pinned": s.TotalBlocks - s.FreeBlockCnt, "ready": int64(len(s.ready)), "pending_reads": int64(len(s.restoring)), "held_restores": 0}
+	if s.nativeRestoreAdmission {
+		m["prefill_reserved_blocks"] = s.otherPrefillReservations("")
+		m["prefill_reservation_requests"] = int64(len(s.prefillTargets))
+	}
 	if s.hotprefix != nil {
 		m["hotprefix_history_nodes"] = int64(len(s.hotprefix.policy.nodes))
 		m["hotprefix_shadow_entries"] = int64(len(s.hotprefix.shadows))

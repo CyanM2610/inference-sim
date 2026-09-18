@@ -96,6 +96,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	RestoreAdmissionContract            string                              `json:"restore_admission_contract,omitempty"`
 	FuturePlacementCoverage             string                              `json:"future_placement_coverage,omitempty"`
 	HotPrefixDiagnostics                map[string]*kv.HotPrefixDiagnostics `json:"hotprefix_diagnostics,omitempty"`
 	StoreSourceReuseContract            string                              `json:"store_source_reuse_contract,omitempty"`
@@ -789,6 +790,12 @@ func runWithObservation(c Config, factories PolicyFactories, observation *runObs
 				return nil, err
 			}
 			out.RestoreCostCoverage = "engine_phase_profile_restore_choices_not_native_validated"
+			if c.RequestScheduler == "vllm_native" {
+				if err := stores[0].EnableNativeRestoreAdmission(); err != nil {
+					return nil, err
+				}
+				out.RestoreAdmissionContract = kv.NativeRestoreAdmissionContract
+			}
 		}
 		if c.HotPrefix != nil && c.HotPrefix.Benefit != nil {
 			chunk := c.MaxBatchTokens
