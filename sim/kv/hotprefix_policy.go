@@ -8,6 +8,7 @@ import (
 // HotPrefixConfig controls block placement or the explicitly named resident
 // logical-segment adaptation. Both use exact per-prefix heat metadata.
 type HotPrefixConfig struct {
+	AdmissionCost         *HotPrefixAdmissionConfig   `json:"admission_cost,omitempty"`
 	Benefit               *HotPrefixBenefitConfig     `json:"benefit,omitempty"`
 	HBMEvictionUnit       string                      `json:"hbm_eviction_unit,omitempty"`
 	LengthReferenceTokens int64                       `json:"length_reference_tokens,omitempty"`
@@ -23,6 +24,14 @@ type HotPrefixConfig struct {
 }
 
 func (c HotPrefixConfig) Validate() error {
+	if c.AdmissionCost != nil {
+		if c.AdmissionCost.Rule != "threshold" && c.AdmissionCost.Rule != "cost_next" {
+			return fmt.Errorf("invalid HotPrefix admission_cost rule")
+		}
+		if c.Benefit == nil || (c.HBMEvictionUnit != "" && c.HBMEvictionUnit != "block") {
+			return fmt.Errorf("admission cost experiment requires forecast and block reclamation; logical groups need a group-aware prediction")
+		}
+	}
 	if c.Benefit != nil {
 		if err := c.Benefit.Validate(); err != nil {
 			return err
@@ -281,6 +290,24 @@ func (p hotPrefixPoolPolicy) Victim(c []PoolEvictionCandidate) string {
 func (p hotPrefixPoolPolicy) Admit(c PoolAdmissionContext) PoolAdmissionDecision {
 	started := p.state.cpuStart()
 	defer p.state.cpuEnd("dram_admit", started)
+	if config := p.state.config.AdmissionCost; config != nil {
+		estimate := p.state.assessAdmission(c)
+		var d PoolAdmissionDecision
+		if config.Rule == "threshold" {
+			d = p.admitThreshold(c)
+		} else {
+			d = PoolAdmissionDecision{Accept: estimate.CostAccept, Reason: estimate.CostReason}
+			if d.Accept {
+				d.Victim = estimate.Victim
+			}
+		}
+		d.AdmissionCost = estimate
+		return d
+	}
+	return p.admitThreshold(c)
+}
+
+func (p hotPrefixPoolPolicy) admitThreshold(c PoolAdmissionContext) PoolAdmissionDecision {
 	n := p.state.nodes[c.Hash]
 	if n == nil || n.frequency == 0 || n.frequency < p.state.config.AdmissionThreshold {
 		return PoolAdmissionDecision{Reason: "frequency_below_threshold"}

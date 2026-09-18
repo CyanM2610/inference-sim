@@ -35,13 +35,16 @@ type PoolEvictionPolicy interface {
 // an incoming block can evict a copy or reserve capacity. Existing hits/joined
 // stores bypass admission; they require no new physical allocation.
 type PoolAdmissionContext struct {
+	Costs                      *PlacementCostSnapshot // detached current placement state; optional
 	Hash                       string
 	CapacityBlocks, UsedBlocks int64
 	Candidates                 []PoolEvictionCandidate
 }
 type PoolAdmissionDecision struct {
-	Accept bool
-	Reason string
+	Accept        bool
+	Reason        string
+	Victim        string // optional explicit replacement; runtime checks eligibility before mutation
+	AdmissionCost *HotPrefixAdmissionEstimate
 }
 type PoolAdmissionPolicy interface {
 	Admit(PoolAdmissionContext) PoolAdmissionDecision

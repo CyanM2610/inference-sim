@@ -776,6 +776,9 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 				return nil, err
 			}
 			out.HotPrefixCostCoverage += "; conditional_next_reference_benefit_estimates_not_actual_future_costs"
+			if c.HotPrefix.AdmissionCost != nil {
+				out.HotPrefixCostCoverage += "; single_block_cost_admission_with_fixed_HP_victim_and_conditional_slot_opportunity; full_descendant_future_traffic_and_native_policy_cost_unvalidated"
+			}
 		}
 		if c.PromotionControl {
 			retention := c.PromotionRetention

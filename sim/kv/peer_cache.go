@@ -334,7 +334,11 @@ func (s *PeerCache) storeCopy(b *KVBlock, pool, req string, retain bool) bool {
 	if retain && s.fabric.pools[pool].entries[h] != nil {
 		return false
 	}
-	e, fresh := s.fabric.reserve(pool, h, b.Tokens, s.clock)
+	var costs *PlacementCostSnapshot
+	if s.hotprefix != nil && s.hotprefix.policy.config.AdmissionCost != nil && s.fabric.pools[pool].entries[h] == nil {
+		costs = s.benefitCostSnapshot(req)
+	}
+	e, fresh := s.fabric.reserveForPlacement(pool, h, b.Tokens, s.clock, req, costs)
 	if e == nil {
 		return false
 	}
