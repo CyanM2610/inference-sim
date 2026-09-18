@@ -43,6 +43,7 @@ type PromotionConfig struct {
 	Budget   int           `json:"block_budget"`
 }
 type Config struct {
+	AllowFuturePlacement      bool `json:"allow_future_placement,omitempty"`
 	profileWarnings           *profileWarnings
 	HotPrefix                 *kv.HotPrefixConfig        `json:"hotprefix,omitempty"`
 	DirectionalTransferOrder  bool                       `json:"directional_transfer_order,omitempty"`
@@ -95,6 +96,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	FuturePlacementCoverage             string                              `json:"future_placement_coverage,omitempty"`
 	HotPrefixDiagnostics                map[string]*kv.HotPrefixDiagnostics `json:"hotprefix_diagnostics,omitempty"`
 	StoreSourceReuseContract            string                              `json:"store_source_reuse_contract,omitempty"`
 	EnginePhaseObservations             []kv.EnginePhaseObservation         `json:"-"`
@@ -158,6 +160,9 @@ type Result struct {
 }
 
 func (c Config) Validate() error {
+	if c.AllowFuturePlacement && c.HotPrefix == nil {
+		return fmt.Errorf("future placement cannot be enabled without an explicit HotPrefix oracle")
+	}
 	if err := c.validateConversationArrivals(); err != nil {
 		return err
 	}
@@ -704,6 +709,16 @@ func runWithObservation(c Config, factories PolicyFactories, observation *runObs
 		if c.HotPrefix != nil {
 			if err := stores[i].ConfigureHotPrefix(*c.HotPrefix); err != nil {
 				return nil, err
+			}
+			if c.AllowFuturePlacement {
+				future := make([]kv.FuturePlacementRequest, 0, len(c.Requests))
+				for _, r := range c.Requests {
+					future = append(future, kv.FuturePlacementRequest{ID: r.ID, AtUS: r.At, AfterRequest: r.AfterRequest, Input: r.Input})
+				}
+				if err := stores[i].ConfigureHotPrefixFutureDemand(future); err != nil {
+					return nil, err
+				}
+				out.FuturePlacementCoverage = "privileged_future_input_only; heuristic_not_optimal_bound; physical_constraints_unchanged; oracle_information_and_search_cost_excluded"
 			}
 			out.HotPrefixCostCoverage = "block_granular_completed_reuse_with_bounded_shadow; declared_planner_us_only; heat_shadow_reclaim_admission_late_load_planning_and_worker_metadata_overhead_unmeasured; native_ranking_unvalidated"
 			if c.HotPrefix.HBMEvictionUnit == "logical_segment" {

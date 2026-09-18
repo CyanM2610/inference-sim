@@ -34,6 +34,7 @@ type HotPrefixChoiceCandidate struct {
 }
 
 type HotPrefixChoice struct {
+	OfflineOverride      bool                       `json:"offline_override,omitempty"`
 	SelectedMemberBlocks []int64                    `json:"selected_member_blocks,omitempty"`
 	CandidateUnit        string                     `json:"candidate_unit,omitempty"`
 	PhysicalIdleBlocks   int64                      `json:"physical_idle_blocks,omitempty"`
@@ -103,6 +104,7 @@ func (p *HotPrefixPolicy) recordChoice(c PeerReclaimContext, d PeerDecision) {
 	}
 	r := HotPrefixChoice{Sequence: s.Choices, ScoreRule: p.config.HBMScore, CandidateRule: p.config.HBMCandidates,
 		SelectedBlock: d.BlockID, Pool: d.Pool, Declined: d.Decline}
+	r.OfflineOverride = p.overrideThisChoice
 	if r.ScoreRule == "" {
 		r.ScoreRule = "paper"
 	}
@@ -150,6 +152,9 @@ func (s *PeerCache) annotateHotPrefixChoice(request string, deficit int64) {
 	r.TimeUS = s.clock
 	r.Request = request
 	r.DeficitBlocks = deficit
+	if r.OfflineOverride && r.TimeUS != s.hotprefix.policy.config.OneShotReclaim.TimeUS {
+		panic("one-shot reclaim decision time diverged before execution")
+	}
 }
 
 func (s *PeerCache) HotPrefixDiagnostics() *HotPrefixDiagnostics {

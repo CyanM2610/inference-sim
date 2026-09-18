@@ -153,6 +153,7 @@ func (s *PeerCache) completeHotPrefixReuse(req *sim.Request) {
 			delete(r.shadowMatches, use.hash)
 		}
 		r.credited[use.hash] = true
+		s.consumeHotPrefixFuture(use.hash, req.ID)
 		n := h.policy.nodes[use.hash]
 		s.fabric.emit(PeerRecord{Time: s.clock, Name: "hotprefix_reuse", Instance: s.id, Request: req.ID, Hash: use.hash,
 			Reason: "compute_completed", Counters: map[string]int64{"frequency": n.frequency, "clock": n.clock, "reused_tokens": use.tokens}})
@@ -180,4 +181,5 @@ func (s *PeerCache) publishHotPrefixCompute(req *sim.Request, b *KVBlock) {
 		h.policy.published(b.Hash)
 	}
 	r.credited[b.Hash] = true
+	s.consumeHotPrefixFuture(b.Hash, req.ID)
 }

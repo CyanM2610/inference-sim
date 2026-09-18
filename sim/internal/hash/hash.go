@@ -47,6 +47,13 @@ func HashBlock(prevHash string, tokens []tokenid.TokenID) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// DigestHex fingerprints a diagnostic snapshot without introducing another
+// hashing implementation in cache policy packages. It is not a KV identity.
+func DigestHex(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
 // ComputeBlockHashes returns hierarchical block hashes for a token sequence.
 // Each hash chains with the previous block's hash, enabling prefix matching.
 // Tokens that don't fill a complete block are ignored.
