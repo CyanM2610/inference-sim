@@ -76,6 +76,9 @@ func (f *PeerFabric) endTransferGroup(now int64) {
 				return d
 			},
 		}
+		for _, j := range members {
+			group.overwrites = append(group.overwrites, j.overwrites...)
+		}
 		f.submit(now, group)
 	}
 }

@@ -65,6 +65,7 @@ type peerPool struct {
 	trackAccess bool
 }
 type peerJob struct {
+	overwrites        []sourceOverwrite
 	notBefore         int64
 	units             int64
 	nativeSource      func() string

@@ -207,8 +207,8 @@ func (s *PeerCache) targets() []PeerTarget {
 	return append(free, full...)
 }
 
-// makeSpace prepares empty blocks at the free-list head; the native allocator
-// may then run unchanged without silently overwriting a selected STORE source.
+// makeSpace prepares allocator slots. Source-reuse mode protects the old bytes
+// with execution dependencies; legacy mode holds the slot until adoption.
 func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool {
 	var empty []*KVBlock
 	var candidates []PeerCandidate
@@ -256,7 +256,7 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 		}
 		candidates = append(candidates[:idx], candidates[idx+1:]...)
 		s.emit("reclaim_decision", req, b.Hash, "hbm", d.Pool, "policy")
-		if d.Pool != "" && s.store(b, d.Pool, req) {
+		if d.Pool != "" && s.store(b, d.Pool, req) && !s.storeSourceReuseEnabled() {
 			s.waiting[req] = true
 			promised++
 			continue
@@ -323,10 +323,15 @@ func (s *PeerCache) storeCopy(b *KVBlock, pool, req string, retain bool) bool {
 // uses this after reserving the full prefix; ordinary storeCopy reserves one.
 func (s *PeerCache) storeReservedCopy(b *KVBlock, pool, req string, retain bool, path []string, e *peerEntry, fresh bool) bool {
 	h := b.Hash
-	// Background copies in the phase backend protect contents through a
-	// pre-forward fence, independently of request allocator ownership. Reclaim
-	// copies retain their existing pin semantics for arbitrary placement policies.
-	leased := retain && s.fabric.phases != nil && s.fabric.phases.reuseSources
+	// Both background and reclaim STOREs protect old contents independently
+	// of allocator ownership. Actual compute/load reuse installs the fence.
+	leased := s.storeSourceReuseEnabled()
+	if leased && !fresh {
+		// The existing transaction reads its original physical source; this
+		// duplicate cached copy does not acquire a fictitious content lease.
+		s.emit("store_join", req, h, "hbm", pool, "deduplicated")
+		return true
+	}
 	var sourceBlocks []int64
 	if leased {
 		sourceBlocks = []int64{b.ID}

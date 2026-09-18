@@ -37,11 +37,12 @@ func (ctx BatchContext) tokenCheck(req *Request, phase string, computed, tokens 
 }
 
 type ExecutionAllocation struct {
-	Request string             `json:"request"`
-	Start   int64              `json:"start_tokens"`
-	End     int64              `json:"end_tokens"`
-	Granted bool               `json:"compute_admitted"`
-	Failure *AllocationFailure `json:"failure,omitempty"`
+	Request      string                  `json:"request"`
+	Start        int64                   `json:"start_tokens"`
+	End          int64                   `json:"end_tokens"`
+	Granted      bool                    `json:"compute_admitted"`
+	Failure      *AllocationFailure      `json:"failure,omitempty"`
+	Dependencies []KVExecutionDependency `json:"execution_dependencies,omitempty"`
 }
 
 type ExecutionPrefix struct {
@@ -63,6 +64,9 @@ func (ctx BatchContext) allocate(req *Request, start, end int64, cached []int64)
 	ok := ctx.KVCache.AllocateKVBlocks(req, start, end, cached)
 	if w := ctx.executionWork; w != nil {
 		call := ExecutionAllocation{Request: req.ID, Start: start, End: end, Granted: ok}
+		if store, known := ctx.KVCache.(KVExecutionDependencyStore); known {
+			call.Dependencies = store.ExecutionDependencies(req.ID)
+		}
 		if !ok {
 			if store, known := ctx.KVCache.(AllocationFailureStore); known {
 				failure := store.LastAllocationFailure()
