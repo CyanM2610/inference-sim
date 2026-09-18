@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/inference-sim/inference-sim/sim"
+	"github.com/inference-sim/inference-sim/sim/kv"
 )
 
 func nativeLabConfig() Config {
@@ -127,5 +128,70 @@ func TestVLLMNativeDecodePressurePreservesObservedOutputs(t *testing.T) {
 	}
 	if !replayed || r.HBM["instance_0"]["total_refs"] != 0 {
 		t.Fatal("missing retained output replay or leaked KV")
+	}
+}
+
+func TestVLLMNativeReclaimSourceReusePolicyMatrix(t *testing.T) {
+	var dependencies int64
+	for _, capacity := range []int64{8, 12} {
+		for _, placement := range []string{"lru_drop", "lfu_store", "hotprefix_2", "prefixkeep_1"} {
+			t.Run(fmt.Sprintf("%s/hbm=%d", placement, capacity), func(t *testing.T) {
+				c := nativeLabConfig()
+				c.StoreSourceReuse, c.TraceBatchShapes = true, true
+				c.Instances[0].HBMBlocks = capacity
+				c.MaxSequences, c.MaxBatchTokens, c.PrefillChunk = 3, 16, 7
+				if placement == "lru_drop" || placement == "lfu_store" {
+					c.Policy, c.HotPrefix = PolicyConfig{Name: placement}, nil
+				} else {
+					c.HotPrefix.PromotionBlocks = 0
+					if placement == "prefixkeep_1" {
+						c.HotPrefix.AdmissionThreshold = 1
+					}
+				}
+				c.Requests = nil
+				rng := rand.New(rand.NewSource(17))
+				for i := 0; i < 24; i++ {
+					input := make([]sim.TokenID, 17+rng.Intn(49))
+					family := i % 5
+					for j := range input {
+						input[j] = sim.TokenID(family*1000 + j)
+					}
+					c.Requests = append(c.Requests, RequestConfig{ID: fmt.Sprint(i), At: int64(i/4) * 1000, Input: input, Output: make([]sim.TokenID, 1+rng.Intn(20))})
+				}
+				r, err := Run(c)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(r.FinishedUS) != 24 || len(r.FirstTokenUS) != 24 || r.StoreSourceReuseContract != kv.StoreSourceReuseContract {
+					t.Fatal("incomplete native offloading execution or missing contract version")
+				}
+				if r.HBM["instance_0"]["total_refs"] != 0 || r.Pools["dram"]["reserved"] != 0 || r.Pools["dram"]["read_pins"] != 0 || r.Counts["transfer_end"] != r.Counts["transfer_adopted"] {
+					t.Fatal("STORE/LOAD lifecycle failed to drain")
+				}
+				ended, fences := map[int64]bool{}, map[int64]bool{}
+				for _, e := range r.Events {
+					switch e.Name {
+					case "hbm_reuse_dependency", "preemption_store_dependency":
+						fences[e.Transaction] = true
+					case "transfer_end":
+						ended[e.Transaction] = true
+					case "engine_forward_ready":
+						for id := range fences {
+							if !ended[id] {
+								t.Fatal("forward crossed a live STORE dependency", id, e.Time)
+							}
+						}
+						clear(fences)
+					}
+				}
+				dependencies += r.Counts["hbm_reuse_dependency"]
+				if placement == "lfu_store" && r.Counts["hbm_reuse_dependency"] == 0 {
+					t.Fatal("fixture did not exercise reclaim source reuse")
+				}
+			})
+		}
+	}
+	if dependencies == 0 {
+		t.Fatal("matrix did not cover execution fences")
 	}
 }

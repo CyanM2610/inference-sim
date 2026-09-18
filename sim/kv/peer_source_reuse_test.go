@@ -1,6 +1,8 @@
 package kv
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/inference-sim/inference-sim/sim"
@@ -9,6 +11,171 @@ import (
 func reuseFixture(t *testing.T) (*peerHarness, *PeerCache) {
 	t.Helper()
 	return reuseFixtureCapacity(t, 2)
+}
+
+func reclaimReuseFixture(t *testing.T, blocks int64) (*peerHarness, *PeerCache) {
+	t.Helper()
+	h, s := reuseFixtureCapacity(t, blocks)
+	h.f.mechanisms.BackgroundStoreMode = "on_reclaim"
+	s.policy = BuiltinPeerPolicy{Name: "lfu_store"}
+	return h, s
+}
+
+func TestReclaimSourceReuseNativeRunningGrantWaitsOnlyAtExecution(t *testing.T) {
+	for _, decode := range []bool{false, true} {
+		var observedRecords []PeerRecord
+		for _, observed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("decode=%v/observe=%v", decode, observed), func(t *testing.T) {
+				h, s := reclaimReuseFixture(t, 4)
+				input, tokens, victims := 8, 4, 2
+				if decode {
+					input, tokens, victims = 2, 1, 1
+				}
+				a := capacityRequest(t, s, "active", input, 2, 100)
+				a.TTFTSet = decode
+				s.MirrorToCPU([]*sim.Request{a})
+				seedPeer(t, s, "idle", []sim.TokenID{1, 2, 3, 4, 5, 6})
+				ctx := capacityContext(s, []*sim.Request{a}, int64(tokens), 1)
+				ctx.CapacityVictims = nil
+				ctx.PrefillTokenThreshold = int64(tokens)
+				ctx.ObserveExecutionWork = observed
+				r := sim.NewVLLMNativeBatchFormation().FormBatch(ctx)
+				if len(r.Preempted) != 0 || a.NumNewTokens != tokens || a.ProgressIndex != 2 || s.IsDeferred(a.ID) || len(s.storePins) != 0 {
+					t.Fatal("reclaim STORE became a scheduling failure", r.Preempted, a.NumNewTokens, s.LastAllocationFailure())
+				}
+				deps := s.ExecutionDependencies(a.ID)
+				if reclaimCount(h) != victims || len(deps) != 1 || len(deps[0].HBMBlocks) != victims || h.f.Pending() != 1 {
+					t.Fatal("same-allocation grouped STORE lost its fence", reclaimCount(h), deps)
+				}
+				if observed && (len(r.ExecutionWork.Allocations) != 1 || !r.ExecutionWork.Allocations[0].Granted || !reflect.DeepEqual(r.ExecutionWork.Allocations[0].Dependencies, deps)) {
+					t.Fatal("admitted allocation did not expose execution dependencies", r.ExecutionWork)
+				}
+				deps[0].HBMBlocks[0] = -1
+				if s.ExecutionDependencies(a.ID)[0].HBMBlocks[0] < 0 {
+					t.Fatal("dependency snapshot aliases runtime ownership")
+				}
+				owned := append([]int64(nil), s.RequestMap[a.ID]...)
+				var end int64
+				ok, err := s.BeginBatch(0, []sim.BatchWork{{Request: a, PrefixTokens: 2, NewTokens: int64(tokens)}}, func(at int64) { end = at })
+				if !ok || err != nil {
+					t.Fatal(ok, err)
+				}
+				for end == 0 {
+					phaseNext(t, h)
+				}
+				var physical, forward, adopted int64
+				for _, e := range h.records {
+					switch e.Name {
+					case "transfer_end":
+						physical = e.Time
+					case "engine_forward_ready":
+						forward = e.Time
+					case "transfer_adopted":
+						adopted = e.Time
+					}
+				}
+				if physical != int64(5+100*victims) || forward != physical || adopted <= forward || end != physical+20 {
+					t.Fatal("physical fence/publication/compute costs conflated", physical, forward, adopted, end)
+				}
+				for _, id := range owned {
+					if s.Blocks[id].RefCount != 1 {
+						t.Fatal("old STORE completion released new owner's block")
+					}
+				}
+				if len(s.ExecutionDependencies(a.ID)) != 0 || h.f.Pending() != 0 {
+					t.Fatal("completed dependency survived")
+				}
+				s.ReleaseKVBlocks(a)
+				assertPeerConservation(t, s)
+				if observed && !reflect.DeepEqual(observedRecords, h.records) {
+					t.Fatal("execution observer changed physical behavior")
+				}
+				observedRecords = h.records
+			})
+		}
+	}
+}
+
+func TestReclaimSourceReuseGroupedLoadAndCancellation(t *testing.T) {
+	h, s := reclaimReuseFixture(t, 2)
+	seedPeer(t, s, "old", []sim.TokenID{1, 2, 3, 4})
+	r := &sim.Request{ID: "restore", InputTokens: []sim.TokenID{21, 22, 23}}
+	hash := s.hashes(r.InputTokens)[0]
+	e, _ := h.f.reserve("cpu", hash, r.InputTokens[:2], 0)
+	e.ready = true
+	if s.AllocateKVBlocks(r, 0, 2, nil) || s.readPending[r.ID] != 1 || len(s.ExecutionDependencies(r.ID)) != 1 {
+		t.Fatal("reclaim and LOAD in the same group lost source dependency")
+	}
+	s.ClearDeferred(r.ID)
+	var end int64
+	s.BeginBatch(0, nil, func(at int64) { end = at })
+	for end == 0 {
+		phaseNext(t, h)
+	}
+	var storeEnd, loadStart int64
+	for _, e := range h.records {
+		if e.Name == "transfer_end" && e.Destination == "cpu" {
+			storeEnd = e.Time
+		}
+		if e.Name == "transfer_start" && e.Destination == "hbm" {
+			loadStart = e.Time
+		}
+	}
+	if storeEnd == 0 || loadStart < storeEnd {
+		t.Fatal("cancelled LOAD overwrote an outstanding STORE", storeEnd, loadStart)
+	}
+	for len(h.events) > 0 {
+		phaseNext(t, h)
+	}
+	end = 0
+	s.BeginBatch(500, nil, func(at int64) { end = at })
+	for end == 0 {
+		phaseNext(t, h)
+	}
+	if h.f.Pending() != 0 || s.FreeBlockCnt != 2 || len(s.storePins) != 0 || len(s.pendingTargets) != 0 {
+		t.Fatal("cancelled grouped reclaim/LOAD leaked resources")
+	}
+	assertPeerConservation(t, s)
+}
+
+func TestReclaimSourceReuseDoesNotTurnTrueCapacityFailureIntoSuccess(t *testing.T) {
+	_, s := reclaimReuseFixture(t, 2)
+	a := capacityRequest(t, s, "a", 4, 2, 100)
+	capacityRequest(t, s, "holder", 2, 2, 200)
+	if s.AllocateKVBlocks(a, 2, 4, nil) || s.LastAllocationFailure().Kind != "capacity" || len(s.ExecutionDependencies(a.ID)) != 0 {
+		t.Fatal("active ownership was treated as recyclable STORE source")
+	}
+}
+
+func TestReclaimSourceReuseReallocationBeforeAdoptionKeepsNewOwner(t *testing.T) {
+	h, s := reclaimReuseFixture(t, 1)
+	seedPeer(t, s, "old", []sim.TokenID{1, 2})
+	r := &sim.Request{ID: "cancel", InputTokens: []sim.TokenID{11, 12}}
+	if !s.AllocateKVBlocks(r, 0, 2, nil) {
+		t.Fatal("initial reuse rejected")
+	}
+	s.ReleaseKVBlocks(r)
+	var end int64
+	s.BeginBatch(0, nil, func(at int64) { end = at })
+	for len(s.ExecutionDependencies(r.ID)) > 0 {
+		phaseNext(t, h)
+	}
+	if end != 0 || h.f.Pending() != 1 {
+		t.Fatal("fixture missed physical-done/unadopted boundary")
+	}
+	fresh := &sim.Request{ID: "fresh", InputTokens: []sim.TokenID{21, 22}}
+	if !s.AllocateKVBlocks(fresh, 0, 2, nil) || len(s.ExecutionDependencies(fresh.ID)) != 0 {
+		t.Fatal("physically completed STORE required adoption before reuse")
+	}
+	for end == 0 {
+		phaseNext(t, h)
+	}
+	id := s.RequestMap[fresh.ID][0]
+	if s.Blocks[id].RefCount != 1 || s.Blocks[id].Tokens[0] != 21 {
+		t.Fatal("old adoption corrupted the replacement owner")
+	}
+	s.ReleaseKVBlocks(fresh)
+	assertPeerConservation(t, s)
 }
 
 func reuseFixtureCapacity(t *testing.T, capacity int64) (*peerHarness, *PeerCache) {

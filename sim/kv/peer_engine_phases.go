@@ -88,45 +88,6 @@ func (s *PeerCache) PreparePrefillPreemption(req *sim.Request) {
 	}
 }
 
-// EnableStoreSourceReuse separates allocator ownership from an outstanding
-// background copy's content lease. Only the phase backend can fence overwrite.
-func (s *PeerCache) EnableStoreSourceReuse() error {
-	p := s.fabric.phases
-	if p == nil || p.active || s.fabric.Pending() != 0 {
-		return fmt.Errorf("store source reuse requires idle engine phases")
-	}
-	p.reuseSources = true
-	p.reuseFences = map[int64]bool{}
-	return nil
-}
-
-// allocated records a dependency at actual physical reuse, after successful
-// compute allocation or load reservation. A prefix hit only reads the old
-// content and does not fence its background STORE. No future times are read.
-func (p *PeerEnginePhases) allocated(now int64, request string, blocks []int64) {
-	ids := make([]int64, 0, len(p.jobs))
-	for id := range p.jobs {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	for _, id := range ids {
-		state := p.jobs[id]
-		if state.physicalDone {
-			continue
-		}
-		for _, block := range blocks {
-			for _, source := range state.job.record.HBMBlocks {
-				if block == source {
-					p.reuseFences[id] = true
-					r := state.job.record
-					r.Time, r.Name, r.Request, r.HBMBlocks = now, "hbm_reuse_dependency", request, []int64{block}
-					p.store.fabric.emit(r)
-				}
-			}
-		}
-	}
-}
-
 func (s *PeerCache) ConfigureEnginePhases(model EnginePhaseModel, observe func(int64, int64, []sim.BatchWork)) error {
 	f := s.fabric
 	if model == nil || f.phases != nil || f.native != nil || f.external != nil || f.Pending() != 0 || len(f.stores) != 1 {
@@ -186,6 +147,9 @@ func (p *PeerEnginePhases) stage(now int64, j *peerJob) {
 	p.jobs[j.record.Transaction] = &phaseJob{job: j}
 	p.staged = append(p.staged, j)
 	p.emit(now, "transfer_staged", j)
+	for _, dependency := range j.overwrites {
+		p.recordSourceFence(j, dependency)
+	}
 	if !p.active {
 		p.store.wake(now)
 	}

@@ -95,6 +95,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	StoreSourceReuseContract            string                        `json:"store_source_reuse_contract,omitempty"`
 	EnginePhaseObservations             []kv.EnginePhaseObservation   `json:"-"`
 	CacheMetrics                        CacheMetrics                  `json:"cache_metrics"`
 	ArrivalUS                           map[string]int64              `json:"arrival_us,omitempty"`
@@ -584,6 +585,9 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 		return nil, err
 	}
 	out := &Result{Config: c, BlockBytes: int64(math.Ceil(bytes * float64(c.BlockTokens))), Counts: map[string]int64{}, CPU: map[string]CPUProfile{}, HBM: map[string]map[string]int64{}}
+	if c.StoreSourceReuse {
+		out.StoreSourceReuseContract = kv.StoreSourceReuseContract
+	}
 	defer func() {
 		out.ProfileWarnings = warnings.snapshot()
 		if len(out.ProfileWarnings) > 0 {
