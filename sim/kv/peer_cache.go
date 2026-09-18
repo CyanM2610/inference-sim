@@ -87,7 +87,7 @@ func (s *PeerCache) BindEvents(schedule func(sim.Event), wake func(int64)) {
 }
 
 func (s *PeerCache) BindDecisionEvents(notify func(sim.DecisionEvent)) { s.decisionEvents = notify }
-func (s *PeerCache) SetClock(t int64)                                  { s.clock = t }
+func (s *PeerCache) SetClock(t int64)                                  { s.clock = t; s.expireHotPrefixShadows() }
 func (s *PeerCache) emit(name, req, h, src, dst, reason string) {
 	s.fabric.emit(PeerRecord{Time: s.clock, Name: name, Instance: s.id, Request: req, Hash: h, Source: src, Destination: dst, Reason: reason})
 	if s.fabric.mechanisms != (PeerMechanisms{}) {
@@ -256,13 +256,16 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 		}
 		candidates = append(candidates[:idx], candidates[idx+1:]...)
 		s.emit("reclaim_decision", req, b.Hash, "hbm", d.Pool, "policy")
-		if d.Pool != "" && s.store(b, d.Pool, req) && !s.storeSourceReuseEnabled() {
+		stored := d.Pool != "" && s.store(b, d.Pool, req)
+		if stored && !s.storeSourceReuseEnabled() {
 			s.waiting[req] = true
 			promised++
 			continue
 		}
 		s.emit("hbm_drop", req, b.Hash, "hbm", "", "reclaim")
+		droppedHash := b.Hash
 		s.invalidate(b)
+		s.shadowHotPrefixDrop(droppedHash, req)
 		empty = append(empty, b)
 	}
 	if int64(len(empty)) < n && promised > 0 {
@@ -523,6 +526,7 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 }
 func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached []int64) bool {
 	s.observeCacheLookup(req.ID, req.FullInputTokens())
+	s.observeHotPrefix(req)
 	fresh := len(s.RequestMap[req.ID]) == 0
 	s.noteAllocationWait(req.ID, "dependency")
 	known, restoreCandidates, pendingLookup := s.observeRestoreLookup(req, cached)
@@ -564,9 +568,6 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 			s.touchRequestPools(req.ID, req.FullInputTokens())
 		}
 		if !s.observed[req.ID] {
-			if s.hotprefix != nil {
-				s.observeHotPrefix(req)
-			}
 			for _, h := range hashes {
 				s.frequency[h]++
 			}
@@ -679,6 +680,7 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 	}
 	if ok {
 		s.stageCacheReuse(req, start, cached, fresh)
+		s.stageHotPrefixReuse(req, start, cached, fresh)
 		s.allocationFailure = sim.AllocationFailure{}
 		if previous != nil {
 			var allocated []int64
@@ -725,6 +727,7 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	// blocks here. An explicitly configured background pool also receives them.
 	for _, req := range batch {
 		s.completeCacheReuse(req)
+		s.completeHotPrefixReuse(req)
 		if s.hotprefix != nil {
 			s.hotprefix.policy.remember(s.hotPrefixKeys(req.PrefillTokens()))
 		}
@@ -744,6 +747,7 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 				if s.fabric.native != nil && s.ready[id] != b.Hash {
 					s.fabric.native.computed(s.clock, id, b.Hash)
 				}
+				s.publishHotPrefixCompute(req, b)
 				s.publishReadyCopy(b)
 				if pool := s.fabric.mechanisms.BackgroundStorePool; pool != "" && (s.fabric.mechanisms.BackgroundStoreMode == "" || s.fabric.mechanisms.BackgroundStoreMode == "continuous") {
 					if s.backgroundOffered[req.ID] == nil {
@@ -772,6 +776,11 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	}
 }
 func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
+	if s.hotprefix != nil {
+		if r := s.hotprefix.requests[req.ID]; r != nil {
+			r.pending = nil
+		}
+	}
 	if s.cacheMetrics != nil {
 		if r := s.cacheMetrics.requests[req.ID]; r != nil {
 			r.pending = nil
@@ -896,6 +905,8 @@ func (s *PeerCache) PeerSnapshot() map[string]int64 {
 	m := map[string]int64{"capacity": s.TotalBlocks, "free": s.FreeBlockCnt, "active_or_pinned": s.TotalBlocks - s.FreeBlockCnt, "ready": int64(len(s.ready)), "pending_reads": int64(len(s.restoring)), "held_restores": 0}
 	if s.hotprefix != nil {
 		m["hotprefix_history_nodes"] = int64(len(s.hotprefix.policy.nodes))
+		m["hotprefix_shadow_entries"] = int64(len(s.hotprefix.shadows))
+		m["hotprefix_shadow_ttl_us"] = s.hotprefix.shadowTTL
 		m["hotprefix_requests_observed"] = s.hotprefix.policy.requests
 		m["hotprefix_parent_pins"] = int64(len(s.hotprefix.parentHolds))
 		m["promoted_unconsumed_resident"] = int64(len(s.promoted))

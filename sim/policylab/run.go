@@ -688,7 +688,7 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 			if err := stores[i].ConfigureHotPrefix(*c.HotPrefix); err != nil {
 				return nil, err
 			}
-			out.HotPrefixCostCoverage = "block_granular_exact_history; declared_planner_us_only; heat_reclaim_admission_late_load_planning_and_worker_metadata_overhead_unmeasured; native_ranking_unvalidated"
+			out.HotPrefixCostCoverage = "block_granular_completed_reuse_with_bounded_shadow; declared_planner_us_only; heat_shadow_reclaim_admission_late_load_planning_and_worker_metadata_overhead_unmeasured; native_ranking_unvalidated"
 		}
 	}
 	requests := make([]*sim.Request, 0, len(c.Requests))

@@ -18,14 +18,15 @@ func hotPolicy(t *testing.T) *HotPrefixPolicy {
 
 func TestHotPrefixCountsPublishedReuseAndAgesSaturatingClocks(t *testing.T) {
 	p := hotPolicy(t)
-	p.observe([]string{"a", "ab"}, 0)
+	p.observe([]string{"a", "ab"})
 	if p.nodes["a"].frequency != 0 {
 		t.Fatal("uncomputed request created reuse")
 	}
 	p.published("a")
 	p.published("ab")
-	p.observe([]string{"a", "ac"}, 1)
-	if p.nodes["a"].frequency != 2 || p.nodes["a"].clock != 2 || p.nodes["ab"].frequency != 1 || p.nodes["ab"].clock != 2 || p.nodes["ac"].frequency != 0 {
+	p.observe([]string{"a", "ac"})
+	p.reuse("a", 0)
+	if p.nodes["a"].frequency != 2 || p.nodes["a"].clock != 3 || p.nodes["ab"].frequency != 1 || p.nodes["ab"].clock != 2 || p.nodes["ac"].frequency != 0 {
 		t.Fatal("shared path or request-distance aging changed", p.nodes)
 	}
 	p.published("a")
@@ -33,7 +34,8 @@ func TestHotPrefixCountsPublishedReuseAndAgesSaturatingClocks(t *testing.T) {
 		t.Fatal("publication double-counted an access")
 	}
 	for i := 0; i < 600; i++ {
-		p.observe([]string{"a"}, 1)
+		p.observe([]string{"a"})
+		p.reuse("a", 0)
 	}
 	if p.nodes["a"].frequency != 255 || p.nodes["ab"].clock != 0 {
 		t.Fatal("8-bit history did not saturate")

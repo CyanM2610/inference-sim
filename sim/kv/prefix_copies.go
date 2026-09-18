@@ -18,6 +18,8 @@ func (s *PeerCache) EnableFirstPublishedCopy() error {
 func (s *PeerCache) publishReadyCopy(b *KVBlock) {
 	s.metricPublish(b)
 	if s.hotprefix != nil {
+		s.expireHotPrefixShadows()
+		delete(s.hotprefix.shadows, b.Hash)
 		s.hotprefix.policy.published(b.Hash)
 	}
 	if s.prefixCopies == nil {
