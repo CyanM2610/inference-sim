@@ -72,7 +72,7 @@ func (s *PeerCache) concurrentRestore(req *sim.Request, cached []int64, hashes [
 	}
 	var pages []page
 	for _, h := range hashes[len(cached):] {
-		if len(pages) == max(1, s.fabric.mechanisms.RestoreWindow) {
+		if !s.nativeRestoreAdmission && len(pages) == max(1, s.fabric.mechanisms.RestoreWindow) {
 			break
 		}
 		e, a := s.find(h)
@@ -100,8 +100,17 @@ func (s *PeerCache) concurrentRestore(req *sim.Request, cached []int64, hashes [
 		}
 	}
 	reserved := s.otherPrefillReservations(req.ID)
+	if s.nativeRestoreAdmission {
+		s.fabric.emit(PeerRecord{Time: s.clock, Name: "restore_admission_check", Instance: s.id, Request: req.ID,
+			Counters: map[string]int64{"lookup_blocks": int64(len(pages)), "needed_blocks": needed,
+				"free_blocks": s.FreeBlockCnt, "other_reserved_blocks": reserved}})
+	}
 	if needed > s.FreeBlockCnt-reserved {
 		s.noteAllocationWait(req.ID, "prefill_reservations")
+		if s.nativeRestoreAdmission {
+			s.allocationFailure.NeededBlocks = needed
+			s.allocationFailure.ReservedBlocks = reserved
+		}
 		s.emit("allocation_wait", req.ID, "", "", "", "prefill_reservations")
 		return true
 	}

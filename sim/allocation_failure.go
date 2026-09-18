@@ -14,6 +14,7 @@ type AllocationFailure struct {
 	NeededBlocks           int64  `json:"needed_blocks"`
 	FreeBlocks             int64  `json:"free_blocks"`
 	ReclaimingBlocks       int64  `json:"reclaiming_blocks"`
+	ReservedBlocks         int64  `json:"other_reserved_blocks,omitempty"`
 }
 
 // AllocationFailureStore must overwrite its observation on every allocation
