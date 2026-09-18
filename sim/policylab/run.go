@@ -552,6 +552,17 @@ func RunWithDecisionPolicy(c Config, factory func(instance string) sim.DecisionP
 }
 
 func run(c Config, factories PolicyFactories) (*Result, error) {
+	return runWithObservation(c, factories, nil)
+}
+
+// runObservation changes result retention only. It is deliberately private:
+// experiment tooling must not turn it into a policy or simulated cost knob.
+type runObservation struct {
+	discardEvents bool
+	afterRun      func([]*kv.PeerCache)
+}
+
+func runWithObservation(c Config, factories PolicyFactories, observation *runObservation) (*Result, error) {
 	warnings := &profileWarnings{}
 	c.profileWarnings = warnings
 	if c.EnginePhases != nil {
@@ -614,7 +625,12 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 	if closedLoop {
 		out.ArrivalUS = map[string]int64{}
 	}
-	sink := func(r kv.PeerRecord) { out.Events = append(out.Events, r); out.Counts[r.Name]++ }
+	sink := func(r kv.PeerRecord) {
+		if observation == nil || !observation.discardEvents {
+			out.Events = append(out.Events, r)
+		}
+		out.Counts[r.Name]++
+	}
 	fabric, err := kv.NewPeerFabric(c.Resources, c.Pools, out.BlockBytes, sink)
 	if err != nil {
 		return nil, err
@@ -1342,6 +1358,9 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 		if h["active_or_pinned"] != 0 || h["held_restores"] != 0 || h["worker_resident_requests"] != 0 {
 			return out, fmt.Errorf("HBM references remain on %s: %v", id, h)
 		}
+	}
+	if observation != nil && observation.afterRun != nil {
+		observation.afterRun(stores)
 	}
 	return out, nil
 }
