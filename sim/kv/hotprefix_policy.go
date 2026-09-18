@@ -8,6 +8,7 @@ import (
 // HotPrefixConfig controls block placement or the explicitly named resident
 // logical-segment adaptation. Both use exact per-prefix heat metadata.
 type HotPrefixConfig struct {
+	ReclaimMode           string                      `json:"reclaim_mode,omitempty"`
 	AdmissionCost         *HotPrefixAdmissionConfig   `json:"admission_cost,omitempty"`
 	Benefit               *HotPrefixBenefitConfig     `json:"benefit,omitempty"`
 	HBMEvictionUnit       string                      `json:"hbm_eviction_unit,omitempty"`
@@ -24,6 +25,12 @@ type HotPrefixConfig struct {
 }
 
 func (c HotPrefixConfig) Validate() error {
+	if c.ReclaimMode != "" && c.ReclaimMode != "whole" && c.ReclaimMode != "deficit_tail" {
+		return fmt.Errorf("invalid HotPrefix reclaim_mode")
+	}
+	if c.ReclaimMode == "deficit_tail" && (c.HBMEvictionUnit != "logical_segment" || c.HBMScore != "benefit_next" || c.Benefit == nil) {
+		return fmt.Errorf("deficit_tail requires logical segments and the explicit benefit_next value model")
+	}
 	if c.AdmissionCost != nil {
 		if c.AdmissionCost.Rule != "threshold" && c.AdmissionCost.Rule != "cost_next" {
 			return fmt.Errorf("invalid HotPrefix admission_cost rule")

@@ -231,7 +231,7 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 	promised := s.reclaimingBlocks(protect)
 	s.spaceWait[req] = int64(len(empty)) < n
 	for int64(len(empty))+promised < n && len(candidates) > 0 {
-		context := PeerReclaimContext{Candidates: candidates, Targets: s.targets()}
+		context := PeerReclaimContext{Candidates: candidates, Targets: s.targets(), DeficitBlocks: n - int64(len(empty)) - promised}
 		context.BenefitCosts = s.benefitCostSnapshot(req)
 		if s.hotprefix != nil {
 			context.ResidentHashes = s.hotPrefixResidents()
@@ -243,6 +243,9 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 			break
 		}
 		actions := validatedReclaimActions(d, context)
+		if s.hotprefix != nil && s.hotprefix.policy.config.ReclaimMode == "deficit_tail" && int64(len(actions)) > context.DeficitBlocks {
+			panic("tail reclamation exceeds the current allocator deficit")
+		}
 		if len(d.Reclaim) > 0 {
 			var ids []int64
 			var hashes []string
@@ -251,9 +254,13 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 				hashes = append(hashes, s.Blocks[a.BlockID].Hash)
 			}
 			deficit := n - int64(len(empty)) - promised
+			reason := "whole_heat_coherent_resident_segment"
+			if s.hotprefix != nil && s.hotprefix.policy.config.ReclaimMode == "deficit_tail" {
+				reason = "deficit_capped_contiguous_tail"
+			}
 			s.fabric.emit(PeerRecord{Time: s.clock, Name: "hotprefix_group_reclaim", Instance: s.id, Request: req,
 				HBMBlocks: ids, Hashes: hashes, Bytes: int64(len(actions)) * s.fabric.bytes,
-				Reason: "whole_heat_coherent_resident_segment", Counters: map[string]int64{
+				Reason: reason, Counters: map[string]int64{
 					"deficit_blocks": deficit, "selected_blocks": int64(len(actions)),
 					"overshoot_blocks": max(0, int64(len(actions))-deficit), "length_tokens": int64(len(actions)) * s.BlockSizeTokens}})
 		}
