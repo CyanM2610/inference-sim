@@ -26,22 +26,23 @@ type PeerAccess struct {
 	WritePath []string `json:"write_path"`
 }
 type PeerRecord struct {
-	Time        int64            `json:"time_us"`
-	Name        string           `json:"name"`
-	Instance    string           `json:"instance,omitempty"`
-	Request     string           `json:"request,omitempty"`
-	Requests    []string         `json:"requests,omitempty"`
-	Transaction int64            `json:"transaction,omitempty"`
-	Source      string           `json:"source,omitempty"`
-	Destination string           `json:"destination,omitempty"`
-	Hash        string           `json:"hash,omitempty"`
-	Hashes      []string         `json:"hashes,omitempty"`
-	HBMBlocks   []int64          `json:"hbm_blocks,omitempty"`
-	Bytes       int64            `json:"bytes,omitempty"`
-	Duration    int64            `json:"duration_us,omitempty"`
-	Reason      string           `json:"reason,omitempty"`
-	Value       int64            `json:"value,omitempty"`
-	Counters    map[string]int64 `json:"counters,omitempty"`
+	AdmissionCost *HotPrefixAdmissionEstimate `json:"admission_cost,omitempty"`
+	Time          int64                       `json:"time_us"`
+	Name          string                      `json:"name"`
+	Instance      string                      `json:"instance,omitempty"`
+	Request       string                      `json:"request,omitempty"`
+	Requests      []string                    `json:"requests,omitempty"`
+	Transaction   int64                       `json:"transaction,omitempty"`
+	Source        string                      `json:"source,omitempty"`
+	Destination   string                      `json:"destination,omitempty"`
+	Hash          string                      `json:"hash,omitempty"`
+	Hashes        []string                    `json:"hashes,omitempty"`
+	HBMBlocks     []int64                     `json:"hbm_blocks,omitempty"`
+	Bytes         int64                       `json:"bytes,omitempty"`
+	Duration      int64                       `json:"duration_us,omitempty"`
+	Reason        string                      `json:"reason,omitempty"`
+	Value         int64                       `json:"value,omitempty"`
+	Counters      map[string]int64            `json:"counters,omitempty"`
 }
 type PeerSink func(PeerRecord)
 type peerBlocker struct {
@@ -319,13 +320,29 @@ func (f *PeerFabric) notifyDecisionTransfer(now int64, j *peerJob) {
 	}
 }
 func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64) (*peerEntry, bool) {
+	return f.reserveForPlacement(pool, hash, tokens, now, "", nil)
+}
+
+func (f *PeerFabric) reserveForPlacement(pool, hash string, tokens []sim.TokenID, now int64, request string, costs *PlacementCostSnapshot) (*peerEntry, bool) {
 	p := f.pools[pool]
 	if e := p.entries[hash]; e != nil {
 		return e, false
 	}
+	explicitVictim := ""
 	if policy, ok := p.policy.(PoolAdmissionPolicy); ok {
-		decision := policy.Admit(PoolAdmissionContext{Hash: hash, CapacityBlocks: p.config.CapacityBlocks,
+		decision := policy.Admit(PoolAdmissionContext{Costs: costs.clone(), Hash: hash, CapacityBlocks: p.config.CapacityBlocks,
 			UsedBlocks: int64(len(p.entries)), Candidates: p.evictionCandidates()})
+		if decision.Victim != "" {
+			v := p.entries[decision.Victim]
+			if !decision.Accept || int64(len(p.entries)) != p.config.CapacityBlocks || v == nil || !v.ready || v.readers != 0 {
+				panic("pool admission selected an invalid explicit victim")
+			}
+			explicitVictim = decision.Victim
+		}
+		if decision.AdmissionCost != nil {
+			f.emit(PeerRecord{Time: now, Name: "hotprefix_admission_cost", Request: request, Destination: pool, Hash: hash,
+				Reason: decision.Reason, AdmissionCost: decision.AdmissionCost})
+		}
 		accepted := int64(0)
 		if decision.Accept {
 			accepted = 1
@@ -337,7 +354,12 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 		}
 	}
 	if int64(len(p.entries)) == p.config.CapacityBlocks {
-		victim := p.evictionVictim()
+		var victim *peerEntry
+		if explicitVictim != "" {
+			victim = p.entries[explicitVictim]
+		} else {
+			victim = p.evictionVictim()
+		}
 		if victim == nil {
 			return nil, false
 		}
