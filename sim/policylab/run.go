@@ -95,6 +95,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	EnginePhaseObservations             []kv.EnginePhaseObservation   `json:"-"`
 	CacheMetrics                        CacheMetrics                  `json:"cache_metrics"`
 	ArrivalUS                           map[string]int64              `json:"arrival_us,omitempty"`
 	ProfileWarnings                     []ProfileWarning              `json:"profile_warnings,omitempty"`
@@ -704,6 +705,11 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 			}
 		})
 		if err != nil {
+			return nil, err
+		}
+		if err := stores[0].SetEnginePhaseObserver(func(row kv.EnginePhaseObservation) {
+			out.EnginePhaseObservations = append(out.EnginePhaseObservations, row)
+		}); err != nil {
 			return nil, err
 		}
 		if c.DirectionalTransferOrder {
