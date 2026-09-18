@@ -14,6 +14,8 @@ type HotPrefixCPU struct {
 }
 
 type HotPrefixChoiceCandidate struct {
+	ResidentMemberBlocks  []int64                   `json:"resident_member_blocks,omitempty"`
+	ResidentLengthTokens  int64                     `json:"resident_length_tokens,omitempty"`
 	Benefit               *HotPrefixBenefitEstimate `json:"benefit,omitempty"`
 	MemberBlocks          []int64                   `json:"member_blocks,omitempty"`
 	MemberHashes          []string                  `json:"member_hashes,omitempty"`
@@ -32,18 +34,19 @@ type HotPrefixChoiceCandidate struct {
 }
 
 type HotPrefixChoice struct {
-	CandidateUnit      string                     `json:"candidate_unit,omitempty"`
-	PhysicalIdleBlocks int64                      `json:"physical_idle_blocks,omitempty"`
-	Sequence           int64                      `json:"sequence"`
-	TimeUS             int64                      `json:"time_us"`
-	Request            string                     `json:"request"`
-	DeficitBlocks      int64                      `json:"deficit_blocks"`
-	ScoreRule          string                     `json:"score_rule"`
-	CandidateRule      string                     `json:"candidate_rule"`
-	SelectedBlock      int64                      `json:"selected_block"`
-	Pool               string                     `json:"pool"`
-	Declined           bool                       `json:"declined"`
-	Candidates         []HotPrefixChoiceCandidate `json:"candidates"`
+	SelectedMemberBlocks []int64                    `json:"selected_member_blocks,omitempty"`
+	CandidateUnit        string                     `json:"candidate_unit,omitempty"`
+	PhysicalIdleBlocks   int64                      `json:"physical_idle_blocks,omitempty"`
+	Sequence             int64                      `json:"sequence"`
+	TimeUS               int64                      `json:"time_us"`
+	Request              string                     `json:"request"`
+	DeficitBlocks        int64                      `json:"deficit_blocks"`
+	ScoreRule            string                     `json:"score_rule"`
+	CandidateRule        string                     `json:"candidate_rule"`
+	SelectedBlock        int64                      `json:"selected_block"`
+	Pool                 string                     `json:"pool"`
+	Declined             bool                       `json:"declined"`
+	Candidates           []HotPrefixChoiceCandidate `json:"candidates"`
 }
 
 type HotPrefixDiagnostics struct {
@@ -107,6 +110,11 @@ func (p *HotPrefixPolicy) recordChoice(c PeerReclaimContext, d PeerDecision) {
 		r.CandidateRule = "leaf"
 	}
 	if p.config.HBMEvictionUnit == "logical_segment" {
+		if p.config.ReclaimMode == "deficit_tail" && !d.Decline {
+			for _, a := range d.Reclaim {
+				r.SelectedMemberBlocks = append(r.SelectedMemberBlocks, a.BlockID)
+			}
+		}
 		p.recordLogicalChoice(c, &r)
 		s.Records = append(s.Records, r)
 		return

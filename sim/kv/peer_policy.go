@@ -15,6 +15,7 @@ type PeerTarget struct {
 	QueueUS   int64
 }
 type PeerReclaimContext struct {
+	DeficitBlocks  int64 // actual remaining allocator deficit, excluding promised source releases
 	BenefitCosts   *PlacementCostSnapshot
 	Candidates     []PeerCandidate
 	Targets        []PeerTarget
@@ -63,6 +64,7 @@ func validatedReclaimActions(d PeerDecision, c PeerReclaimContext) []PeerReclaim
 
 func cloneReclaimContext(c PeerReclaimContext) PeerReclaimContext {
 	copy := PeerReclaimContext{
+		DeficitBlocks:  c.DeficitBlocks,
 		BenefitCosts:   c.BenefitCosts.clone(),
 		Candidates:     append([]PeerCandidate(nil), c.Candidates...),
 		Targets:        append([]PeerTarget(nil), c.Targets...),
