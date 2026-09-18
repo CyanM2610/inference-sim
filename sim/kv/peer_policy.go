@@ -19,15 +19,45 @@ type PeerReclaimContext struct {
 	Targets        []PeerTarget
 	ResidentHashes []string // includes protected resident descendants
 }
+type PeerReclaimAction struct {
+	BlockID int64
+	Pool    string
+}
 type PeerDecision struct {
 	BlockID int64
 	Pool    string
-	Decline bool // no eligible victim; runtime waits instead of fabricating space
+	Decline bool                // no eligible victim; runtime waits instead of fabricating space
+	Reclaim []PeerReclaimAction // when nonempty, apply the whole validated group
 } // empty Pool means drop
 type PeerPolicy interface {
 	// Choose receives a detached candidate/target snapshot. The runtime retains
 	// its own eligibility list; modifying this input cannot authorize a victim.
 	Choose(PeerReclaimContext) PeerDecision
+}
+
+func validatedReclaimActions(d PeerDecision, c PeerReclaimContext) []PeerReclaimAction {
+	if len(d.Reclaim) == 0 {
+		return []PeerReclaimAction{{BlockID: d.BlockID, Pool: d.Pool}}
+	}
+	if d.BlockID != d.Reclaim[0].BlockID || d.Pool != d.Reclaim[0].Pool {
+		panic("peer group representative disagrees with first action")
+	}
+	legal := map[int64]bool{}
+	for _, v := range c.Candidates {
+		legal[v.ID] = true
+	}
+	targets := map[string]bool{"": true}
+	for _, t := range c.Targets {
+		targets[t.Pool] = t.Available
+	}
+	seen := map[int64]bool{}
+	for _, a := range d.Reclaim {
+		if !legal[a.BlockID] || seen[a.BlockID] || !targets[a.Pool] {
+			panic("peer policy selected an invalid reclaim group")
+		}
+		seen[a.BlockID] = true
+	}
+	return append([]PeerReclaimAction(nil), d.Reclaim...)
 }
 
 func cloneReclaimContext(c PeerReclaimContext) PeerReclaimContext {

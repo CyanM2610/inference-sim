@@ -5,9 +5,11 @@ import (
 	"sort"
 )
 
-// HotPrefixConfig defines a block-granular placement policy. It deliberately
-// uses exact metadata, not the paper's approximate token-radix cuckoo filter.
+// HotPrefixConfig controls block placement or the explicitly named resident
+// logical-segment adaptation. Both use exact per-prefix heat metadata.
 type HotPrefixConfig struct {
+	HBMEvictionUnit       string                      `json:"hbm_eviction_unit,omitempty"`
+	LengthReferenceTokens int64                       `json:"length_reference_tokens,omitempty"`
 	HBMScore              string                      `json:"hbm_score,omitempty"`
 	HBMCandidates         string                      `json:"hbm_candidates,omitempty"`
 	Diagnostics           *HotPrefixDiagnosticsConfig `json:"diagnostics,omitempty"`
@@ -21,9 +23,23 @@ type HotPrefixConfig struct {
 
 func (c HotPrefixConfig) Validate() error {
 	switch c.HBMScore {
-	case "", "paper", "frequency", "clock", "lru":
+	case "", "paper", "paper_fixed", "frequency", "clock", "lru":
 	default:
 		return fmt.Errorf("invalid HotPrefix hbm_score %q", c.HBMScore)
+	}
+	switch c.HBMEvictionUnit {
+	case "", "block", "logical_segment":
+	default:
+		return fmt.Errorf("invalid HotPrefix hbm_eviction_unit %q", c.HBMEvictionUnit)
+	}
+	if c.HBMEvictionUnit == "logical_segment" && (c.PromotionBlocks != 0 || c.HBMCandidates == "all_idle") {
+		return fmt.Errorf("HotPrefix logical segments require leaf candidates and promotion disabled")
+	}
+	if c.HBMScore == "paper_fixed" && (c.HBMEvictionUnit != "logical_segment" || c.LengthReferenceTokens <= 0) {
+		return fmt.Errorf("paper_fixed requires logical segments and an explicit positive length reference")
+	}
+	if c.LengthReferenceTokens < 0 {
+		return fmt.Errorf("invalid HotPrefix length_reference_tokens")
 	}
 	switch c.HBMCandidates {
 	case "", "leaf", "all_idle":
@@ -46,6 +62,8 @@ type hotPrefixNode struct {
 	parent           string
 	frequency, clock int64
 	depth            int64
+	children         int
+	inputEndpoint    bool
 }
 
 // HotPrefixPolicy owns history and pure decisions, never resource references.
@@ -85,6 +103,9 @@ func (p *HotPrefixPolicy) remember(keys []string) {
 		if n == nil {
 			n = &hotPrefixNode{parent: parent, depth: int64(i + 1)}
 			p.nodes[key] = n
+			if parent != "" {
+				p.nodes[parent].children++
+			}
 		} else if n.parent != parent {
 			panic("inconsistent HotPrefix identity")
 		}
@@ -96,6 +117,9 @@ func (p *HotPrefixPolicy) observe(keys []string) {
 	started := p.cpuStart()
 	defer p.cpuEnd("observe_history", started)
 	p.remember(keys)
+	if len(keys) > 0 {
+		p.nodes[keys[len(keys)-1]].inputEndpoint = true
+	}
 	p.requests++
 	if p.requests%p.config.AgingIntervalRequests == 0 {
 		for _, n := range p.nodes {
@@ -188,6 +212,9 @@ func (p *HotPrefixPolicy) eligible(v PeerCandidate, parents map[string]bool, cop
 }
 
 func (p *HotPrefixPolicy) choose(c PeerReclaimContext) PeerDecision {
+	if p.config.HBMEvictionUnit == "logical_segment" {
+		return p.chooseLogicalSegment(c)
+	}
 	parents := p.nonLeaves(c.ResidentHashes)
 	copies := map[string]int{}
 	for _, hash := range c.ResidentHashes {

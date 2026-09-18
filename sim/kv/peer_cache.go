@@ -241,33 +241,53 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 			s.emit("reclaim_declined", req, "", "hbm", "", "no_eligible_victim")
 			break
 		}
-		idx := -1
-		for i, c := range candidates {
-			if c.ID == d.BlockID {
-				idx = i
-				break
+		actions := validatedReclaimActions(d, context)
+		if len(d.Reclaim) > 0 {
+			var ids []int64
+			var hashes []string
+			for _, a := range actions {
+				ids = append(ids, a.BlockID)
+				hashes = append(hashes, s.Blocks[a.BlockID].Hash)
 			}
+			deficit := n - int64(len(empty)) - promised
+			s.fabric.emit(PeerRecord{Time: s.clock, Name: "hotprefix_group_reclaim", Instance: s.id, Request: req,
+				HBMBlocks: ids, Hashes: hashes, Bytes: int64(len(actions)) * s.fabric.bytes,
+				Reason: "whole_heat_coherent_resident_segment", Counters: map[string]int64{
+					"deficit_blocks": deficit, "selected_blocks": int64(len(actions)),
+					"overshoot_blocks": max(0, int64(len(actions))-deficit), "length_tokens": int64(len(actions)) * s.BlockSizeTokens}})
 		}
-		if idx < 0 {
-			panic("peer policy selected a non-candidate block")
+		// Validate the complete action before any mutation, then apply every
+		// member even when a prefix of the group already satisfies the deficit.
+		for _, action := range actions {
+			d := PeerDecision{BlockID: action.BlockID, Pool: action.Pool}
+			idx := -1
+			for i, c := range candidates {
+				if c.ID == d.BlockID {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				panic("peer policy selected a non-candidate block")
+			}
+			b := s.Blocks[d.BlockID]
+			if s.hotprefix != nil {
+				s.hotPrefixRecord("hotprefix_reclaim", req, b.Hash, d.Pool)
+			}
+			candidates = append(candidates[:idx], candidates[idx+1:]...)
+			s.emit("reclaim_decision", req, b.Hash, "hbm", d.Pool, "policy")
+			stored := d.Pool != "" && s.store(b, d.Pool, req)
+			if stored && !s.storeSourceReuseEnabled() {
+				s.waiting[req] = true
+				promised++
+				continue
+			}
+			s.emit("hbm_drop", req, b.Hash, "hbm", "", "reclaim")
+			droppedHash := b.Hash
+			s.invalidate(b)
+			s.shadowHotPrefixDrop(droppedHash, req)
+			empty = append(empty, b)
 		}
-		b := s.Blocks[d.BlockID]
-		if s.hotprefix != nil {
-			s.hotPrefixRecord("hotprefix_reclaim", req, b.Hash, d.Pool)
-		}
-		candidates = append(candidates[:idx], candidates[idx+1:]...)
-		s.emit("reclaim_decision", req, b.Hash, "hbm", d.Pool, "policy")
-		stored := d.Pool != "" && s.store(b, d.Pool, req)
-		if stored && !s.storeSourceReuseEnabled() {
-			s.waiting[req] = true
-			promised++
-			continue
-		}
-		s.emit("hbm_drop", req, b.Hash, "hbm", "", "reclaim")
-		droppedHash := b.Hash
-		s.invalidate(b)
-		s.shadowHotPrefixDrop(droppedHash, req)
-		empty = append(empty, b)
 	}
 	if int64(len(empty)) < n && promised > 0 {
 		s.waiting[req] = true

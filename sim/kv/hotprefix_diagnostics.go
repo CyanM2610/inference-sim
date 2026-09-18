@@ -14,6 +14,8 @@ type HotPrefixCPU struct {
 }
 
 type HotPrefixChoiceCandidate struct {
+	MemberBlocks          []int64  `json:"member_blocks,omitempty"`
+	MemberHashes          []string `json:"member_hashes,omitempty"`
 	BlockID               int64    `json:"block_id"`
 	Hash                  string   `json:"hash"`
 	LRUIndex              int      `json:"lru_index"`
@@ -29,16 +31,18 @@ type HotPrefixChoiceCandidate struct {
 }
 
 type HotPrefixChoice struct {
-	Sequence      int64                      `json:"sequence"`
-	TimeUS        int64                      `json:"time_us"`
-	Request       string                     `json:"request"`
-	DeficitBlocks int64                      `json:"deficit_blocks"`
-	ScoreRule     string                     `json:"score_rule"`
-	CandidateRule string                     `json:"candidate_rule"`
-	SelectedBlock int64                      `json:"selected_block"`
-	Pool          string                     `json:"pool"`
-	Declined      bool                       `json:"declined"`
-	Candidates    []HotPrefixChoiceCandidate `json:"candidates"`
+	CandidateUnit      string                     `json:"candidate_unit,omitempty"`
+	PhysicalIdleBlocks int64                      `json:"physical_idle_blocks,omitempty"`
+	Sequence           int64                      `json:"sequence"`
+	TimeUS             int64                      `json:"time_us"`
+	Request            string                     `json:"request"`
+	DeficitBlocks      int64                      `json:"deficit_blocks"`
+	ScoreRule          string                     `json:"score_rule"`
+	CandidateRule      string                     `json:"candidate_rule"`
+	SelectedBlock      int64                      `json:"selected_block"`
+	Pool               string                     `json:"pool"`
+	Declined           bool                       `json:"declined"`
+	Candidates         []HotPrefixChoiceCandidate `json:"candidates"`
 }
 
 type HotPrefixDiagnostics struct {
@@ -90,6 +94,11 @@ func (p *HotPrefixPolicy) recordChoice(c PeerReclaimContext, d PeerDecision) {
 	}
 	if r.CandidateRule == "" {
 		r.CandidateRule = "leaf"
+	}
+	if p.config.HBMEvictionUnit == "logical_segment" {
+		p.recordLogicalChoice(c, &r)
+		s.Records = append(s.Records, r)
+		return
 	}
 	parents := p.nonLeaves(c.ResidentHashes)
 	copies := map[string]int{}
