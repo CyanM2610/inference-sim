@@ -759,6 +759,24 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 			}
 			out.RestoreCostCoverage = "engine_phase_profile_restore_choices_not_native_validated"
 		}
+		if c.HotPrefix != nil && c.HotPrefix.Benefit != nil {
+			chunk := c.MaxBatchTokens
+			if c.PrefillChunk > 0 {
+				chunk = min(chunk, c.PrefillChunk)
+			}
+			decisionUS := int64(0)
+			if c.DecisionPolicy != nil && c.DecisionPolicy.ExtraCost != nil {
+				x := c.DecisionPolicy.ExtraCost
+				if x.PerPrefillWaitUS != 0 || x.PerRestoreChoiceUS != 0 || x.PerPreemptionUS != 0 || x.PerPrefixBlockUS != 0 || x.PerPendingTransferUS != 0 || x.PerPromotionUS != 0 || x.PerPromotionBlockUS != 0 {
+					return nil, fmt.Errorf("benefit conditional cost supports fixed+visible-request decision pricing only")
+				}
+				decisionUS = x.FixedUS + x.PerVisibleRequestUS
+			}
+			if err := stores[0].ConfigureBenefitCosts(chunk, decisionUS); err != nil {
+				return nil, err
+			}
+			out.HotPrefixCostCoverage += "; conditional_next_reference_benefit_estimates_not_actual_future_costs"
+		}
 		if c.PromotionControl {
 			retention := c.PromotionRetention
 			if retention == "" {

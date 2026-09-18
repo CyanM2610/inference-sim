@@ -15,6 +15,7 @@ type PeerTarget struct {
 	QueueUS   int64
 }
 type PeerReclaimContext struct {
+	BenefitCosts   *PlacementCostSnapshot
 	Candidates     []PeerCandidate
 	Targets        []PeerTarget
 	ResidentHashes []string // includes protected resident descendants
@@ -62,6 +63,7 @@ func validatedReclaimActions(d PeerDecision, c PeerReclaimContext) []PeerReclaim
 
 func cloneReclaimContext(c PeerReclaimContext) PeerReclaimContext {
 	copy := PeerReclaimContext{
+		BenefitCosts:   c.BenefitCosts.clone(),
 		Candidates:     append([]PeerCandidate(nil), c.Candidates...),
 		Targets:        append([]PeerTarget(nil), c.Targets...),
 		ResidentHashes: append([]string(nil), c.ResidentHashes...),

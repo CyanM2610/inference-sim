@@ -232,10 +232,11 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 	s.spaceWait[req] = int64(len(empty)) < n
 	for int64(len(empty))+promised < n && len(candidates) > 0 {
 		context := PeerReclaimContext{Candidates: candidates, Targets: s.targets()}
+		context.BenefitCosts = s.benefitCostSnapshot(req)
 		if s.hotprefix != nil {
 			context.ResidentHashes = s.hotPrefixResidents()
 		}
-		d := s.policy.Choose(cloneReclaimContext(context))
+		d := s.policy.Choose(s.reclaimPolicySnapshot(context))
 		s.annotateHotPrefixChoice(req, n-int64(len(empty))-promised)
 		if d.Decline {
 			s.emit("reclaim_declined", req, "", "hbm", "", "no_eligible_victim")

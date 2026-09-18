@@ -14,20 +14,21 @@ type HotPrefixCPU struct {
 }
 
 type HotPrefixChoiceCandidate struct {
-	MemberBlocks          []int64  `json:"member_blocks,omitempty"`
-	MemberHashes          []string `json:"member_hashes,omitempty"`
-	BlockID               int64    `json:"block_id"`
-	Hash                  string   `json:"hash"`
-	LRUIndex              int      `json:"lru_index"`
-	Eligible              bool     `json:"eligible"`
-	HasResidentDescendant bool     `json:"has_resident_descendant"`
-	Copies                int      `json:"resident_copies"`
-	ReadyCopies           []string `json:"ready_copies,omitempty"`
-	Frequency             int64    `json:"frequency"`
-	Clock                 int64    `json:"clock"`
-	LengthTokens          int64    `json:"length_tokens"`
-	Depth                 int64    `json:"depth"`
-	Score                 float64  `json:"score"`
+	Benefit               *HotPrefixBenefitEstimate `json:"benefit,omitempty"`
+	MemberBlocks          []int64                   `json:"member_blocks,omitempty"`
+	MemberHashes          []string                  `json:"member_hashes,omitempty"`
+	BlockID               int64                     `json:"block_id"`
+	Hash                  string                    `json:"hash"`
+	LRUIndex              int                       `json:"lru_index"`
+	Eligible              bool                      `json:"eligible"`
+	HasResidentDescendant bool                      `json:"has_resident_descendant"`
+	Copies                int                       `json:"resident_copies"`
+	ReadyCopies           []string                  `json:"ready_copies,omitempty"`
+	Frequency             int64                     `json:"frequency"`
+	Clock                 int64                     `json:"clock"`
+	LengthTokens          int64                     `json:"length_tokens"`
+	Depth                 int64                     `json:"depth"`
+	Score                 float64                   `json:"score"`
 }
 
 type HotPrefixChoice struct {
@@ -75,6 +76,16 @@ func (p *HotPrefixPolicy) cpuEnd(method string, start time.Time) {
 	c.Calls++
 	c.Nanoseconds += time.Since(start).Nanoseconds()
 	p.diagnostics.CPU[method] = c
+}
+
+func (s *PeerCache) reclaimPolicySnapshot(c PeerReclaimContext) PeerReclaimContext {
+	if s.hotprefix == nil {
+		return cloneReclaimContext(c)
+	}
+	p := s.hotprefix.policy
+	started := p.cpuStart()
+	defer p.cpuEnd("reclaim_snapshot_clone", started)
+	return cloneReclaimContext(c)
 }
 
 func (p *HotPrefixPolicy) recordChoice(c PeerReclaimContext, d PeerDecision) {

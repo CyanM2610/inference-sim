@@ -8,6 +8,7 @@ import (
 // HotPrefixConfig controls block placement or the explicitly named resident
 // logical-segment adaptation. Both use exact per-prefix heat metadata.
 type HotPrefixConfig struct {
+	Benefit               *HotPrefixBenefitConfig     `json:"benefit,omitempty"`
 	HBMEvictionUnit       string                      `json:"hbm_eviction_unit,omitempty"`
 	LengthReferenceTokens int64                       `json:"length_reference_tokens,omitempty"`
 	HBMScore              string                      `json:"hbm_score,omitempty"`
@@ -22,10 +23,21 @@ type HotPrefixConfig struct {
 }
 
 func (c HotPrefixConfig) Validate() error {
+	if c.Benefit != nil {
+		if err := c.Benefit.Validate(); err != nil {
+			return err
+		}
+		if c.PromotionBlocks != 0 {
+			return fmt.Errorf("benefit experiments require promotion disabled")
+		}
+	}
 	switch c.HBMScore {
-	case "", "paper", "paper_fixed", "frequency", "clock", "lru":
+	case "", "paper", "paper_fixed", "frequency", "clock", "lru", "benefit_next":
 	default:
 		return fmt.Errorf("invalid HotPrefix hbm_score %q", c.HBMScore)
+	}
+	if c.HBMScore == "benefit_next" && (c.Benefit == nil || c.HBMEvictionUnit != "logical_segment") {
+		return fmt.Errorf("benefit_next requires an explicit forecast and logical segments")
 	}
 	switch c.HBMEvictionUnit {
 	case "", "block", "logical_segment":
@@ -59,6 +71,7 @@ func (c HotPrefixConfig) Validate() error {
 }
 
 type hotPrefixNode struct {
+	references       hotPrefixReferenceHistory
 	parent           string
 	frequency, clock int64
 	depth            int64
@@ -71,11 +84,12 @@ type hotPrefixNode struct {
 // them hotness records. The runtime expires shadow heat independently from
 // the structural prefix identities used by resident descendants.
 type HotPrefixPolicy struct {
-	config      HotPrefixConfig
-	blockTokens int64
-	nodes       map[string]*hotPrefixNode
-	requests    int64
-	diagnostics *HotPrefixDiagnostics
+	lastSegments []hotPrefixLogicalSegment
+	config       HotPrefixConfig
+	blockTokens  int64
+	nodes        map[string]*hotPrefixNode
+	requests     int64
+	diagnostics  *HotPrefixDiagnostics
 }
 
 func NewHotPrefixPolicy(c HotPrefixConfig, blockTokens int64) (*HotPrefixPolicy, error) {
@@ -91,7 +105,7 @@ func NewHotPrefixPolicy(c HotPrefixConfig, blockTokens int64) (*HotPrefixPolicy,
 	p := &HotPrefixPolicy{config: c, blockTokens: blockTokens, nodes: map[string]*hotPrefixNode{}}
 	if c.Diagnostics != nil {
 		p.diagnostics = &HotPrefixDiagnostics{Schema: "hotprefix_choices_v1", MeasureCPU: c.Diagnostics.MeasureCPU, CPU: map[string]HotPrefixCPU{},
-			Coverage: "local Go pure policy/history methods; inclusive method timings; trace construction/export excluded; not simulated service or native CPU calibration"}
+			Coverage: "local Go history, policy and snapshot methods; inclusive method timings; trace construction/export excluded; not simulated service or native CPU calibration"}
 	}
 	return p, nil
 }

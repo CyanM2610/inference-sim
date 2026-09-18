@@ -8,6 +8,7 @@ import (
 )
 
 type hotPrefixRuntime struct {
+	benefitCosts  *PlacementPhaseCosts
 	requests      map[string]*hotPrefixRequest
 	shadows       map[string]hotPrefixShadow
 	expiry        hotPrefixExpiries
