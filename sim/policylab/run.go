@@ -690,6 +690,9 @@ func run(c Config, factories PolicyFactories) (*Result, error) {
 				return nil, err
 			}
 			out.HotPrefixCostCoverage = "block_granular_completed_reuse_with_bounded_shadow; declared_planner_us_only; heat_shadow_reclaim_admission_late_load_planning_and_worker_metadata_overhead_unmeasured; native_ranking_unvalidated"
+			if c.HotPrefix.HBMEvictionUnit == "logical_segment" {
+				out.HotPrefixCostCoverage = "block_aligned_heat_coherent_resident_segments_with_block_admission_and_shadow; existing_vector_transfer_model_extrapolated; selection_wall_time_optional_not_simulated; full_metadata_and_native_cost_unvalidated"
+			}
 		}
 	}
 	requests := make([]*sim.Request, 0, len(c.Requests))
