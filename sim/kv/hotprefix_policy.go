@@ -8,15 +8,31 @@ import (
 // HotPrefixConfig defines a block-granular placement policy. It deliberately
 // uses exact metadata, not the paper's approximate token-radix cuckoo filter.
 type HotPrefixConfig struct {
-	ShadowTTLUS           *int64 `json:"shadow_ttl_us,omitempty"` // nil = 60 seconds; zero disables shadow
-	AgingIntervalRequests int64  `json:"aging_interval_requests"`
-	AdmissionThreshold    int64  `json:"admission_threshold"`
-	MaxAge                int64  `json:"max_age,omitempty"`
-	PromotionBlocks       int64  `json:"promotion_blocks_per_step"`
-	PlannerUS             int64  `json:"planner_us,omitempty"`
+	HBMScore              string                      `json:"hbm_score,omitempty"`
+	HBMCandidates         string                      `json:"hbm_candidates,omitempty"`
+	Diagnostics           *HotPrefixDiagnosticsConfig `json:"diagnostics,omitempty"`
+	ShadowTTLUS           *int64                      `json:"shadow_ttl_us,omitempty"` // nil = 60 seconds; zero disables shadow
+	AgingIntervalRequests int64                       `json:"aging_interval_requests"`
+	AdmissionThreshold    int64                       `json:"admission_threshold"`
+	MaxAge                int64                       `json:"max_age,omitempty"`
+	PromotionBlocks       int64                       `json:"promotion_blocks_per_step"`
+	PlannerUS             int64                       `json:"planner_us,omitempty"`
 }
 
 func (c HotPrefixConfig) Validate() error {
+	switch c.HBMScore {
+	case "", "paper", "frequency", "clock", "lru":
+	default:
+		return fmt.Errorf("invalid HotPrefix hbm_score %q", c.HBMScore)
+	}
+	switch c.HBMCandidates {
+	case "", "leaf", "all_idle":
+	default:
+		return fmt.Errorf("invalid HotPrefix hbm_candidates %q", c.HBMCandidates)
+	}
+	if c.PromotionBlocks > 0 && ((c.HBMScore != "" && c.HBMScore != "paper") || c.HBMCandidates == "all_idle") {
+		return fmt.Errorf("HotPrefix HBM ablations require promotion disabled")
+	}
 	if c.ShadowTTLUS != nil && (*c.ShadowTTLUS < 0 || *c.ShadowTTLUS > 1<<62) {
 		return fmt.Errorf("invalid HotPrefix shadow_ttl_us")
 	}
@@ -41,6 +57,7 @@ type HotPrefixPolicy struct {
 	blockTokens int64
 	nodes       map[string]*hotPrefixNode
 	requests    int64
+	diagnostics *HotPrefixDiagnostics
 }
 
 func NewHotPrefixPolicy(c HotPrefixConfig, blockTokens int64) (*HotPrefixPolicy, error) {
@@ -53,7 +70,12 @@ func NewHotPrefixPolicy(c HotPrefixConfig, blockTokens int64) (*HotPrefixPolicy,
 	if c.MaxAge == 0 {
 		c.MaxAge = 255
 	}
-	return &HotPrefixPolicy{config: c, blockTokens: blockTokens, nodes: map[string]*hotPrefixNode{}}, nil
+	p := &HotPrefixPolicy{config: c, blockTokens: blockTokens, nodes: map[string]*hotPrefixNode{}}
+	if c.Diagnostics != nil {
+		p.diagnostics = &HotPrefixDiagnostics{Schema: "hotprefix_choices_v1", MeasureCPU: c.Diagnostics.MeasureCPU, CPU: map[string]HotPrefixCPU{},
+			Coverage: "local Go pure policy/history methods; inclusive method timings; trace construction/export excluded; not simulated service or native CPU calibration"}
+	}
+	return p, nil
 }
 
 func (p *HotPrefixPolicy) remember(keys []string) {
@@ -71,6 +93,8 @@ func (p *HotPrefixPolicy) remember(keys []string) {
 }
 
 func (p *HotPrefixPolicy) observe(keys []string) {
+	started := p.cpuStart()
+	defer p.cpuEnd("observe_history", started)
 	p.remember(keys)
 	p.requests++
 	if p.requests%p.config.AgingIntervalRequests == 0 {
@@ -82,6 +106,8 @@ func (p *HotPrefixPolicy) observe(keys []string) {
 
 // reuse is invoked by completed execution, not a speculative READY lookup.
 func (p *HotPrefixPolicy) reuse(hash string, shadowFrequency int64) {
+	started := p.cpuStart()
+	defer p.cpuEnd("completed_reuse", started)
 	n := p.nodes[hash]
 	if n == nil {
 		panic("HotPrefix reuse lacks arrived prefix identity")
@@ -91,6 +117,8 @@ func (p *HotPrefixPolicy) reuse(hash string, shadowFrequency int64) {
 }
 
 func (p *HotPrefixPolicy) published(hash string) {
+	started := p.cpuStart()
+	defer p.cpuEnd("publish_history", started)
 	n := p.nodes[hash]
 	if n == nil {
 		panic("HotPrefix publication lacks arrived prefix identity")
@@ -127,6 +155,39 @@ func (p *HotPrefixPolicy) nonLeaves(resident []string) map[string]bool {
 }
 
 func (p *HotPrefixPolicy) Choose(c PeerReclaimContext) PeerDecision {
+	started := p.cpuStart()
+	d := p.choose(c)
+	p.cpuEnd("hbm_choose", started)
+	p.recordChoice(c, d)
+	return d
+}
+
+func (p *HotPrefixPolicy) score(hash string) float64 {
+	n := p.nodes[hash]
+	if n == nil {
+		return 0
+	}
+	switch p.config.HBMScore {
+	case "frequency":
+		return float64(n.frequency)
+	case "clock":
+		return float64(n.clock)
+	case "lru":
+		return 0 // stable candidate order is the shared tiebreaker
+	default:
+		return float64(n.frequency) + float64(n.clock)/float64(p.blockTokens)
+	}
+}
+
+func (p *HotPrefixPolicy) eligible(v PeerCandidate, parents map[string]bool, copies map[string]int) bool {
+	if p.config.HBMCandidates == "all_idle" {
+		return true
+	}
+	n := p.nodes[v.Hash]
+	return n != nil && n.frequency > 0 && (!parents[v.Hash] || copies[v.Hash] > 1)
+}
+
+func (p *HotPrefixPolicy) choose(c PeerReclaimContext) PeerDecision {
 	parents := p.nonLeaves(c.ResidentHashes)
 	copies := map[string]int{}
 	for _, hash := range c.ResidentHashes {
@@ -135,11 +196,10 @@ func (p *HotPrefixPolicy) Choose(c PeerReclaimContext) PeerDecision {
 	best := -1
 	var score float64
 	for i, candidate := range c.Candidates {
-		n := p.nodes[candidate.Hash]
-		if n == nil || n.frequency == 0 || parents[candidate.Hash] && copies[candidate.Hash] < 2 {
+		if !p.eligible(candidate, parents, copies) {
 			continue
 		}
-		value := float64(n.frequency) + float64(n.clock)/float64(p.blockTokens)
+		value := p.score(candidate.Hash)
 		if best < 0 || value < score { // retain native free-list/LRU order for ties
 			best, score = i, value
 		}
@@ -165,6 +225,8 @@ type hotPrefixPoolPolicy struct{ state *HotPrefixPolicy }
 func (hotPrefixPoolPolicy) Observe(PoolPolicyEvent) {} // one request observation owns heat
 
 func (p hotPrefixPoolPolicy) Victim(c []PoolEvictionCandidate) string {
+	started := p.state.cpuStart()
+	defer p.state.cpuEnd("dram_victim", started)
 	best := ""
 	for _, v := range c {
 		if best == "" || p.state.hotness(v.Hash) < p.state.hotness(best) ||
@@ -176,6 +238,8 @@ func (p hotPrefixPoolPolicy) Victim(c []PoolEvictionCandidate) string {
 }
 
 func (p hotPrefixPoolPolicy) Admit(c PoolAdmissionContext) PoolAdmissionDecision {
+	started := p.state.cpuStart()
+	defer p.state.cpuEnd("dram_admit", started)
 	n := p.state.nodes[c.Hash]
 	if n == nil || n.frequency == 0 || n.frequency < p.state.config.AdmissionThreshold {
 		return PoolAdmissionDecision{Reason: "frequency_below_threshold"}
