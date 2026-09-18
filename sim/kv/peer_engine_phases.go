@@ -43,6 +43,7 @@ type phaseJob struct {
 // PeerEnginePhases owns engine control ordering, never request policy or token
 // advancement. Source/target leases and publication remain PeerCache callbacks.
 type PeerEnginePhases struct {
+	observePhases     func(EnginePhaseObservation)
 	submissionTails   map[string]*phaseJob
 	started           bool
 	submissionPolicy  TransferSubmissionPolicy
@@ -315,16 +316,24 @@ func (p *PeerEnginePhases) begin(now int64, work []sim.BatchWork, done func(int6
 		return false, fmt.Errorf("engine load planning clock overflow")
 	}
 	p.started, p.active = true, true
+	observation := EnginePhaseObservation{Instance: p.store.id, StartUS: now, PlanningEndUS: base, HasCompute: len(work) > 0, PreviousGPUReadyUS: p.lastGPUReady}
+	for _, w := range work {
+		if w.Request != nil && p.observePhases != nil {
+			observation.Requests = append(observation.Requests, w.Request.ID)
+		}
+	}
 	p.commitWorkerStep(now, work, fresh, t)
 	p.emit(now, "engine_step_begin", nil)
 	if planning > 0 {
 		p.store.fabric.emit(PeerRecord{Time: now, Name: "engine_load_planning", Instance: p.store.id, Duration: planning, Counters: map[string]int64{"loads": loads, "blocks": blocks}})
 	}
 	p.schedule(base+t.PreForwardUS, func(pre int64) {
+		observation.PreForwardUS = pre
 		p.emit(pre, "engine_pre_forward", nil)
 		storeEnd := p.submit(pre, p.lastGPUReady, false)
 		p.schedule(storeEnd, func(at int64) {
 			resume := func(ready int64) {
+				observation.ForwardReadyUS = ready
 				if p.reuseSources {
 					p.emit(ready, "engine_forward_ready", nil)
 				}
@@ -336,18 +345,28 @@ func (p *PeerEnginePhases) begin(now int64, work []sim.BatchWork, done func(int6
 				if len(work) == 0 {
 					gpuReady, outputReady = p.lastGPUReady, now
 				}
+				observation.GPUStartEstimateUS = max(ready, observation.PreviousGPUReadyUS)
+				observation.GPUReadyUS, observation.OutputReadyUS = gpuReady, outputReady
 				p.lastGPUReady = max(p.lastGPUReady, gpuReady)
 				post := base + t.PostForwardUS + delay
 				p.schedule(post, func(at int64) {
+					observation.PostForwardUS = at
 					p.emit(at, "engine_post_forward", nil)
 					p.store.afterHotPrefixPlacement(at, work, func(at int64) {
 						loadEnd := p.submit(at, gpuReady, true)
+						observation.LoadSubmitEndUS = loadEnd
 						p.schedule(loadEnd+t.PollUS, func(poll int64) {
+							observation.PollUS = poll
 							p.emit(poll, "engine_worker_poll", nil)
 							completed := p.completed() // only this poll's snapshot can be adopted
 							end := max(poll, outputReady) + t.TailUS
 							p.schedule(end, func(at int64) {
 								publish := func(at int64) {
+									observation.AdoptUS = at
+									if p.observePhases != nil {
+										p.observePhases(observation)
+										observation.Requests = nil
+									}
 									for _, j := range completed {
 										p.emit(at, "transfer_adopted", j)
 										j.done(at)

@@ -34,6 +34,7 @@ func writeJSON(path string, v any) error {
 func run() error {
 	config := flag.String("config", "", "experiment JSON")
 	output := flag.String("out", "", "result directory")
+	utilizationRequests := flag.String("utilization-requests", "", "JSON request ID array defining an additional utilization time window")
 	requestPlugin := flag.String("request-plugin", "", "registered request policy; empty retains config")
 	peerPlugin := flag.String("kv-plugin", "", "registered HBM reclaim/save policy; empty retains config")
 	poolPlugin := flag.String("pool-plugin", "", "registered pool eviction policy; empty retains config")
@@ -88,6 +89,17 @@ func run() error {
 	for name, v := range map[string]any{"summary.json": r, "cache-metrics.json": r.CacheMetrics, "profile_cpu.json": r.CPU, "routing.json": r.RoutingTrace, "config.json": c} {
 		if err = writeJSON(filepath.Join(*output, name), v); err != nil {
 			return err
+		}
+	}
+	if runErr == nil {
+		var measured []string
+		if *utilizationRequests != "" {
+			if err = json.Unmarshal([]byte(*utilizationRequests), &measured); err != nil || len(measured) == 0 {
+				return fmt.Errorf("utilization-requests must be a nonempty JSON request ID array")
+			}
+		}
+		if err = policylab.WriteUtilization(filepath.Join(*output, "utilization"), r, measured); err != nil {
+			return fmt.Errorf("utilization export: %w", err)
 		}
 	}
 	if r.TransferSubmissionCostCoverage != "" {
