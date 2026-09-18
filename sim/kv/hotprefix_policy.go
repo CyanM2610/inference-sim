@@ -16,7 +16,8 @@ type HotPrefixConfig struct {
 	HBMScore              string                      `json:"hbm_score,omitempty"`
 	HBMCandidates         string                      `json:"hbm_candidates,omitempty"`
 	Diagnostics           *HotPrefixDiagnosticsConfig `json:"diagnostics,omitempty"`
-	ShadowTTLUS           *int64                      `json:"shadow_ttl_us,omitempty"` // nil = 60 seconds; zero disables shadow
+	ShadowTTLUS           *int64                      `json:"shadow_ttl_us,omitempty"`    // nil = 60 seconds; zero disables shadow
+	ShadowThreshold       *int64                      `json:"shadow_threshold,omitempty"` // nil follows effective admission threshold
 	AgingIntervalRequests int64                       `json:"aging_interval_requests"`
 	AdmissionThreshold    int64                       `json:"admission_threshold"`
 	MaxAge                int64                       `json:"max_age,omitempty"`
@@ -37,6 +38,9 @@ func (c HotPrefixConfig) Validate() error {
 		}
 		if c.Benefit == nil || (c.HBMEvictionUnit != "" && c.HBMEvictionUnit != "block") {
 			return fmt.Errorf("admission cost experiment requires forecast and block reclamation; logical groups need a group-aware prediction")
+		}
+		if warmup := c.AdmissionCost.WarmupUntilFullReady; warmup != nil && (warmup.AdmissionThreshold < 1 || warmup.AdmissionThreshold > 255) {
+			return fmt.Errorf("admission warmup requires an explicit threshold in [1,255]")
 		}
 	}
 	if c.Benefit != nil {
@@ -80,6 +84,9 @@ func (c HotPrefixConfig) Validate() error {
 	if c.ShadowTTLUS != nil && (*c.ShadowTTLUS < 0 || *c.ShadowTTLUS > 1<<62) {
 		return fmt.Errorf("invalid HotPrefix shadow_ttl_us")
 	}
+	if c.ShadowThreshold != nil && (*c.ShadowThreshold < 1 || *c.ShadowThreshold > 255) {
+		return fmt.Errorf("explicit HotPrefix shadow_threshold must be in [1,255]")
+	}
 	if c.AgingIntervalRequests <= 0 || c.AdmissionThreshold < 0 || c.AdmissionThreshold > 255 || c.MaxAge < 0 || c.MaxAge > 255 || c.PromotionBlocks < 0 || c.PlannerUS < 0 {
 		return fmt.Errorf("invalid HotPrefix aging, threshold, clock, promotion budget or planner cost")
 	}
@@ -100,12 +107,13 @@ type hotPrefixNode struct {
 // them hotness records. The runtime expires shadow heat independently from
 // the structural prefix identities used by resident descendants.
 type HotPrefixPolicy struct {
-	lastSegments []hotPrefixLogicalSegment
-	config       HotPrefixConfig
-	blockTokens  int64
-	nodes        map[string]*hotPrefixNode
-	requests     int64
-	diagnostics  *HotPrefixDiagnostics
+	admissionWarmupFinished bool
+	lastSegments            []hotPrefixLogicalSegment
+	config                  HotPrefixConfig
+	blockTokens             int64
+	nodes                   map[string]*hotPrefixNode
+	requests                int64
+	diagnostics             *HotPrefixDiagnostics
 }
 
 func NewHotPrefixPolicy(c HotPrefixConfig, blockTokens int64) (*HotPrefixPolicy, error) {
@@ -299,9 +307,10 @@ func (p hotPrefixPoolPolicy) Admit(c PoolAdmissionContext) PoolAdmissionDecision
 	defer p.state.cpuEnd("dram_admit", started)
 	if config := p.state.config.AdmissionCost; config != nil {
 		estimate := p.state.assessAdmission(c)
+		rule, threshold := p.state.admissionRule(c, estimate)
 		var d PoolAdmissionDecision
-		if config.Rule == "threshold" {
-			d = p.admitThreshold(c)
+		if rule == "threshold" {
+			d = p.admitThresholdValue(c, threshold)
 		} else {
 			d = PoolAdmissionDecision{Accept: estimate.CostAccept, Reason: estimate.CostReason}
 			if d.Accept {
@@ -315,8 +324,12 @@ func (p hotPrefixPoolPolicy) Admit(c PoolAdmissionContext) PoolAdmissionDecision
 }
 
 func (p hotPrefixPoolPolicy) admitThreshold(c PoolAdmissionContext) PoolAdmissionDecision {
+	return p.admitThresholdValue(c, p.state.config.AdmissionThreshold)
+}
+
+func (p hotPrefixPoolPolicy) admitThresholdValue(c PoolAdmissionContext, threshold int64) PoolAdmissionDecision {
 	n := p.state.nodes[c.Hash]
-	if n == nil || n.frequency == 0 || n.frequency < p.state.config.AdmissionThreshold {
+	if n == nil || n.frequency == 0 || n.frequency < threshold {
 		return PoolAdmissionDecision{Reason: "frequency_below_threshold"}
 	}
 	if c.UsedBlocks < c.CapacityBlocks {

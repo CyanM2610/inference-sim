@@ -3,10 +3,15 @@ package kv
 // HotPrefixAdmissionConfig selects the D gate or records the same cost
 // prediction while retaining the original frequency threshold baseline.
 type HotPrefixAdmissionConfig struct {
-	Rule string `json:"rule"`
+	Rule                 string                          `json:"rule"`
+	WarmupUntilFullReady *HotPrefixAdmissionWarmupConfig `json:"warmup_until_full_ready,omitempty"`
 }
 
 type HotPrefixAdmissionEstimate struct {
+	Phase               string               `json:"phase,omitempty"`
+	ActiveThreshold     *int64               `json:"active_threshold,omitempty"`
+	WarmupStateSHA256   string               `json:"warmup_state_sha256,omitempty"`
+	WarmupReadyBlocks   int64                `json:"warmup_ready_blocks,omitempty"`
 	Rule                string               `json:"rule"`
 	Forecast            HotPrefixForecast    `json:"forecast"`
 	VictimForecast      *HotPrefixForecast   `json:"victim_forecast,omitempty"`
