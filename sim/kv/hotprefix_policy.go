@@ -8,6 +8,7 @@ import (
 // HotPrefixConfig controls block placement or the explicitly named resident
 // logical-segment adaptation. Both use exact per-prefix heat metadata.
 type HotPrefixConfig struct {
+	OneShotReclaim        *OneShotReclaim             `json:"one_shot_reclaim,omitempty"`
 	ReclaimMode           string                      `json:"reclaim_mode,omitempty"`
 	AdmissionCost         *HotPrefixAdmissionConfig   `json:"admission_cost,omitempty"`
 	Benefit               *HotPrefixBenefitConfig     `json:"benefit,omitempty"`
@@ -26,6 +27,11 @@ type HotPrefixConfig struct {
 }
 
 func (c HotPrefixConfig) Validate() error {
+	if x := c.OneShotReclaim; x != nil {
+		if c.HBMScore != "lru" || c.HBMEvictionUnit != "logical_segment" || c.ReclaimMode == "deficit_tail" || c.Benefit != nil || c.PromotionBlocks != 0 || c.Diagnostics == nil || !c.Diagnostics.TraceCandidates || x.Sequence <= 0 || x.TimeUS < 0 || len(x.CandidatesSHA256) != 64 || len(x.MemberBlocks) == 0 || len(x.MemberBlocks) != len(x.MemberHashes) {
+			return fmt.Errorf("one-shot reclaim requires explicit LRU logical diagnostics and a complete expected snapshot")
+		}
+	}
 	if c.ReclaimMode != "" && c.ReclaimMode != "whole" && c.ReclaimMode != "deficit_tail" {
 		return fmt.Errorf("invalid HotPrefix reclaim_mode")
 	}
@@ -52,12 +58,15 @@ func (c HotPrefixConfig) Validate() error {
 		}
 	}
 	switch c.HBMScore {
-	case "", "paper", "paper_fixed", "frequency", "clock", "lru", "benefit_next":
+	case "", "paper", "paper_fixed", "frequency", "clock", "lru", "benefit_next", "oracle_next_arrival", "oracle_remaining":
 	default:
 		return fmt.Errorf("invalid HotPrefix hbm_score %q", c.HBMScore)
 	}
 	if c.HBMScore == "benefit_next" && (c.Benefit == nil || c.HBMEvictionUnit != "logical_segment") {
 		return fmt.Errorf("benefit_next requires an explicit forecast and logical segments")
+	}
+	if isFutureScore(c.HBMScore) && (c.HBMEvictionUnit != "logical_segment" || c.Benefit != nil || c.AdmissionCost != nil || c.ReclaimMode == "deficit_tail" || c.AdmissionThreshold != 0 || c.PromotionBlocks != 0 || c.ShadowTTLUS == nil || *c.ShadowTTLUS != 0) {
+		return fmt.Errorf("future placement requires logical whole segments, unconditional admission, no shadow, benefit or promotion")
 	}
 	switch c.HBMEvictionUnit {
 	case "", "block", "logical_segment":
@@ -107,6 +116,8 @@ type hotPrefixNode struct {
 // them hotness records. The runtime expires shadow heat independently from
 // the structural prefix identities used by resident descendants.
 type HotPrefixPolicy struct {
+	overrideThisChoice      bool
+	future                  *hotPrefixFuture // nil for every online policy
 	admissionWarmupFinished bool
 	lastSegments            []hotPrefixLogicalSegment
 	config                  HotPrefixConfig

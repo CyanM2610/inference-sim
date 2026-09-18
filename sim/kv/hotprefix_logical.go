@@ -97,6 +97,11 @@ func (p *HotPrefixPolicy) chooseLogicalSegment(c PeerReclaimContext) PeerDecisio
 			}
 		}
 	}
+	if isFutureScore(p.config.HBMScore) {
+		for i := range segments {
+			segments[i].score = p.futureScore(segments[i].hashes)
+		}
+	}
 	p.lastSegments = segments
 	best := -1
 	for i, g := range segments {
@@ -105,6 +110,7 @@ func (p *HotPrefixPolicy) chooseLogicalSegment(c PeerReclaimContext) PeerDecisio
 			best = i
 		}
 	}
+	best = p.overrideLogicalChoice(segments, c.DeficitBlocks, best)
 	if best < 0 {
 		return PeerDecision{Decline: true}
 	}

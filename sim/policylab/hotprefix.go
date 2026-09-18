@@ -14,6 +14,17 @@ func (c Config) validateHotPrefix() error {
 	if err := c.HotPrefix.Validate(); err != nil {
 		return err
 	}
+	oracle := c.HotPrefix.HBMScore == "oracle_next_arrival" || c.HotPrefix.HBMScore == "oracle_remaining"
+	if oracle != c.AllowFuturePlacement {
+		return fmt.Errorf("oracle scores require allow_future_placement, which is forbidden for online policies")
+	}
+	if c.HotPrefix.HBMScore == "oracle_next_arrival" {
+		for _, r := range c.Requests {
+			if r.AfterRequest != "" {
+				return fmt.Errorf("next-arrival oracle requires open-loop arrivals")
+			}
+		}
+	}
 	if c.HotPrefix.Benefit != nil && !c.RestoreControl {
 		return fmt.Errorf("benefit predictions require native restore semantics")
 	}
