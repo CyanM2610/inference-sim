@@ -8,14 +8,18 @@ import (
 // HotPrefixConfig defines a block-granular placement policy. It deliberately
 // uses exact metadata, not the paper's approximate token-radix cuckoo filter.
 type HotPrefixConfig struct {
-	AgingIntervalRequests int64 `json:"aging_interval_requests"`
-	AdmissionThreshold    int64 `json:"admission_threshold"`
-	MaxAge                int64 `json:"max_age,omitempty"`
-	PromotionBlocks       int64 `json:"promotion_blocks_per_step"`
-	PlannerUS             int64 `json:"planner_us,omitempty"`
+	ShadowTTLUS           *int64 `json:"shadow_ttl_us,omitempty"` // nil = 60 seconds; zero disables shadow
+	AgingIntervalRequests int64  `json:"aging_interval_requests"`
+	AdmissionThreshold    int64  `json:"admission_threshold"`
+	MaxAge                int64  `json:"max_age,omitempty"`
+	PromotionBlocks       int64  `json:"promotion_blocks_per_step"`
+	PlannerUS             int64  `json:"planner_us,omitempty"`
 }
 
 func (c HotPrefixConfig) Validate() error {
+	if c.ShadowTTLUS != nil && (*c.ShadowTTLUS < 0 || *c.ShadowTTLUS > 1<<62) {
+		return fmt.Errorf("invalid HotPrefix shadow_ttl_us")
+	}
 	if c.AgingIntervalRequests <= 0 || c.AdmissionThreshold < 0 || c.AdmissionThreshold > 255 || c.MaxAge < 0 || c.MaxAge > 255 || c.PromotionBlocks < 0 || c.PlannerUS < 0 {
 		return fmt.Errorf("invalid HotPrefix aging, threshold, clock, promotion budget or planner cost")
 	}
@@ -30,7 +34,8 @@ type hotPrefixNode struct {
 
 // HotPrefixPolicy owns history and pure decisions, never resource references.
 // Zero-frequency records identify arrived input only; first publication makes
-// them hotness records. Metadata survives eviction and restoration.
+// them hotness records. The runtime expires shadow heat independently from
+// the structural prefix identities used by resident descendants.
 type HotPrefixPolicy struct {
 	config      HotPrefixConfig
 	blockTokens int64
@@ -65,21 +70,24 @@ func (p *HotPrefixPolicy) remember(keys []string) {
 	}
 }
 
-func (p *HotPrefixPolicy) observe(keys []string, matched int) {
+func (p *HotPrefixPolicy) observe(keys []string) {
 	p.remember(keys)
-	for _, key := range keys[:matched] {
-		n := p.nodes[key]
-		if n.frequency > 0 {
-			n.frequency = min(255, n.frequency+1)
-			n.clock = p.config.MaxAge
-		}
-	}
 	p.requests++
 	if p.requests%p.config.AgingIntervalRequests == 0 {
 		for _, n := range p.nodes {
 			n.clock = max(0, n.clock-1)
 		}
 	}
+}
+
+// reuse is invoked by completed execution, not a speculative READY lookup.
+func (p *HotPrefixPolicy) reuse(hash string, shadowFrequency int64) {
+	n := p.nodes[hash]
+	if n == nil {
+		panic("HotPrefix reuse lacks arrived prefix identity")
+	}
+	n.frequency = min(255, max(n.frequency, shadowFrequency)+1)
+	n.clock = p.config.MaxAge
 }
 
 func (p *HotPrefixPolicy) published(hash string) {

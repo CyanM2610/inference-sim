@@ -8,6 +8,11 @@ import (
 )
 
 type hotPrefixRuntime struct {
+	requests      map[string]*hotPrefixRequest
+	shadows       map[string]hotPrefixShadow
+	expiry        hotPrefixExpiries
+	shadowTTL     int64
+	shadowSerial  uint64
 	policy        *HotPrefixPolicy
 	pool          string
 	prefills      map[string]bool
@@ -34,7 +39,12 @@ func (s *PeerCache) ConfigureHotPrefix(c HotPrefixConfig) error {
 	if err := s.fabric.SetPoolEvictionPolicy(pool, hotPrefixPoolPolicy{state: policy}); err != nil {
 		return err
 	}
-	s.hotprefix = &hotPrefixRuntime{policy: policy, pool: pool, prefills: map[string]bool{}, parentHolds: map[string]int64{}}
+	ttl := int64(60_000_000)
+	if c.ShadowTTLUS != nil {
+		ttl = *c.ShadowTTLUS
+	}
+	s.hotprefix = &hotPrefixRuntime{policy: policy, pool: pool, prefills: map[string]bool{}, parentHolds: map[string]int64{},
+		requests: map[string]*hotPrefixRequest{}, shadows: map[string]hotPrefixShadow{}, shadowTTL: ttl}
 	s.policy = policy
 	return nil
 }
@@ -50,7 +60,14 @@ func (s *PeerCache) hotPrefixKeys(tokens []sim.TokenID) []string {
 }
 
 func (s *PeerCache) observeHotPrefix(req *sim.Request) {
+	h := s.hotprefix
+	if h == nil || h.requests[req.ID] != nil {
+		return
+	}
+	s.expireHotPrefixShadows()
 	keys := s.hotPrefixKeys(req.FullInputTokens())
+	r := &hotPrefixRequest{credited: map[string]bool{}, shadowMatches: map[string]int64{}}
+	h.requests[req.ID] = r
 	matched := 0
 	for _, hash := range keys {
 		_, local := s.lookup[hash]
@@ -60,9 +77,15 @@ func (s *PeerCache) observeHotPrefix(req *sim.Request) {
 		}
 		matched++
 	}
-	s.hotprefix.policy.observe(keys, matched)
+	h.policy.observe(keys)
+	for _, key := range keys {
+		if _, ok := h.shadows[key]; ok {
+			r.shadowMatches[key] = h.policy.nodes[key].frequency
+			s.hotPrefixRecord("hotprefix_shadow_match", req.ID, key, "")
+		}
+	}
 	s.fabric.emit(PeerRecord{Time: s.clock, Name: "hotprefix_observe", Instance: s.id, Request: req.ID,
-		Hashes: keys, Counters: map[string]int64{"matched_blocks": int64(matched), "request_serial": s.hotprefix.policy.requests}})
+		Hashes: keys, Reason: "availability_only_not_heat", Counters: map[string]int64{"matched_blocks": int64(matched), "request_serial": s.hotprefix.policy.requests}})
 }
 
 func (s *PeerCache) hotPrefixResidents() []string {
@@ -74,12 +97,16 @@ func (s *PeerCache) hotPrefixResidents() []string {
 	return hashes
 }
 
-func (s *PeerCache) hotPrefixRecord(name, request, hash, destination string) {
+func (s *PeerCache) hotPrefixRecord(name, request, hash, destination string, reasons ...string) {
 	n := s.hotprefix.policy.nodes[hash]
 	if n == nil {
 		panic("HotPrefix decision refers to unknown history")
 	}
-	s.fabric.emit(PeerRecord{Time: s.clock, Name: name, Instance: s.id, Request: request, Hash: hash,
+	reason := ""
+	if len(reasons) > 0 {
+		reason = reasons[0]
+	}
+	s.fabric.emit(PeerRecord{Time: s.clock, Name: name, Instance: s.id, Request: request, Hash: hash, Reason: reason,
 		Destination: destination, Counters: map[string]int64{"frequency": n.frequency, "clock": n.clock,
 			"depth": n.depth, "length_tokens": s.BlockSizeTokens, "hotness": n.frequency * n.clock}})
 }
@@ -174,7 +201,9 @@ func (s *PeerCache) executeHotPrefixPromotion() {
 			}
 			s.hotPrefixRecord("hotprefix_promotion_drop", "@promotion", b.Hash, "")
 			s.emit("hbm_drop", "@promotion", b.Hash, "hbm", "", "hotprefix_promotion")
+			droppedHash := b.Hash
 			s.invalidate(b) // Algorithm 2 discards cold GPU victims; no STORE here.
+			s.shadowHotPrefixDrop(droppedHash, "@promotion")
 		}
 		s.hotPrefixRecord("hotprefix_promote", "@promotion", action.hash, "hbm")
 		parent := h.policy.parent(action.hash)
