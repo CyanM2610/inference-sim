@@ -251,11 +251,14 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 		})
 		dmaIDs = append(dmaIDs, dma)
 		previous = api
-		if s.Cost.HoldCPUUntilDMA {
-			previous = e.MustAdd(Task{Name: "host_stream_synchronize", Operation: s.ID, Resource: s.CPU, Parents: []int64{api}, WaitFor: []int64{dma}, Finish: func() error { result.CPUFinishedNS = e.NowNS; return nil }})
-		}
-		if s.Cost.BlockingAPI {
-			previous = dma
+		if s.Cost.HoldCPUUntilDMA || s.Cost.BlockingAPI {
+			name := "host_stream_synchronize"
+			if s.Cost.BlockingAPI {
+				name = "host_blocking_copy_wait"
+			}
+			// A DMA dependency alone would serialize calls but leave the host
+			// resource free for unrelated work while this blocking call runs.
+			previous = e.MustAdd(Task{Name: name, Operation: s.ID, Resource: s.CPU, Parents: []int64{api}, WaitFor: []int64{dma}, Finish: func() error { result.CPUFinishedNS = e.NowNS; return nil }})
 		}
 		if s.Cost.WaitForDMA {
 			previous = e.MustAdd(Task{Name: "host_copy_wait", Operation: s.ID, Resource: s.CPU, Parents: []int64{api}, Ready: func() bool { return due > 0 }, Duration: func() int64 { return max(0, due-s.Cost.ReturnLeadNS-e.NowNS) }, Finish: func() error { result.CPUFinishedNS = e.NowNS; return nil }})
