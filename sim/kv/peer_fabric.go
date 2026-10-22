@@ -71,6 +71,7 @@ type peerPool struct {
 	trackAccess bool
 }
 type peerJob struct {
+	nativeControl     *nativePromotion
 	hostObject        *hostObject
 	overwrites        []sourceOverwrite
 	notBefore         int64
@@ -190,7 +191,7 @@ func (f *PeerFabric) submit(now int64, j *peerJob) {
 	j.record.Bytes = max(1, j.units) * f.bytes
 	if len(f.stores) == 1 && f.stores[0].nativePhaseTransfers {
 		store := f.stores[0]
-		if j.record.Reason == "promotion" {
+		if j.record.Reason == "promotion" && j.nativeControl == nil {
 			store.nativePromotionPrepared = append(store.nativePromotionPrepared, j)
 		} else {
 			store.nativePrepared = append(store.nativePrepared, j)

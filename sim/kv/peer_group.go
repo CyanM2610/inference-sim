@@ -64,7 +64,7 @@ func (f *PeerFabric) endTransferGroup(now int64) {
 		for _, j := range members {
 			record.HBMBlocks = append(record.HBMBlocks, j.record.HBMBlocks...)
 		}
-		group := &peerJob{record: record, units: int64(len(members)), path: first.path, schedule: first.schedule,
+		group := &peerJob{nativeControl: first.nativeControl, record: record, units: int64(len(members)), path: first.path, schedule: first.schedule,
 			done: func(at int64) {
 				for _, j := range members {
 					j.done(at)

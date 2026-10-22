@@ -21,6 +21,9 @@ func (s *PeerCache) NativeControlPending() bool {
 	if !s.nativePhaseTransfers {
 		return false
 	}
+	if s.nativeControl != nil {
+		return true
+	}
 	// This ownership already spans reservation through adoption. Prepared and
 	// receipt queues alone miss both the copy and claimed-receipt intervals.
 	prefix := s.restoreIdentity("@promotion", "")
@@ -186,6 +189,8 @@ type nativeCapturedBatch struct {
 	loads                []*peerJob
 	receives             []string
 	promotions           []int64
+	control              *nativePromotion
+	controlReceipt       *nativePromotion
 }
 
 // The physical STORE read / LOAD write outlives allocator ownership. Keep the
@@ -282,6 +287,7 @@ func (s *PeerCache) CaptureNativeBatch(work []sim.NativeWork) sim.NativeBatchKV 
 		s.nativeStored[w.Request.ID] = position
 		s.nativePending[w.Request.ID]++
 	}
+	b.control = s.prepareNativePromotion()
 	return b
 }
 
@@ -368,6 +374,9 @@ func (b *nativeCapturedBatch) PostForward(now int64, producer *sim.NativeFence) 
 			s.holdCapturedHostStore(w.Request.ID, captured.ids)
 		}
 	}
+	if b.control != nil {
+		s.submitNativePromotion(b.control)
+	}
 	jobs := append(b.loads, s.nativePrepared...)
 	b.loads = nil
 	s.nativePrepared = nil
@@ -442,6 +451,11 @@ func (b *nativeCapturedBatch) Poll(now int64) {
 	s.SetClock(now)
 	b.promotions = s.nativePromotionReceipts
 	s.nativePromotionReceipts = nil
+	if c := s.nativeControl; c != nil && c.submitted && !c.claimed && c.completed == len(c.ids)-c.cached {
+		c.claimed = true
+		b.controlReceipt = c
+		s.emit("native_control_receipt", c.id, "", "host", "hbm", "worker_poll")
+	}
 	for request, pending := range s.nativeLoadPending {
 		if pending && s.readPending[request] == 0 && len(s.nativeLoadTargets[request]) > 0 {
 			b.receives = append(b.receives, request)
@@ -503,6 +517,9 @@ func (b *nativeCapturedBatch) Consumed(now int64) {
 	b.consumed = true
 	s := b.store
 	s.SetClock(now)
+	if b.controlReceipt != nil {
+		s.adoptNativePromotion(b.controlReceipt)
+	}
 	for _, id := range b.promotions {
 		block := s.Blocks[id]
 		s.publishReadyCopy(block)

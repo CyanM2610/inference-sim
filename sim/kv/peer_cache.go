@@ -17,6 +17,9 @@ type PeerCache struct {
 	nativePrepared          []*peerJob
 	nativePromotionPrepared []*peerJob
 	nativePromotionReceipts []int64
+	nativeControl           *nativePromotion
+	nativeControlSerial     int64
+	nativeControlRPCs       int64
 	nativePageAccess        map[int64]nativePendingPageAccess
 	nativeReserving         bool
 	nativeBatchPins         int64
@@ -488,6 +491,12 @@ func (s *PeerCache) fetch(h, req string, e *peerEntry, a *PeerAccess, protect ma
 }
 
 func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAccess, protect map[int64]bool, background, retainRequest bool) bool {
+	return s.fetchInto(h, req, e, a, protect, background, retainRequest, nil, nil)
+}
+
+// A native control owns its complete reservation before worker submission;
+// legacy/demand paths reserve here. Both use the same physical transfer path.
+func (s *PeerCache) fetchInto(h, req string, e *peerEntry, a *PeerAccess, protect map[int64]bool, background, retainRequest bool, target *KVBlock, control *nativePromotion) bool {
 	nativePromotion := s.nativePhaseTransfers && background
 	if nativePromotion && retainRequest {
 		panic("native phase promotion uses independent cache ownership")
@@ -497,11 +506,11 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		s.waiting[req] = true
 		return true
 	}
-	if background && s.fabric.mechanisms.MaxPromotionQueueUS > 0 && s.fabric.EstimateQueueUS(s.clock, a.ReadPath) > s.fabric.mechanisms.MaxPromotionQueueUS {
+	if control == nil && background && s.fabric.mechanisms.MaxPromotionQueueUS > 0 && s.fabric.EstimateQueueUS(s.clock, a.ReadPath) > s.fabric.mechanisms.MaxPromotionQueueUS {
 		s.emit("promotion_rejected", req, h, a.Pool, "hbm", "queue_budget")
 		return false
 	}
-	var b *KVBlock
+	b := target
 	reserve := func(now int64) bool {
 		s.clock = now
 		if !s.makeSpace(1, protect, req) {
@@ -517,7 +526,10 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		s.pendingTargets[b.ID] = true
 		return true
 	}
-	if !s.fabric.mechanisms.ReserveAtDispatch && !reserve(s.clock) {
+	if control != nil && (target == nil || target.RefCount != 1 || target.Hash != "" || !s.pendingTargets[target.ID]) {
+		panic("native control lost its reserved destination")
+	}
+	if target == nil && !s.fabric.mechanisms.ReserveAtDispatch && !reserve(s.clock) {
 		return false
 	}
 	s.restoring[identity] = true
@@ -569,12 +581,14 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 	if b != nil {
 		targetIDs = []int64{b.ID}
 	} // legacy dispatch-time reservation has no target yet
-	s.fabric.submit(s.clock, &peerJob{hostObject: e.object, nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.hbmBuffer(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, HBMBlocks: targetIDs, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
+	s.fabric.submit(s.clock, &peerJob{nativeControl: control, hostObject: e.object, nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.hbmBuffer(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, HBMBlocks: targetIDs, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
 		s.clock = now
 		delete(s.pendingTargets, b.ID)
-		b.Hash = h
 		b.Tokens = append([]sim.TokenID(nil), e.tokens...)
-		s.HashToBlock[h] = b.ID
+		if control == nil {
+			b.Hash = h
+			s.HashToBlock[h] = b.ID
+		}
 		if !s.nativeAsync || background && !nativePromotion {
 			s.publishReadyCopy(b)
 		}
@@ -590,7 +604,12 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		if s.readPending[req] == 0 {
 			delete(s.readPending, req)
 		}
-		if nativePromotion {
+		if control != nil {
+			control.completed++
+			if control.completed > len(control.ids)-control.cached {
+				panic("native control copied a destination twice")
+			}
+		} else if nativePromotion {
 			// Keep this target owned and undiscoverable until an actual worker
 			// poll and FIFO consumption adopt the receipt. Further promotions
 			// of the same hash still see restoring=true in this interval.
@@ -1080,6 +1099,13 @@ func (s *PeerCache) PeerSnapshot() map[string]int64 {
 		m["native_processed_step"] = s.nativeProcessedStep
 		m["native_promotion_prepared"] = int64(len(s.nativePromotionPrepared))
 		m["native_promotion_receipts"] = int64(len(s.nativePromotionReceipts))
+		if s.nativeControlSerial != 0 {
+			m["native_control_rpcs"] = s.nativeControlRPCs
+			m["native_control_pending"] = 0
+			if s.nativeControl != nil {
+				m["native_control_pending"] = 1
+			}
+		}
 		m["promoted_unconsumed_resident"] = int64(len(s.promoted))
 		for _, retired := range s.nativeDeferred {
 			m["native_deferred_free_refs"] += int64(len(retired.ids))

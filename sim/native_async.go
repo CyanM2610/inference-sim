@@ -42,25 +42,28 @@ type nativeAsyncRuntime struct {
 // NativeAsyncEvent exposes actual runtime transitions, never trace-forced times.
 // Shape is a submission snapshot, so later formation cannot rewrite past work.
 type NativeAsyncEvent struct {
-	At               int64                `json:"time_us"`
-	Name             string               `json:"name"`
-	BatchID          int64                `json:"batch_id"`
-	Shape            []NativeBatchShape   `json:"shape,omitempty"`
-	QueueDepth       int                  `json:"queue_depth"`
-	Phase            string               `json:"phase,omitempty"`
-	Resource         string               `json:"resource,omitempty"`
-	DurationUS       int64                `json:"duration_us,omitempty"`
-	Execution        *NativeExecutionPlan `json:"execution,omitempty"`
-	KVAccess         *NativeKVAccessPlan  `json:"kv_access,omitempty"`
-	Transaction      int64                `json:"transaction,omitempty"`
-	Transfer         *NativeTransferPlan  `json:"transfer,omitempty"`
-	TransferShape    *NativeTransferShape `json:"transfer_shape,omitempty"`
-	ProducerBatch    int64                `json:"producer_batch,omitempty"`
-	ProducerPhase    string               `json:"producer_phase,omitempty"`
-	Request          string               `json:"request,omitempty"`
-	CoverageGap      string               `json:"coverage_gap,omitempty"`
-	Generation       uint64               `json:"generation,omitempty"`
-	FinishedRequests []string             `json:"finished_requests,omitempty"`
+	At               int64                  `json:"time_us"`
+	Name             string                 `json:"name"`
+	BatchID          int64                  `json:"batch_id"`
+	Shape            []NativeBatchShape     `json:"shape,omitempty"`
+	QueueDepth       int                    `json:"queue_depth"`
+	Phase            string                 `json:"phase,omitempty"`
+	Resource         string                 `json:"resource,omitempty"`
+	DurationUS       int64                  `json:"duration_us,omitempty"`
+	Execution        *NativeExecutionPlan   `json:"execution,omitempty"`
+	KVAccess         *NativeKVAccessPlan    `json:"kv_access,omitempty"`
+	Transaction      int64                  `json:"transaction,omitempty"`
+	Transfer         *NativeTransferPlan    `json:"transfer,omitempty"`
+	TransferShape    *NativeTransferShape   `json:"transfer_shape,omitempty"`
+	ProducerBatch    int64                  `json:"producer_batch,omitempty"`
+	ProducerPhase    string                 `json:"producer_phase,omitempty"`
+	Request          string                 `json:"request,omitempty"`
+	CoverageGap      string                 `json:"coverage_gap,omitempty"`
+	ControlID        string                 `json:"control_id,omitempty"`
+	ControlShape     *NativeControlRPCShape `json:"control_shape,omitempty"`
+	Control          *NativeControlRPCPlan  `json:"control,omitempty"`
+	Generation       uint64                 `json:"generation,omitempty"`
+	FinishedRequests []string               `json:"finished_requests,omitempty"`
 	run              func()
 }
 

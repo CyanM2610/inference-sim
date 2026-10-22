@@ -150,8 +150,8 @@ func (s *PeerCache) handoffHostLookup(jobs []*peerJob) func(int64) {
 	}
 	// Explicit background promotion has its own immediate read reservation;
 	// it must not borrow or retire a foreground request's lookup lease.
-	foreground := jobs[0].record.Reason == "restore"
-	if foreground {
+	leased := jobs[0].record.Reason == "restore" || jobs[0].nativeControl != nil
+	if leased {
 		for _, object := range objects {
 			if lookup == nil || lookup.remaining[object.key] != object {
 				panic("LOAD does not own its lookup reservation")
@@ -160,12 +160,12 @@ func (s *PeerCache) handoffHostLookup(jobs []*peerJob) func(int64) {
 	}
 	for _, object := range objects {
 		object.transferRefs++
-		if foreground {
+		if leased {
 			s.releaseHostLookupObject(request, lookup, object.key, "transfer_handoff")
 		}
 		s.hostOwnershipEvent("host_transfer_reserved", request, object, "load")
 	}
-	if foreground {
+	if leased {
 		// Complete chunks preceding the first LOAD are covered by HBM.
 		for _, object := range lookup.prefix {
 			if seen[object] {
