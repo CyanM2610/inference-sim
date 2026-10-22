@@ -16,56 +16,11 @@ type ExternalTransfer struct {
 	Bytes       int64  `json:"bytes"`
 }
 type externalPeerRuntime struct {
-	memory    ExternalMemory
 	free      []string
 	leased    map[string]bool
 	pending   map[int64]*peerJob
 	delivered map[int64]bool
 	commands  []ExternalTransfer
-}
-
-// ExternalMemory observes actual physical storage when the external worker is
-// itself simulated. Hardware-only controllers leave this unset.
-type ExternalMemory interface {
-	InvalidateHBM(slot int64) error
-	CheckContents(hash, buffer string) error
-	CheckTransfer(id int64, hash, buffer string) error
-	CheckIdle(buffer string) error
-}
-
-func (f *PeerFabric) AttachExternalMemory(memory ExternalMemory) error {
-	if f.external == nil || f.external.memory != nil || memory == nil || f.serial != 0 {
-		return fmt.Errorf("external memory must attach once before policy execution")
-	}
-	f.external.memory = memory
-	return nil
-}
-
-func (f *PeerFabric) ValidateExternalMemory() error {
-	if f.external == nil || f.external.memory == nil {
-		return fmt.Errorf("external memory is not attached")
-	}
-	x := f.external
-	if len(x.pending) != 0 || len(x.commands) != 0 || f.Pending() != 0 {
-		return fmt.Errorf("external acknowledgements remain pending")
-	}
-	for id, hash := range f.stores[0].ready {
-		if err := x.memory.CheckContents(hash, f.hbmBuffer(id)); err != nil {
-			return err
-		}
-	}
-	for hash, entry := range f.pools["dram"].entries {
-		if !entry.ready || !x.leased[entry.nativeBuffer] {
-			return fmt.Errorf("unpublished or unleased external directory entry")
-		}
-		if err := x.memory.CheckContents(hash, entry.nativeBuffer); err != nil {
-			return err
-		}
-	}
-	if len(x.leased) != len(f.pools["dram"].entries) {
-		return fmt.Errorf("physical leases disagree with directory")
-	}
-	return nil
 }
 
 func (f *PeerFabric) ConfigureExternalTransfers() error {
@@ -98,11 +53,6 @@ func (x *externalPeerRuntime) reserve() string {
 func (x *externalPeerRuntime) release(id string) {
 	if !x.leased[id] {
 		panic("unleased external host slot")
-	}
-	if x.memory != nil {
-		if err := x.memory.CheckIdle(id); err != nil {
-			panic(err)
-		}
 	}
 	delete(x.leased, id)
 	x.free = append(x.free, id)
@@ -138,11 +88,6 @@ func (f *PeerFabric) CompleteExternalTransfer(id, at int64) error {
 	j := x.pending[id]
 	if j == nil || !x.delivered[id] || at <= j.record.Time {
 		return fmt.Errorf("unknown, undelivered or premature external completion %d", id)
-	}
-	if x.memory != nil {
-		if err := x.memory.CheckTransfer(id, j.record.Hash, j.nativeDestination()); err != nil {
-			return err
-		}
 	}
 	delete(x.pending, id)
 	delete(x.delivered, id)

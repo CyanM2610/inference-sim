@@ -12,7 +12,6 @@ import (
 // Arenas are already allocated at admission (steady state). Slot reuse changes
 // contents, never allocated byte count. Only single-instance pinned DRAM works.
 type NativePeerRuntime struct {
-	hbmSlots, hostSlots         int64
 	inputs                      *kvruntime.RequestInputs
 	outputEnabled               bool
 	pagedEnabled, forwardActive bool
@@ -98,43 +97,27 @@ func (f *PeerFabric) ConfigureNative(p *kvruntime.Profile, numa int, sink func(k
 	if len(s.access) != 1 || s.access[0].Pool != "dram" || len(s.access[0].ReadPath) != 1 || len(s.access[0].WritePath) != 1 || s.access[0].ReadPath[0] != s.access[0].WritePath[0] {
 		return fmt.Errorf("native backend requires one shared transfer gate for both directions")
 	}
-	n, err := newNativePeerRuntime(p, numa, s.TotalBlocks, f.pools["dram"].config.CapacityBlocks, sink)
-	if err != nil {
-		return err
-	}
-	n.fabric = f
-	f.native = n
-	return nil
-}
-
-// newNativePeerRuntime binds physical arenas without attaching a policy clock.
-// Both the legacy BLIS pump and the externally acknowledged controller use it.
-func newNativePeerRuntime(p *kvruntime.Profile, numa int, hbmSlots, hostSlots int64, sink func(kvruntime.Record)) (*NativePeerRuntime, error) {
-	if p == nil || hbmSlots <= 0 || hostSlots <= 0 {
-		return nil, fmt.Errorf("native arenas require a profile and positive capacities")
-	}
-	n := &NativePeerRuntime{hbmSlots: hbmSlots, hostSlots: hostSlots, origins: map[string]uint64{}, profile: p, points: map[string]kvruntime.TransferPoint{}, hostLeased: map[string]bool{}, scheduled: map[int64]bool{}, sink: sink}
+	n := &NativePeerRuntime{origins: map[string]uint64{}, fabric: f, profile: p, points: map[string]kvruntime.TransferPoint{}, hostLeased: map[string]bool{}, scheduled: map[int64]bool{}, sink: sink}
 	for _, direction := range []string{"d2h", "h2d"} {
 		point, err := p.Find(numa, "paged", "pinned", 1, direction)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		n.points[direction] = point
 	}
 	e := kvruntime.NewEngine(sink)
-	const blockBytes = int64(917504)
-	m, err := kvruntime.NewMemory(e, 256, map[string]int64{"hbm": hbmSlots * blockBytes, "dram": hostSlots * blockBytes})
+	m, err := kvruntime.NewMemory(e, 256, map[string]int64{"hbm": s.TotalBlocks * f.bytes, "dram": f.pools["dram"].config.CapacityBlocks * f.bytes})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	n.Runtime, err = kvruntime.NewRuntime(e, m, p.QueueDepth)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for _, pool := range []string{"hbm", "dram"} {
-		capacity := hbmSlots
+		capacity := s.TotalBlocks
 		if pool == "dram" {
-			capacity = hostSlots
+			capacity = f.pools[pool].config.CapacityBlocks
 		}
 		for slot := int64(0); slot < capacity; slot++ {
 			id := fmt.Sprintf("%s/slot/%d", pool, slot)
@@ -143,20 +126,21 @@ func newNativePeerRuntime(p *kvruntime.Profile, numa int, hbmSlots, hostSlots in
 				kind = "pinned_arena_slot"
 				n.hostFree = append(n.hostFree, id)
 			}
-			if _, err := m.Reserve(id, pool, kind, blockBytes); err != nil {
-				return nil, err
+			if _, err := m.Reserve(id, pool, kind, f.bytes); err != nil {
+				return err
 			}
 			if err := m.Allocate(id); err != nil {
-				return nil, err
+				return err
 			}
 			if err := m.Fill(id, 0); err != nil {
-				return nil, err
+				return err
 			}
-			e.Emit(kvruntime.Record{Name: "arena_slot_bind", Destination: id, Resource: pool, Bytes: blockBytes, SourceOffset: slot * 16384, PhysicalLayerStride: capacity * 16384, Reason: "56_layer_major_slices_of_16KiB"})
+			e.Emit(kvruntime.Record{Name: "arena_slot_bind", Destination: id, Resource: pool, Bytes: f.bytes, SourceOffset: slot * 16384, PhysicalLayerStride: capacity * 16384, Reason: "56_layer_major_slices_of_16KiB"})
 		}
 	}
 	e.Emit(kvruntime.Record{Name: "native_scope", Reason: "warm preallocated arenas; 56x16KiB per-block native service; one transaction gate; BLIS compute remains its configured model; arena setup, CPU/compute contention and coalesced cross-block transfer are not calibrated"})
-	return n, nil
+	f.native = n
+	return nil
 }
 func (n *NativePeerRuntime) hbmID(id int64) string { return fmt.Sprintf("hbm/slot/%d", id) }
 func (n *NativePeerRuntime) reserveEntry(pool string) string {

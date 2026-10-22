@@ -9,9 +9,7 @@ import (
 )
 
 func (f *PeerFabric) EnableInputPipeline(requests []kvruntime.InputRequest) error {
-	return f.native.enableInputPipeline(requests)
-}
-func (n *NativePeerRuntime) enableInputPipeline(requests []kvruntime.InputRequest) error {
+	n := f.native
 	if n == nil || !n.outputEnabled || n.inputs != nil || n.profile.InputPipeline == nil {
 		return fmt.Errorf("input pipeline requires output copies and measured input profile")
 	}
@@ -20,7 +18,7 @@ func (n *NativePeerRuntime) enableInputPipeline(requests []kvruntime.InputReques
 	for _, x := range p.Index {
 		known[x.Count] = true
 	}
-	for count := int64(1); count <= n.hbmSlots; count++ {
+	for count := int64(1); count <= f.stores[0].TotalBlocks; count++ {
 		if !known[count] {
 			return fmt.Errorf("unmeasured possible input index count %d", count)
 		}
@@ -42,7 +40,7 @@ func (n *NativePeerRuntime) enableInputPipeline(requests []kvruntime.InputReques
 	}
 	m.Capacity["host_input"] = 2 * p.HostIndexBytes
 	var pages []string
-	for id := int64(0); id < n.hbmSlots; id++ {
+	for id := int64(0); id < f.stores[0].TotalBlocks; id++ {
 		pages = append(pages, n.hbmID(id))
 	}
 	inputs, err := kvruntime.NewRequestInputs(n.Runtime, *p, "hbm_workspace", "host_input", pages, requests)
@@ -55,9 +53,7 @@ func (n *NativePeerRuntime) enableInputPipeline(requests []kvruntime.InputReques
 }
 
 func (f *PeerFabric) EnableOutputCopies(policy string) error {
-	return f.native.enableOutputCopies(policy)
-}
-func (n *NativePeerRuntime) enableOutputCopies(policy string) error {
+	n := f.native
 	if n == nil || !n.pagedEnabled || n.outputEnabled {
 		return fmt.Errorf("output copies require an idle paged runtime")
 	}
@@ -96,14 +92,12 @@ func (n *NativePeerRuntime) enableOutputCopies(policy string) error {
 // EnableTorchCopies opts into coefficients measured over live Torch-owned
 // pointers. Keeping this explicit preserves prior standalone-CUDA experiments.
 func (f *PeerFabric) EnableTorchCopies() error {
-	return f.native.enableTorchCopies()
-}
-func (n *NativePeerRuntime) enableTorchCopies() error {
+	n := f.native
 	if n == nil || !n.pagedEnabled || n.profile.TorchCopies == nil {
 		return fmt.Errorf("live Torch copies require the paged backend and measured profile")
 	}
 	c := n.profile.TorchCopies
-	if n.hbmSlots != c.GPUSlots || n.hostSlots != c.HostSlots {
+	if f.stores[0].TotalBlocks != c.GPUSlots || f.pools["dram"].config.CapacityBlocks != c.HostSlots {
 		return fmt.Errorf("live Torch transfer arena shape mismatch")
 	}
 	points := map[string]kvruntime.TransferPoint{}
@@ -121,10 +115,8 @@ func (n *NativePeerRuntime) enableTorchCopies() error {
 }
 
 func (f *PeerFabric) EnablePagedForward() error {
-	return f.native.enablePagedForward()
-}
-func (n *NativePeerRuntime) enablePagedForward() error {
-	if n == nil || n.pagedEnabled || n.hbmSlots != 40 || len(n.profile.PagedForward) == 0 {
+	n := f.native
+	if n == nil || n.pagedEnabled || f.stores[0].TotalBlocks != 40 || len(n.profile.PagedForward) == 0 {
 		return fmt.Errorf("paged forward requires the measured 40-slot arena and pipeline profile")
 	}
 	var before, reserved int64
@@ -132,7 +124,7 @@ func (n *NativePeerRuntime) enablePagedForward() error {
 		before = max(before, p.BeforeAllocatedBytes)
 		reserved = max(reserved, p.ReservedBytes)
 	}
-	arena := n.hbmSlots * 917504
+	arena := f.stores[0].TotalBlocks * f.bytes
 	if before <= arena || reserved < before {
 		return fmt.Errorf("invalid measured GPU allocation baseline")
 	}
@@ -147,8 +139,8 @@ func (n *NativePeerRuntime) enablePagedForward() error {
 	if err := m.Allocate("native/model_context"); err != nil {
 		return err
 	}
-	for slot := int64(0); slot < n.hbmSlots; slot++ {
-		if err := m.Invalidate(n.hbmID(slot)); err != nil {
+	for _, b := range f.stores[0].Blocks {
+		if err := m.Invalidate(n.hbmID(b.ID)); err != nil {
 			return err
 		}
 	}
@@ -201,49 +193,23 @@ func (s *PeerCache) BeginBatch(now int64, work []sim.BatchWork, done func(int64)
 		return false, fmt.Errorf("native paged forward supports one active batch-one graph")
 	}
 	w := work[0]
-	n.advance(now)
-	ids := append([]int64(nil), s.RequestMap[w.Request.ID]...)
-	hashes := make([]string, len(ids))
-	for i, id := range ids {
-		hashes[i] = s.Blocks[id].Hash
-	}
-	_, err := n.beginPagedBatch(w.Request, w.PrefixTokens, w.NewTokens, ids, hashes, func(result *kvruntime.PagedStepResult) {
-		at := (result.CompleteNS + 999) / 1000
-		n.completed = append(n.completed, func() {
-			n.fabric.emit(PeerRecord{Time: at, Name: "native_forward_complete", Request: w.Request.ID, Value: at*1000 - result.CompleteNS, Duration: at - now, Counters: map[string]int64{"verified_cells": result.CellsVerified, "mapping_tasks": int64(result.MappingTasks), "workspace_peak_delta_bytes": result.AllocatedPeakDelta, "output_bytes": result.OutputBytes, "output_observed_ns": result.OutputObservedNS}})
-			done(at)
-		})
-	})
-	if err != nil {
-		return false, err
-	}
-	n.arm(s.schedule)
-	return true, nil
-}
-
-// beginPagedBatch submits only physical work. The caller owns policy time and
-// completion observation; the method never advances or recursively pumps it.
-func (n *NativePeerRuntime) beginPagedBatch(req *sim.Request, prefix, query int64, ids []int64, hashes []string, done func(*kvruntime.PagedStepResult)) (*kvruntime.PagedStepResult, error) {
-	if n == nil || !n.pagedEnabled || n.forwardActive || req == nil {
-		return nil, fmt.Errorf("paged worker requires an idle initialized runtime and request")
-	}
 	var point *kvruntime.PagedForwardPoint
 	for i := range n.profile.PagedForward {
 		p := &n.profile.PagedForward[i]
-		if p.Prefix == prefix && p.Query == query {
+		if p.Prefix == w.PrefixTokens && p.Query == w.NewTokens {
 			point = p
 			break
 		}
 	}
 	if point == nil {
-		return nil, fmt.Errorf("unmeasured paged pipeline prefix=%d query=%d", prefix, query)
+		return false, fmt.Errorf("unmeasured paged pipeline prefix=%d query=%d", w.PrefixTokens, w.NewTokens)
 	}
-	origins, err := n.requestOrigins(req, prefix+query)
+	n.advance(now)
+	origins, err := n.requestOrigins(w.Request, w.PrefixTokens+w.NewTokens)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	ids = append([]int64(nil), ids...)
-	hashes = append([]string(nil), hashes...)
+	ids := append([]int64(nil), s.RequestMap[w.Request.ID]...)
 	var slots []string
 	for _, id := range ids {
 		slots = append(slots, n.hbmID(id))
@@ -252,7 +218,7 @@ func (n *NativePeerRuntime) beginPagedBatch(req *sim.Request, prefix, query int6
 	for _, c := range n.profile.Compute {
 		if c.Length == 256 && c.Mode == "resident" {
 			index := 0
-			if query == 1 {
+			if w.NewTokens == 1 {
 				index = 1
 			}
 			weights = c.ForwardWeights[index]
@@ -260,40 +226,37 @@ func (n *NativePeerRuntime) beginPagedBatch(req *sim.Request, prefix, query int6
 		}
 	}
 	n.forwardSerial++
-	name := fmt.Sprintf("request/%s/step/%d", req.ID, n.forwardSerial)
-	spec := kvruntime.PagedStepSpec{Inputs: n.inputs, Request: req.ID, ID: name, Slots: slots, Prefix: prefix, Query: query, TokenOrigins: origins, Weights: weights, Point: *point, WorkspacePool: "hbm_workspace"}
+	name := fmt.Sprintf("request/%s/step/%d", w.Request.ID, n.forwardSerial)
+	n.forwardActive = true
+	spec := kvruntime.PagedStepSpec{Inputs: n.inputs, Request: w.Request.ID, ID: name, Slots: slots, Prefix: w.PrefixTokens, Query: w.NewTokens, TokenOrigins: origins, Weights: weights, Point: *point, WorkspacePool: "hbm_workspace"}
 	if point.Output != nil {
 		if !n.outputEnabled {
-			return nil, fmt.Errorf("output-aware profile requires output_copies configuration")
+			return false, fmt.Errorf("output-aware profile requires output_copies configuration")
 		}
 		spec.HostOutputBuffer = "native/host_output"
 		spec.OutputCopyResource = "copy_d2h"
 		spec.OutputStreamGroup = "request_stream"
 		spec.OutputValue = point.Output.ReferenceToken
 		spec.OutputReferenceKind = "internal_profile_reference"
-		end := prefix + query
-		if end >= req.InputLen() {
-			index := end - req.InputLen()
-			if index >= int64(len(req.OutputTokens)) {
-				return nil, fmt.Errorf("output observation exceeds supplied reference")
+		end := w.PrefixTokens + w.NewTokens
+		if end >= w.Request.InputLen() {
+			index := end - w.Request.InputLen()
+			if index >= int64(len(w.Request.OutputTokens)) {
+				return false, fmt.Errorf("output observation exceeds supplied reference")
 			}
-			spec.OutputValue = uint64(uint32(req.OutputTokens[index]))
+			spec.OutputValue = uint64(uint32(w.Request.OutputTokens[index]))
 			spec.OutputReferenceKind = "request_reference"
 		}
 	}
 	spec.Done = func(result *kvruntime.PagedStepResult) {
 		// Register complete reusable input blocks against the independent causal
 		// token reference, never against a copy of the observed destination bytes.
-		end := prefix + query
+		end := w.PrefixTokens + w.NewTokens
 		for page, id := range ids {
-			if int64((page+1)*16) > min(end, req.InputLen()) {
+			if int64((page+1)*16) > min(end, w.Request.InputLen()) {
 				break
 			}
-			if page >= len(hashes) {
-				n.Runtime.Engine.Fail(fmt.Errorf("missing independent input block hash"))
-				return
-			}
-			hash := hashes[page]
+			hash := s.Blocks[id].Hash
 			if hash == "" {
 				n.Runtime.Engine.Fail(fmt.Errorf("full input block has no hash"))
 				return
@@ -321,19 +284,20 @@ func (n *NativePeerRuntime) beginPagedBatch(req *sim.Request, prefix, query int6
 				return
 			}
 		}
-		n.forwardActive = false
-		if done != nil {
-			done(result)
-		}
+		at := (result.CompleteNS + 999) / 1000
+		n.completed = append(n.completed, func() {
+			n.forwardActive = false
+			n.fabric.emit(PeerRecord{Time: at, Name: "native_forward_complete", Request: w.Request.ID, Value: at*1000 - result.CompleteNS, Duration: at - now, Counters: map[string]int64{"verified_cells": result.CellsVerified, "mapping_tasks": int64(result.MappingTasks), "workspace_peak_delta_bytes": result.AllocatedPeakDelta, "output_bytes": result.OutputBytes, "output_observed_ns": result.OutputObservedNS}})
+			done(at)
+		})
 	}
-	n.forwardActive = true
-	result, err := n.Runtime.PagedStep(spec)
+	_, err = n.Runtime.PagedStep(spec)
 	if err != nil {
-		n.Runtime.Engine.Fail(err)
+		return false, err
 	}
-	return result, err
+	n.arm(s.schedule)
+	return true, nil
 }
-
 func (n *NativePeerRuntime) checkPagedContents(hash, buffer string) error {
 	expected := n.pagedContents[hash]
 	b := n.Runtime.Memory.Buffers[buffer]
