@@ -185,6 +185,16 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 		}
 	}
 	promised := int64(0)
+	// STORE sources leave the free list until completion is adopted. Retrying
+	// after a partial completion must include that outstanding physical space,
+	// rather than selecting another full set of victims on every wakeup.
+	// A source adopted by a request, or needed as a protected hit, cannot pay
+	// this allocation's deficit. Multiple STORE pins still promise one block.
+	for id, pins := range s.storePins {
+		if pins > 0 && s.Blocks[id].RefCount == pins && !protect[id] {
+			promised++
+		}
+	}
 	s.spaceWait[req] = int64(len(empty)) < n
 	for int64(len(empty))+promised < n && len(candidates) > 0 {
 		d := s.policy.Choose(PeerReclaimContext{Candidates: candidates, Targets: s.targets()})
@@ -209,6 +219,9 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 		s.emit("hbm_drop", req, b.Hash, "hbm", "", "reclaim")
 		s.invalidate(b)
 		empty = append(empty, b)
+	}
+	if int64(len(empty)) < n && promised > 0 {
+		s.waiting[req] = true
 	}
 	// Move all prepared empties before cached free blocks. Do not move protected hits.
 	for i := len(empty) - 1; i >= 0; i-- {
