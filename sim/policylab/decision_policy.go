@@ -6,10 +6,8 @@ import (
 )
 
 type DecisionPolicyConfig struct {
-	QueueOrder      string                  `json:"queue_order,omitempty"`
-	PrefillTokenCap int64                   `json:"prefill_token_cap,omitempty"`
-	ExtraCost       *sim.LinearDecisionCost `json:"extra_cost,omitempty"`
-	TraceEvents     bool                    `json:"trace_events,omitempty"`
+	QueueOrder      string `json:"queue_order,omitempty"`
+	PrefillTokenCap int64  `json:"prefill_token_cap,omitempty"`
 }
 
 // decisionAdapter retains the existing queue observation at the same boundary
@@ -35,10 +33,3 @@ func (a *decisionAdapter) Decide(v sim.DecisionView) sim.DecisionPlan {
 	return p
 }
 func (a *decisionAdapter) Observe(f sim.DecisionFeedback) { a.policy.Observe(f) }
-
-type eventDecisionAdapter struct {
-	*decisionAdapter
-	listener sim.DecisionEventListener
-}
-
-func (a *eventDecisionAdapter) OnEvent(e sim.DecisionEvent) { a.listener.OnEvent(e) }

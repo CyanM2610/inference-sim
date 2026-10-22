@@ -68,8 +68,6 @@ type DecisionCapabilities struct {
 	Placement          bool `json:"placement"`
 	TransferPriority   bool `json:"transfer_priority"`
 	CostEstimates      bool `json:"cost_estimates"`
-	LifecycleEvents    bool `json:"lifecycle_events"`
-	TransferEvents     bool `json:"transfer_events"`
 }
 type DecisionView struct {
 	Version           uint64               `json:"version"`
@@ -109,7 +107,6 @@ type DecisionUnselected struct {
 }
 type DecisionFeedback struct {
 	Version    uint64               `json:"version"`
-	AtUS       int64                `json:"at_us"`
 	Status     string               `json:"status"`
 	Reason     string               `json:"reason,omitempty"`
 	Grants     []DecisionGrant      `json:"grants,omitempty"`
@@ -125,20 +122,15 @@ type DecisionRecord struct {
 	FeedbackWallNS int64            `json:"feedback_wall_ns"`
 	RuntimeWallNS  int64            `json:"runtime_wall_ns"`
 	CostCoverage   string           `json:"cost_coverage"`
-	Service        *DecisionService `json:"service,omitempty"`
 }
 type DecisionPolicy interface {
 	Decide(DecisionView) DecisionPlan
 	Observe(DecisionFeedback)
 }
 type decisionRuntime struct {
-	policy   DecisionPolicy
-	observe  func(DecisionRecord)
-	record   DecisionRecord
-	cost     DecisionCostModel
-	pending  *DecisionCompleteEvent
-	events   *decisionEvents
-	applying bool
+	policy  DecisionPolicy
+	observe func(DecisionRecord)
+	record  DecisionRecord
 }
 
 func (s *Simulator) SetDecisionPolicy(policy DecisionPolicy, observe func(DecisionRecord)) error {
@@ -149,13 +141,6 @@ func (s *Simulator) SetDecisionPolicy(policy DecisionPolicy, observe func(Decisi
 		return fmt.Errorf("decision token caps require VLLMBatchFormation")
 	}
 	s.decision = &decisionRuntime{policy: policy, observe: observe}
-	if listener, ok := policy.(DecisionEventListener); ok {
-		if err := s.enableDecisionEvents(); err != nil {
-			s.decision = nil
-			return err
-		}
-		s.decision.events.listener = listener
-	}
 	return nil
 }
 
@@ -164,10 +149,6 @@ func (s *Simulator) decisionView(now int64) DecisionView {
 		BlockTokens: s.KVCache.BlockSize(), HBMCapacityBlocks: s.KVCache.TotalCapacity(), HBMFreeBlocks: s.KVCache.TotalCapacity() - s.KVCache.UsedBlocks(),
 		Capabilities: DecisionCapabilities{QueueOrder: true, TokenCaps: true}}
 	_, v.Capabilities.ReadyRestoresFirst = s.KVCache.(DeferredAdmissionStore)
-	if s.decision != nil && s.decision.events != nil {
-		v.Capabilities.LifecycleEvents = true
-		_, v.Capabilities.TransferEvents = s.KVCache.(DecisionEventSource)
-	}
 	var queries []DecisionKVQuery
 	view := func(r *Request) DecisionRequest {
 		emitted := int64(0)
@@ -265,38 +246,6 @@ func (s *Simulator) prepareDecision(now int64) map[string]int64 {
 		s.deliverDecision(DecisionFeedback{Version: view.Version, Status: "rejected", Reason: err.Error()})
 		panic(err) // malformed policy is a run failure, never a silent fallback
 	}
-	if d.cost != nil {
-		cost, err := d.cost.Estimate(cloneDecisionView(view), cloneDecisionPlan(plan))
-		if err == nil {
-			err = cost.validate(now)
-		}
-		if err != nil {
-			d.record.RuntimeWallNS = time.Since(runtimeStart).Nanoseconds()
-			s.deliverDecision(DecisionFeedback{Version: view.Version, Status: "rejected", Reason: err.Error()})
-			panic(err)
-		}
-		d.record.Service = &DecisionService{StartUS: now, EndUS: now + cost.ExtraUS, ExtraUS: cost.ExtraUS, Provenance: cost.Provenance}
-		d.record.CostCoverage = ExplicitDecisionCostCoverage
-		if cost.ExtraUS > 0 {
-			ev := &DecisionCompleteEvent{At: now + cost.ExtraUS, waiting: append([]*Request(nil), s.WaitQ.Items()...)}
-			if s.RunningBatch != nil {
-				ev.running = append([]*Request(nil), s.RunningBatch.Requests...)
-			}
-			d.pending = ev
-			s.stepEvent = ev
-			s.Schedule(ev)
-			d.record.RuntimeWallNS = time.Since(runtimeStart).Nanoseconds()
-			return nil
-		}
-	}
-	d.record.RuntimeWallNS = time.Since(runtimeStart).Nanoseconds()
-	return s.applyDecisionPlan()
-}
-
-func (s *Simulator) applyDecisionPlan() map[string]int64 {
-	d := s.decision
-	start := time.Now()
-	plan := d.record.Plan
 	if plan.QueueOrder != nil {
 		rank := map[string]int{}
 		for i, id := range plan.QueueOrder {
@@ -310,7 +259,7 @@ func (s *Simulator) applyDecisionPlan() map[string]int64 {
 	for _, cap := range plan.TokenCaps {
 		caps[cap.Request] = cap.Tokens
 	}
-	d.record.RuntimeWallNS += time.Since(start).Nanoseconds()
+	d.record.RuntimeWallNS = time.Since(runtimeStart).Nanoseconds()
 	return caps
 }
 func (s *Simulator) finishDecision(result BatchResult) {
@@ -330,7 +279,7 @@ func (s *Simulator) finishDecision(result BatchResult) {
 	for _, r := range result.Preempted {
 		preempted[r.Request.ID] = true
 	}
-	for _, r := range s.decisionView(s.decisionAppliedAt()).KV.Requests {
+	for _, r := range s.decisionView(d.record.View.NowUS).KV.Requests {
 		pending[r.ID] = r.TransferPending || r.Deferred
 	}
 	for _, r := range append(append([]DecisionRequest(nil), d.record.View.Running...), d.record.View.Waiting...) {
@@ -351,7 +300,6 @@ func (s *Simulator) finishDecision(result BatchResult) {
 }
 func (s *Simulator) deliverDecision(f DecisionFeedback) {
 	d := s.decision
-	f.AtUS = s.decisionAppliedAt()
 	d.record.Feedback = f
 	start := time.Now()
 	d.policy.Observe(cloneDecisionFeedback(f))
@@ -360,11 +308,4 @@ func (s *Simulator) deliverDecision(f DecisionFeedback) {
 	if d.observe != nil {
 		d.observe(d.record)
 	}
-}
-
-func (s *Simulator) decisionAppliedAt() int64 {
-	if service := s.decision.record.Service; service != nil {
-		return service.EndUS
-	}
-	return s.decision.record.View.NowUS
 }

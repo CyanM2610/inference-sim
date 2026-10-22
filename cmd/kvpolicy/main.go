@@ -75,22 +75,6 @@ func run() error {
 			return err
 		}
 	}
-	if r.DecisionEventCostCoverage != "" {
-		f, err := os.Create(filepath.Join(*output, "policy-events.jsonl"))
-		if err != nil {
-			return err
-		}
-		enc := json.NewEncoder(f)
-		for _, event := range r.PolicyEvents {
-			if err := enc.Encode(event); err != nil {
-				f.Close()
-				return err
-			}
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-	}
 	if c.Native != nil {
 		file, err := os.Create(filepath.Join(*output, "native.events.jsonl.gz"))
 		if err != nil {

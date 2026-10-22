@@ -81,11 +81,9 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
-	PolicyDecisions           []sim.DecisionRecord      `json:"-"`
-	DecisionCostCoverage      string                    `json:"decision_cost_coverage,omitempty"`
-	PolicyEvents              []sim.DecisionEventRecord `json:"-"`
-	DecisionEventCostCoverage string                    `json:"decision_event_cost_coverage,omitempty"`
-	BatchShapes               []BatchCostObservation    `json:"batch_shapes,omitempty"`
+	PolicyDecisions      []sim.DecisionRecord   `json:"-"`
+	DecisionCostCoverage string                 `json:"decision_cost_coverage,omitempty"`
+	BatchShapes          []BatchCostObservation `json:"batch_shapes,omitempty"`
 	// Absolute first observation, captured once before any possible re-prefill
 	// overwrites legacy core TTFT fields. These are the ranking API timestamps.
 	FirstTokenUS      map[string]int64            `json:"first_token_us"`
@@ -108,11 +106,6 @@ type Result struct {
 
 func (c Config) Validate() error {
 	if c.DecisionPolicy != nil {
-		if c.DecisionPolicy.ExtraCost != nil {
-			if err := c.DecisionPolicy.ExtraCost.Validate(); err != nil {
-				return err
-			}
-		}
 		if c.DecisionPolicy.PrefillTokenCap > c.MaxBatchTokens {
 			return fmt.Errorf("decision prefill cap exceeds batch token limit")
 		}
@@ -439,34 +432,13 @@ func run(c Config, decisionFactory func(string) sim.DecisionPolicy) (*Result, er
 			if c.RequestScheduler != "" {
 				adapter.sink = sink
 			}
-			var installed sim.DecisionPolicy = adapter
-			listener, subscribed := selected.(sim.DecisionEventListener)
-			if subscribed {
-				installed = &eventDecisionAdapter{decisionAdapter: adapter, listener: listener}
-			}
-			if e := inst.SetDecisionPolicy(installed, func(r sim.DecisionRecord) {
+			if e := inst.SetDecisionPolicy(adapter, func(r sim.DecisionRecord) {
 				r.Instance = string(id)
 				out.PolicyDecisions = append(out.PolicyDecisions, r)
 			}); e != nil {
 				panic(e)
 			}
 			out.DecisionCostCoverage = "host_measured_sim_time_uncalibrated"
-			if subscribed || c.DecisionPolicy.TraceEvents {
-				if e := inst.SetDecisionEventObserver(func(r sim.DecisionEventRecord) {
-					r.Instance = string(id)
-					out.PolicyEvents = append(out.PolicyEvents, r)
-				}); e != nil {
-					panic(e)
-				}
-				out.DecisionEventCostCoverage = sim.DecisionEventCostCoverage
-			}
-			if c.DecisionPolicy.ExtraCost != nil {
-				model := *c.DecisionPolicy.ExtraCost
-				if e := inst.SetDecisionCostModel(model); e != nil {
-					panic(e)
-				}
-				out.DecisionCostCoverage = sim.ExplicitDecisionCostCoverage
-			}
 		} else if c.RequestScheduler != "" {
 			deadlines := make(map[string]int64)
 			for _, r := range c.Requests {

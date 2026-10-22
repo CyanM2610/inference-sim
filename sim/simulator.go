@@ -627,7 +627,6 @@ func (sim *Simulator) EnqueueRequest(r *Request) {
 	if r.Deadline > 0 && r.Deadline <= sim.Clock {
 		r.State = StateTimedOut
 		sim.Metrics.TimedOutRequests++
-		sim.notifyDecisionEvent(DecisionEvent{Kind: "request_timed_out", OccurredUS: sim.Clock, Request: r.ID, Reason: "past_due_at_enqueue"})
 		if sim.OnRequestDone != nil {
 			for _, next := range sim.OnRequestDone(r, sim.Clock) {
 				sim.InjectArrival(next)
@@ -647,7 +646,6 @@ func (sim *Simulator) EnqueueRequest(r *Request) {
 	r.Priority = float64(sim.sloMap.InvertForVLLM(r.SLOClass))
 
 	sim.WaitQ.Enqueue(r)
-	sim.notifyDecisionEvent(DecisionEvent{Kind: "request_arrived", OccurredUS: sim.Clock, Request: r.ID})
 
 	// Schedule timeout event (after all guards + enqueue — BC-5)
 	// Skip scheduling when deadline > horizon (perf: avoids orphaned events)
@@ -675,7 +673,6 @@ func (sim *Simulator) EnqueueDecodeSubRequest(r *Request, clusterTime int64) {
 	r.Priority = float64(sim.sloMap.InvertForVLLM(r.SLOClass))
 
 	sim.WaitQ.Enqueue(r)
-	sim.notifyDecisionEvent(DecisionEvent{Kind: "request_arrived", OccurredUS: max(sim.Clock, clusterTime), Request: r.ID})
 	// Do NOT add len(r.InputTokens) to TotalInputTokens — already counted by prefill sub-request.
 
 	// Schedule timeout for decode sub-request (R23: parity with EnqueueRequest)
@@ -833,9 +830,6 @@ func (sim *Simulator) recordRequestCompletion(req *Request) {
 // sim.stepEvent here prevents future QueuedEvent INV-8 guards from seeing a stale
 // non-nil pointer and skipping their step-scheduling.
 func (sim *Simulator) Step(now int64) {
-	if sim.decision != nil && sim.decision.pending != nil {
-		return // The decision service owns the next formation, not a wakeup.
-	}
 	if sim.RunningBatch == nil && sim.WaitQ.Len() == 0 {
 		if sim.batchCompletionEvents && pendingEngineWork(sim.KVCache) && sim.beginAsyncBatch(now) {
 			return
@@ -844,13 +838,7 @@ func (sim *Simulator) Step(now int64) {
 		return
 	}
 	preemptionsBefore := sim.Metrics.PreemptionCount
-	if !sim.scheduleBatch(now) {
-		return
-	}
-	sim.executeScheduledBatch(now, preemptionsBefore)
-}
-
-func (sim *Simulator) executeScheduledBatch(now int64, preemptionsBefore int64) {
+	sim.scheduleBatch(now)
 	if sim.batchCompletionEvents {
 		if len(sim.RunningBatch.Requests) == 0 {
 			if pendingEngineWork(sim.KVCache) && sim.beginAsyncBatch(now) {
@@ -894,7 +882,7 @@ func (sim *Simulator) executeScheduledBatch(now int64, preemptionsBefore int64) 
 
 // scheduleBatch handles Phase 1: priority assignment, queue reordering, batch formation,
 // and event scheduling for preemptions and newly scheduled requests.
-func (sim *Simulator) scheduleBatch(now int64) bool {
+func (sim *Simulator) scheduleBatch(now int64) {
 	sim.stepCount += 1
 
 	// Synchronize KV cache clock for thrashing detection (no-op for single-tier KVCacheState)
@@ -907,16 +895,6 @@ func (sim *Simulator) scheduleBatch(now int64) bool {
 		sim.scheduler.OrderQueue(reqs, now)
 	})
 	tokenCaps := sim.prepareDecision(now)
-	if sim.decision != nil && sim.decision.pending != nil {
-		return false
-	}
-	sim.formScheduledBatch(now, tokenCaps, nil)
-	return true
-}
-
-// late requests arrived while the decision service was busy. They are excluded
-// from this formation only, then restored before observations or execution.
-func (sim *Simulator) formScheduledBatch(now int64, tokenCaps map[string]int64, late []*Request) {
 
 	// Cold-load pre-admission gate (LoRA, #1466): if the wait-queue head is a cold
 	// adapter request and no load is in flight, start a serialized per-instance
@@ -953,9 +931,6 @@ func (sim *Simulator) formScheduledBatch(now int64, tokenCaps map[string]int64, 
 
 	// Apply result: update running batch
 	sim.RunningBatch = batchResult.RunningBatch
-	for _, req := range late {
-		sim.WaitQ.Enqueue(req)
-	}
 	sim.finishDecision(batchResult)
 
 	// Record preemption metrics and emit debug log for each preempted request
@@ -1259,7 +1234,6 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 
 			// Record completion metrics
 			sim.recordRequestCompletion(req)
-			sim.notifyDecisionEvent(DecisionEvent{Kind: "request_completed", OccurredUS: now + currStepAdvance, Request: req.ID})
 
 			// Invoke completion callback for session management
 			if sim.OnRequestDone != nil {
@@ -1301,7 +1275,6 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 				Request: req,
 			})
 			sim.recordRequestCompletion(req)
-			sim.notifyDecisionEvent(DecisionEvent{Kind: "request_completed", OccurredUS: now + currStepAdvance, Request: req.ID, Reason: "length_capped"})
 
 			// Invoke completion callback for session management (length-capped)
 			if sim.OnRequestDone != nil {
