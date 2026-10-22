@@ -28,7 +28,7 @@ func (s *PeerCache) storeSourceReuseEnabled() bool {
 // waits for worker poll/adoption. It cannot be enabled after execution starts.
 func (s *PeerCache) EnableStoreSourceReuse() error {
 	p := s.fabric.phases
-	if p == nil || p.active || p.started || s.fabric.Pending() != 0 || s.fabric.groupDepth != 0 {
+	if p == nil || p.active || p.started || s.fabric.Pending() != 0 || s.fabric.groupDepth != 0 || s.fabric.hostChunks != nil {
 		return fmt.Errorf("store source reuse requires unused engine phases")
 	}
 	p.reuseSources = true

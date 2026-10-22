@@ -38,6 +38,7 @@ func TestFuturePlacementRequiresExplicitIsolation(t *testing.T) {
 		func(c *Config) { c.HotPrefix.HBMScore = "paper" },
 		func(c *Config) { c.HotPrefix = nil; c.Policy.Name = "lru_drop" },
 		func(c *Config) { c.Requests[1].AfterRequest = c.Requests[0].ID; c.Requests[1].At = 0 },
+		func(c *Config) { c.Requests[1].AfterRequests = []string{c.Requests[0].ID}; c.Requests[1].At = 0 },
 		func(c *Config) { c.HotPrefix.AdmissionThreshold = 2 },
 	} {
 		c := futureLabConfig("oracle_next_arrival")

@@ -182,6 +182,10 @@ func (kvc *KVCacheState) SnapshotCachedBlocksFn() func([]sim.TokenID) int {
 // start and endIndex are by original requests' index
 // endIndex is non-inclusive
 func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, endIndex int64, cachedBlocks []int64) bool {
+	return kvc.allocateKVBlocks(req, startIndex, endIndex, cachedBlocks, false)
+}
+
+func (kvc *KVCacheState) allocateKVBlocks(req *sim.Request, startIndex int64, endIndex int64, cachedBlocks []int64, placeholder bool) bool {
 	kvc.allocationFailure = sim.AllocationFailure{}
 	reqID := req.ID
 	logrus.Debugf("AllocateBlock for ReqID: %s, Num Inputs: %d, startIndex = %d, endIndex = %d", req.ID, req.InputLen(), startIndex, endIndex)
@@ -229,7 +233,11 @@ func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, en
 		}
 	} else {
 		// request is in decode
-		newTokens = append(newTokens, req.OutputTokens[startIndex-req.InputLen()])
+		if placeholder {
+			newTokens = append(newTokens, 0) // reserved capacity, no future token identity
+		} else {
+			newTokens = append(newTokens, req.OutputTokens[startIndex-req.InputLen()])
+		}
 
 		// Decode pre-check: if the last block is full and no free blocks exist,
 		// fail fast without any state mutation. Mirrors vLLM's universal pre-check

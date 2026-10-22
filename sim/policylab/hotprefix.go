@@ -20,7 +20,7 @@ func (c Config) validateHotPrefix() error {
 	}
 	if c.HotPrefix.HBMScore == "oracle_next_arrival" {
 		for _, r := range c.Requests {
-			if r.AfterRequest != "" {
+			if r.hasArrivalDependencies() {
 				return fmt.Errorf("next-arrival oracle requires open-loop arrivals")
 			}
 		}

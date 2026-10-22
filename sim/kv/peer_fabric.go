@@ -26,23 +26,26 @@ type PeerAccess struct {
 	WritePath []string `json:"write_path"`
 }
 type PeerRecord struct {
-	AdmissionCost *HotPrefixAdmissionEstimate `json:"admission_cost,omitempty"`
-	Time          int64                       `json:"time_us"`
-	Name          string                      `json:"name"`
-	Instance      string                      `json:"instance,omitempty"`
-	Request       string                      `json:"request,omitempty"`
-	Requests      []string                    `json:"requests,omitempty"`
-	Transaction   int64                       `json:"transaction,omitempty"`
-	Source        string                      `json:"source,omitempty"`
-	Destination   string                      `json:"destination,omitempty"`
-	Hash          string                      `json:"hash,omitempty"`
-	Hashes        []string                    `json:"hashes,omitempty"`
-	HBMBlocks     []int64                     `json:"hbm_blocks,omitempty"`
-	Bytes         int64                       `json:"bytes,omitempty"`
-	Duration      int64                       `json:"duration_us,omitempty"`
-	Reason        string                      `json:"reason,omitempty"`
-	Value         int64                       `json:"value,omitempty"`
-	Counters      map[string]int64            `json:"counters,omitempty"`
+	AdmissionCost   *HotPrefixAdmissionEstimate `json:"admission_cost,omitempty"`
+	Time            int64                       `json:"time_us"`
+	Name            string                      `json:"name"`
+	Instance        string                      `json:"instance,omitempty"`
+	Request         string                      `json:"request,omitempty"`
+	Requests        []string                    `json:"requests,omitempty"`
+	Transaction     int64                       `json:"transaction,omitempty"`
+	Source          string                      `json:"source,omitempty"`
+	Destination     string                      `json:"destination,omitempty"`
+	Hash            string                      `json:"hash,omitempty"`
+	Hashes          []string                    `json:"hashes,omitempty"`
+	HBMBlocks       []int64                     `json:"hbm_blocks,omitempty"`
+	Bytes           int64                       `json:"bytes,omitempty"`
+	EffectiveBytes  int64                       `json:"effective_bytes,omitempty"`
+	HostObjects     []string                    `json:"host_objects,omitempty"`
+	HostChunkBlocks int64                       `json:"host_chunk_blocks,omitempty"`
+	Duration        int64                       `json:"duration_us,omitempty"`
+	Reason          string                      `json:"reason,omitempty"`
+	Value           int64                       `json:"value,omitempty"`
+	Counters        map[string]int64            `json:"counters,omitempty"`
 }
 type PeerSink func(PeerRecord)
 type peerBlocker struct {
@@ -50,6 +53,7 @@ type peerBlocker struct {
 	active  func() bool
 }
 type peerEntry struct {
+	object       *hostObject
 	nativeBuffer string
 	hash         string
 	tokens       []sim.TokenID
@@ -66,6 +70,7 @@ type peerPool struct {
 	trackAccess bool
 }
 type peerJob struct {
+	hostObject        *hostObject
 	overwrites        []sourceOverwrite
 	notBefore         int64
 	units             int64
@@ -81,6 +86,7 @@ type peerJob struct {
 	cancel            func(int64)
 }
 type PeerFabric struct {
+	hostChunks    *hostChunkState
 	phases        *PeerEnginePhases
 	groupDepth    int
 	groupBuffer   []*peerJob
@@ -324,6 +330,9 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 }
 
 func (f *PeerFabric) reserveForPlacement(pool, hash string, tokens []sim.TokenID, now int64, request string, costs *PlacementCostSnapshot) (*peerEntry, bool) {
+	if f.hostChunks != nil {
+		panic("host chunks require atomic object reservation, not block admission")
+	}
 	p := f.pools[pool]
 	if e := p.entries[hash]; e != nil {
 		return e, false
@@ -397,6 +406,15 @@ func (f *PeerFabric) Snapshot() map[string]map[string]int64 {
 			m["read_pins"] += int64(e.readers)
 		}
 		out[id] = m
+		if f.hostChunks != nil {
+			m["lookup_references"], m["transfer_reservations"] = 0, 0
+			for _, object := range f.hostChunks.objects {
+				if object.pool == id {
+					m["lookup_references"] += object.lookupReaders
+					m["transfer_reservations"] += object.transferRefs
+				}
+			}
+		}
 	}
 	return out
 }

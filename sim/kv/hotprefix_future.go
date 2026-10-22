@@ -10,10 +10,11 @@ import (
 // FuturePlacementRequest is privileged experiment input, never an online
 // scheduler view. Outputs and policy-dependent future completion times are absent.
 type FuturePlacementRequest struct {
-	ID           string
-	AtUS         int64
-	AfterRequest string
-	Input        []sim.TokenID
+	ID            string
+	AtUS          int64
+	AfterRequest  string
+	AfterRequests []string
+	Input         []sim.TokenID
 }
 
 type futurePlacementDemand struct {
@@ -45,7 +46,7 @@ func (s *PeerCache) ConfigureHotPrefixFutureDemand(requests []FuturePlacementReq
 		if r.ID == "" || r.AtUS < 0 || f.byRequest[r.ID] != nil {
 			return fmt.Errorf("invalid or duplicate future request")
 		}
-		if r.AfterRequest != "" && s.hotprefix.policy.config.HBMScore == "oracle_next_arrival" {
+		if (r.AfterRequest != "" || len(r.AfterRequests) > 0) && s.hotprefix.policy.config.HBMScore == "oracle_next_arrival" {
 			return fmt.Errorf("next-arrival oracle cannot use endogenous conversation arrivals")
 		}
 		f.byRequest[r.ID] = map[string]*futurePlacementDemand{}

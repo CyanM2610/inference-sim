@@ -65,11 +65,11 @@ func (s *PeerCache) PromoteRequestPrefix(q sim.DecisionKVQuery, endpoint int64) 
 			out.ReadyBlocks++
 			continue
 		}
-		if s.restoring[key] {
+		if s.restoring[s.restoreIdentity(q.ID, key)] {
 			out.PendingBlocks++
 			continue
 		}
-		entry, access := s.find(key)
+		entry, access := s.findForInput(q.ID, key, q.Input)
 		if entry == nil {
 			out.BlockedBlocks, out.Reason = endpoint-int64(i), "source_not_ready"
 			break
@@ -106,7 +106,7 @@ func (s *PeerCache) promoteRetainedPrefix(q sim.DecisionKVQuery, keys []string, 
 	out.ReadyBlocks = int64(len(local))
 	missing := out.MaxPrefixBlocks - out.ReadyBlocks
 	for _, key := range keys[len(local):] {
-		if s.restoring[key] {
+		if s.restoring[s.restoreIdentity(q.ID, key)] {
 			out.PendingBlocks++
 		}
 	}
@@ -128,7 +128,7 @@ func (s *PeerCache) promoteRetainedPrefix(q sim.DecisionKVQuery, keys []string, 
 	}
 	var pages []page
 	for _, key := range keys[len(local):] {
-		entry, access := s.find(key)
+		entry, access := s.findForInput(q.ID, key, q.Input)
 		if entry == nil {
 			out.Reason = "source_not_ready"
 			break

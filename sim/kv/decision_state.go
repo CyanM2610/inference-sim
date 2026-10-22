@@ -40,6 +40,10 @@ func (s *PeerCache) decisionState(queries []sim.DecisionKVQuery, sharing bool) s
 		recoverable := local
 		for _, key := range keys[local:] {
 			found := false
+			if s.fabric.hostChunks != nil {
+				entry, _ := s.findForRestore(q.ID, key, q.Input)
+				found = entry != nil
+			}
 			for _, a := range s.access {
 				if e := s.fabric.pools[a.Pool].entries[key]; e != nil && e.ready {
 					found = true
@@ -72,7 +76,7 @@ func (s *PeerCache) decisionState(queries []sim.DecisionKVQuery, sharing bool) s
 		if sharing {
 			row := &v.Requests[len(v.Requests)-1]
 			for _, key := range keys {
-				row.PrefixBlocks = append(row.PrefixBlocks, sim.DecisionPrefixBlock{ID: key, LoadPending: s.restoring[key]})
+				row.PrefixBlocks = append(row.PrefixBlocks, sim.DecisionPrefixBlock{ID: key, LoadPending: s.restoring[s.restoreIdentity(q.ID, key)]})
 			}
 		}
 	}

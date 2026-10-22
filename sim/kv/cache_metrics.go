@@ -109,7 +109,11 @@ func (s *PeerCache) observeCacheLookup(id string, input []sim.TokenID) {
 		if !s.restoreControl && (i+1)*s.BlockSizeTokens >= n {
 			break
 		}
-		if e, a := s.find(previous); e != nil {
+		e, a := s.findForInput(id, previous, input)
+		if s.fabric.hostChunks != nil {
+			e, a = s.findForRestore(id, previous, input)
+		}
+		if e != nil {
 			if a.Pool == "dram" {
 				r.DRAMHitTokens += tokens
 				r.dramHits[i] = tokens
@@ -117,6 +121,11 @@ func (s *PeerCache) observeCacheLookup(id string, input []sim.TokenID) {
 				r.OtherPoolHitTokens += tokens
 			}
 			continue
+		}
+		if s.fabric.hostChunks != nil {
+			if e, _ := s.hostEntryForInput(id, previous, input); e != nil && !e.ready {
+				r.LookupPendingStore = true
+			}
 		}
 		for _, a := range s.access {
 			if e := s.fabric.pools[a.Pool].entries[previous]; e != nil && !e.ready {

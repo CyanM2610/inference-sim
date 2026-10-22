@@ -80,6 +80,9 @@ func (m PeerMechanisms) Validate() error {
 // ConfigureMechanisms is normally called before constructing caches. Online
 // tracking must be enabled before NewPeerCache; the runner enforces this order.
 func (f *PeerFabric) ConfigureMechanisms(m PeerMechanisms) error {
+	if f.hostChunks != nil {
+		return fmt.Errorf("configure mechanisms before host chunk ownership")
+	}
 	if err := m.Validate(); err != nil {
 		return err
 	}

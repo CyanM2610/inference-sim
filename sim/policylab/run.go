@@ -28,6 +28,7 @@ type PolicyConfig struct {
 }
 type RequestConfig struct {
 	AfterRequest    string        `json:"after_request,omitempty"`
+	AfterRequests   []string      `json:"after_requests,omitempty"`
 	ThinkTimeUS     int64         `json:"think_time_us,omitempty"`
 	ID              string        `json:"id"`
 	At              int64         `json:"at_us"`
@@ -623,7 +624,7 @@ func runWithObservation(c Config, factories PolicyFactories, observation *runObs
 	closedLoop := false
 	for _, r := range c.Requests {
 		requestConfig[r.ID] = r
-		closedLoop = closedLoop || r.AfterRequest != ""
+		closedLoop = closedLoop || r.hasArrivalDependencies()
 		if r.TTFTSLOUS > 0 {
 			requestDeadlines[r.ID] = r.At + r.TTFTSLOUS
 		}
@@ -714,7 +715,7 @@ func runWithObservation(c Config, factories PolicyFactories, observation *runObs
 			if c.AllowFuturePlacement {
 				future := make([]kv.FuturePlacementRequest, 0, len(c.Requests))
 				for _, r := range c.Requests {
-					future = append(future, kv.FuturePlacementRequest{ID: r.ID, AtUS: r.At, AfterRequest: r.AfterRequest, Input: r.Input})
+					future = append(future, kv.FuturePlacementRequest{ID: r.ID, AtUS: r.At, AfterRequest: r.AfterRequest, AfterRequests: r.AfterRequests, Input: r.Input})
 				}
 				if err := stores[i].ConfigureHotPrefixFutureDemand(future); err != nil {
 					return nil, err
@@ -925,7 +926,7 @@ func runWithObservation(c Config, factories PolicyFactories, observation *runObs
 	if closedLoop {
 		initial = nil
 		for _, r := range requests {
-			if requestConfig[r.ID].AfterRequest == "" {
+			if !requestConfig[r.ID].hasArrivalDependencies() {
 				initial = append(initial, r)
 			}
 		}

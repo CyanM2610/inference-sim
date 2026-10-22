@@ -22,6 +22,7 @@ func (f *PeerFabric) endTransferGroup(now int64) {
 	}
 	buffer := f.groupBuffer
 	f.groupBuffer = nil
+	f.joinHostLoads(buffer)
 	for len(buffer) > 0 {
 		first := buffer[0]
 		members := []*peerJob{first}
@@ -38,6 +39,7 @@ func (f *PeerFabric) endTransferGroup(now int64) {
 		}
 		buffer = remaining
 		if len(members) == 1 {
+			f.accountHostTransfer(first, members)
 			f.submit(now, first)
 			continue
 		}
@@ -79,6 +81,7 @@ func (f *PeerFabric) endTransferGroup(now int64) {
 		for _, j := range members {
 			group.overwrites = append(group.overwrites, j.overwrites...)
 		}
+		f.accountHostTransfer(group, members)
 		f.submit(now, group)
 	}
 }

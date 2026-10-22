@@ -124,7 +124,7 @@ func NewPoolEvictionPolicy(name string) (PoolEvictionPolicy, error) {
 // SetPoolEvictionPolicy registers a programmatic policy before pool use.
 func (f *PeerFabric) SetPoolEvictionPolicy(id string, policy PoolEvictionPolicy) error {
 	p := f.pools[id]
-	if p == nil || policy == nil || len(p.entries) > 0 || f.Pending() != 0 {
+	if p == nil || policy == nil || len(p.entries) > 0 || f.Pending() != 0 || f.hostChunks != nil {
 		return fmt.Errorf("pool policy requires a known unused pool and nonnil policy")
 	}
 	p.policy, p.trackAccess = policy, true
@@ -185,6 +185,16 @@ func (p *peerPool) evictionCandidates() []PoolEvictionCandidate {
 // future requests or outputs. Full input blocks include the final logits block;
 // restore eligibility separately excludes its last token.
 func (s *PeerCache) touchRequestPools(req string, tokens []sim.TokenID) {
+	if s.fabric.hostChunks != nil {
+		previous := ""
+		for i := int64(0); i+s.BlockSizeTokens <= int64(len(tokens)); i += s.BlockSizeTokens {
+			previous = s.hashBlock(previous, tokens[i:i+s.BlockSizeTokens])
+			if e, _ := s.findForInput(req, previous, tokens); e != nil {
+				e.last = s.clock
+			}
+		}
+		return
+	}
 	var keys []string
 	for _, a := range s.access {
 		if !s.fabric.pools[a.Pool].trackAccess {

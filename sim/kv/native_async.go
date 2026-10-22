@@ -1,0 +1,238 @@
+package kv
+
+import (
+	"fmt"
+	"sort"
+
+	"github.com/inference-sim/inference-sim/sim"
+)
+
+func (s *PeerCache) EnableNativeAsyncKV() error {
+	if s.nativeAsync || s.fabric.hostChunks == nil || s.fabric.phases != nil || s.batchPrefixes != nil || len(s.RequestMap) != 0 || s.fabric.Pending() != 0 {
+		return fmt.Errorf("native async KV requires unused host chunks without the legacy batch executor")
+	}
+	s.nativeAsync = true
+	s.nativePending = map[string]int{}
+	s.nativeDeferred = map[string][]int64{}
+	s.nativeLoadPending = map[string]bool{}
+	s.nativeLoadTargets = map[string][]int64{}
+	s.nativeStored = map[string]nativeStorePosition{}
+	// Full external chunks may include the last prompt block. Recompute one
+	// token for logits while retaining that physical block, as native does.
+	s.restoreControl = true
+	s.restoreLimits = map[string]int64{}
+	s.restoredPrefixBlocks = map[string]int64{}
+	s.nativeRestoreAdmission = true
+	return nil
+}
+
+func (s *PeerCache) ReserveNativeRange(req *sim.Request, start, end int64, cached []int64) bool {
+	if !s.nativeAsync || s.nativeReserving || start < 0 || end <= start || start >= req.PrefillEnd() && end != start+1 {
+		panic("invalid native reservation")
+	}
+	shadow := *req
+	shadow.ProgressIndex = start
+	// Allocate capacity for decode without exposing offline output identities.
+	shadow.OutputTokens = req.OutputTokens[:req.EmittedTokens()]
+	s.nativeReserving = true
+	defer func() { s.nativeReserving = false }()
+	if !s.AllocateKVBlocks(&shadow, start, end, cached) {
+		return false
+	}
+	// Native APC registers finalized token hashes at allocate_slots(), before
+	// device completion. Later uses are ordered on the same worker stream; host
+	// STORE still waits for captured DeviceComplete. Unknown placeholders are
+	// not indexed. This differs from the legacy completion-only APC mode.
+	known := min(end, req.InputLen()+req.EmittedTokens())
+	if known < req.InputLen() {
+		known = min(end, req.InputLen())
+	}
+	s.nativeHashAndPublish(req, s.RequestMap[req.ID], known, true)
+	return true
+}
+
+type nativeCapturedWork struct {
+	work                 sim.NativeWork
+	ids                  []int64
+	storeStart, storeEnd int64
+}
+
+type nativeStorePosition struct {
+	generation uint64
+	tokens     int64
+}
+
+type nativeCapturedBatch struct {
+	store                *PeerCache
+	works                []nativeCapturedWork
+	deviceDone, consumed bool
+	receives             []string
+}
+
+func (s *PeerCache) CaptureNativeBatch(work []sim.NativeWork) sim.NativeBatchKV {
+	if !s.nativeAsync {
+		panic("native async KV is disabled")
+	}
+	b := &nativeCapturedBatch{store: s}
+	for _, w := range work {
+		n := (w.End + s.BlockSizeTokens - 1) / s.BlockSizeTokens
+		ids := s.RequestMap[w.Request.ID]
+		if n <= 0 || n > int64(len(ids)) {
+			panic("native work has no reserved target")
+		}
+		captured := append([]int64(nil), ids[:n]...)
+		for _, id := range captured {
+			s.pin(s.Blocks[id])
+			s.nativeBatchPins++
+		}
+		position, exists := s.nativeStored[w.Request.ID]
+		if !exists || position.generation != w.Generation {
+			position = nativeStorePosition{generation: w.Generation}
+			if w.Generation == 0 {
+				if lookup := s.fabric.hostChunks.lookups[w.Request.ID]; lookup != nil {
+					position.tokens = int64(len(lookup.prefix)) * s.fabric.hostChunks.blocks * s.BlockSizeTokens
+				}
+			}
+		}
+		chunkTokens := s.fabric.hostChunks.blocks * s.BlockSizeTokens
+		storeEnd := min(w.End, w.KnownTokens) / chunkTokens * chunkTokens
+		b.works = append(b.works, nativeCapturedWork{work: w, ids: captured, storeStart: position.tokens, storeEnd: storeEnd})
+		// Pinned connector advances num_stored_blocks when metadata is built,
+		// even if server admission later rejects STORE. No implicit retry is
+		// created merely because a later batch has the same completed prefix.
+		position.tokens = max(position.tokens, storeEnd)
+		s.nativeStored[w.Request.ID] = position
+		s.nativePending[w.Request.ID]++
+	}
+	return b
+}
+
+// Resolve only finalized input/observed output identities at schedule time,
+// or device-produced identities at completion. No caller publishes beyond end.
+func (s *PeerCache) nativeHashAndPublish(req *sim.Request, ids []int64, end int64, publish bool) {
+	previous := ""
+	for i, id := range ids {
+		if int64(i+1)*s.BlockSizeTokens > end {
+			break
+		}
+		b := s.Blocks[id]
+		for j := range b.Tokens {
+			index := int64(i)*s.BlockSizeTokens + int64(j)
+			if index < req.InputLen() {
+				b.Tokens[j] = req.InputTokens[index]
+			} else {
+				index -= req.InputLen()
+				if index >= int64(len(req.OutputTokens)) {
+					panic("native hash exceeded available token identity")
+				}
+				b.Tokens[j] = req.OutputTokens[index]
+			}
+		}
+		hash := s.hashBlock(previous, b.Tokens)
+		if b.Hash != hash {
+			if _, ready := s.ready[id]; ready {
+				panic("native finalized APC content changed")
+			}
+			if s.HashToBlock[b.Hash] == id {
+				delete(s.HashToBlock, b.Hash)
+			}
+			b.Hash = hash
+		}
+		previous = hash
+		if publish {
+			s.publishReadyCopy(b)
+		}
+	}
+}
+
+func (b *nativeCapturedBatch) DeviceComplete(now int64) {
+	if b.deviceDone || b.consumed {
+		panic("duplicate native device completion")
+	}
+	b.deviceDone = true
+	s := b.store
+	s.SetClock(now)
+	for _, captured := range b.works {
+		w := captured.work
+		// Device execution may run ahead of host EOS observation. Only real token
+		// identities can enter the reusable directory; extra work still pays cost.
+		end := min(w.End, w.Request.InputLen()+int64(len(w.Request.OutputTokens)))
+		s.nativeHashAndPublish(w.Request, captured.ids, end, false)
+		s.fabric.beginTransferGroup()
+		s.storeHostChunksFrom(w.Request, captured.ids, captured.storeStart, min(end, captured.storeEnd), false)
+		s.fabric.endTransferGroup(now)
+		if w.Request.State == sim.StateTimedOut || w.Request.State == sim.StateCompleted {
+			// A cancelled request can acquire STORE obligations after its host END.
+			// Keep all captured pages until those STORE replies drain.
+			s.holdCapturedHostStore(w.Request.ID, captured.ids)
+		}
+	}
+	for request, pending := range s.nativeLoadPending {
+		if pending && s.readPending[request] == 0 && len(s.nativeLoadTargets[request]) > 0 {
+			b.receives = append(b.receives, request)
+		}
+	}
+	sort.Strings(b.receives)
+}
+
+func (s *PeerCache) holdCapturedHostStore(request string, ids []int64) {
+	h := s.fabric.hostChunks
+	if h.pending[request] == 0 {
+		return
+	}
+	seen := map[int64]bool{}
+	for _, id := range h.requestHolds[request] {
+		seen[id] = true
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			s.pin(s.Blocks[id])
+			h.requestHolds[request] = append(h.requestHolds[request], id)
+			seen[id] = true
+		}
+	}
+}
+
+func (b *nativeCapturedBatch) Consumed(now int64) {
+	if !b.deviceDone || b.consumed {
+		panic("native batch consumed before device completion or twice")
+	}
+	b.consumed = true
+	s := b.store
+	s.SetClock(now)
+	for _, request := range b.receives {
+		if !s.nativeLoadPending[request] {
+			continue
+		}
+		for _, id := range s.nativeLoadTargets[request] {
+			block := s.Blocks[id]
+			s.publishReadyCopy(block)
+			s.emit("hbm_publish", request, block.Hash, "host", "hbm", "native_receive_adopted")
+		}
+		delete(s.nativeLoadTargets, request)
+		delete(s.nativeLoadPending, request)
+		s.emit("native_receive_adopted", request, "", "host", "hbm", "fifo_output_consumption")
+	}
+	for _, captured := range b.works {
+		w := captured.work
+		// Never expose a token identity which host output consumption has not
+		// finalized, including a cancelled batch's unobserved generated suffix.
+		end := min(w.End, w.Request.InputLen()+w.Request.EmittedTokens())
+		s.nativeHashAndPublish(w.Request, captured.ids, end, true)
+		for i := len(captured.ids) - 1; i >= 0; i-- {
+			s.unpin(s.Blocks[captured.ids[i]])
+			s.nativeBatchPins--
+		}
+		s.nativePending[w.Request.ID]--
+		if s.nativePending[w.Request.ID] == 0 {
+			delete(s.nativePending, w.Request.ID)
+			for i := len(s.nativeDeferred[w.Request.ID]) - 1; i >= 0; i-- {
+				s.unpin(s.Blocks[s.nativeDeferred[w.Request.ID][i]])
+			}
+			delete(s.nativeDeferred, w.Request.ID)
+			if w.Request.State == sim.StateCompleted || w.Request.State == sim.StateTimedOut {
+				delete(s.nativeStored, w.Request.ID)
+			}
+		}
+	}
+}
