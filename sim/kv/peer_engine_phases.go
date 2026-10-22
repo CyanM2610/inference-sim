@@ -2,6 +2,7 @@ package kv
 
 import (
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/inference-sim/inference-sim/sim"
@@ -25,25 +26,65 @@ type EnginePhaseModel interface {
 	HostSubmitUS(direction string, blocks int64) int64
 }
 
+// EngineLoadPlanningModel optionally accounts for creating new load metadata
+// above the base engine phase. Jobs already submitted or merely polled do not
+// repeat this work. Copy submission and device service remain separate.
+type EngineLoadPlanningModel interface {
+	PredictLoadPlanning(loads, blocks int64) (int64, error)
+}
+
 type phaseJob struct {
 	job          *peerJob
 	physicalDone bool
+	submitted    bool
+	predecessor  *phaseJob
 }
 
 // PeerEnginePhases owns engine control ordering, never request policy or token
 // advancement. Source/target leases and publication remain PeerCache callbacks.
 type PeerEnginePhases struct {
-	store        *PeerCache
-	model        EnginePhaseModel
-	observe      func(start, end int64, work []sim.BatchWork)
-	staged       []*peerJob
-	jobs         map[int64]*phaseJob
-	active       bool
-	lastGPUReady int64
-	flush        map[int64]bool
-	afterFlush   func(int64)
-	reuseSources bool
-	reuseFences  map[int64]bool
+	submissionTails   map[string]*phaseJob
+	started           bool
+	submissionPolicy  TransferSubmissionPolicy
+	submissionCost    *TransferSubmissionCost
+	observeSubmission func(TransferSubmissionRecord)
+	workerResidents   map[string]*sim.Request
+	completionBarrier sim.HostCompletionBarrier
+	store             *PeerCache
+	model             EnginePhaseModel
+	observe           func(start, end int64, work []sim.BatchWork)
+	staged            []*peerJob
+	jobs              map[int64]*phaseJob
+	active            bool
+	lastGPUReady      int64
+	flush             map[int64]bool
+	afterFlush        func(int64)
+	reuseSources      bool
+	reuseFences       map[int64]bool
+	preemptionFences  map[int64]bool
+}
+
+// Pinned vLLM flushes every existing store owned by a preempted request,
+// including stores whose HBM source is merely shared, not overwritten.
+func (s *PeerCache) PreparePrefillPreemption(req *sim.Request) {
+	p := s.fabric.phases
+	if p == nil {
+		return
+	}
+	if p.preemptionFences == nil {
+		p.preemptionFences = map[int64]bool{}
+	}
+	ids := make([]int64, 0)
+	for id, state := range p.jobs {
+		if state.job.record.Request == req.ID && state.job.record.Destination != "hbm" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		p.preemptionFences[id] = true
+		p.emit(s.clock, "preemption_store_dependency", p.jobs[id].job)
+	}
 }
 
 // EnableStoreSourceReuse separates allocator ownership from an outstanding
@@ -98,10 +139,22 @@ func (s *PeerCache) ConfigureEnginePhases(model EnginePhaseModel, observe func(i
 		return fmt.Errorf("offload engine phases require grouped concurrent restores and a background store pool")
 	}
 	f.phases = &PeerEnginePhases{store: s, model: model, observe: observe, jobs: map[int64]*phaseJob{}}
+	if m, ok := model.(EngineWorkerMetadataModel); ok && m.WorkerMetadataEnabled() {
+		f.phases.workerResidents = map[string]*sim.Request{}
+	}
 	return nil
 }
 
 func (s *PeerCache) ExecutesEmptySteps() bool { return s.fabric.phases != nil }
+
+func (s *PeerCache) BindHostCompletionBarrier(barrier sim.HostCompletionBarrier) error {
+	p := s.fabric.phases
+	if p == nil || p.active || p.completionBarrier != nil || barrier == nil {
+		return fmt.Errorf("host completion barrier requires idle engine phases")
+	}
+	p.completionBarrier = barrier
+	return nil
+}
 func (s *PeerCache) HasPendingEngineWork() bool {
 	return s.fabric.phases != nil && len(s.fabric.phases.jobs) > 0
 }
@@ -128,6 +181,7 @@ func (p *PeerEnginePhases) emit(at int64, name string, j *peerJob) {
 	p.store.fabric.emit(r)
 }
 func (p *PeerEnginePhases) stage(now int64, j *peerJob) {
+	p.started = true
 	p.jobs[j.record.Transaction] = &phaseJob{job: j}
 	p.staged = append(p.staged, j)
 	p.emit(now, "transfer_staged", j)
@@ -147,22 +201,43 @@ func (p *PeerEnginePhases) submit(now, gpuReady int64, load bool) int64 {
 			remaining = append(remaining, j)
 		}
 	}
-	p.staged = remaining
+	direction := "d2h"
+	if load {
+		direction = "h2d"
+	}
+	selected, record, err := p.orderSubmissions(now, direction, selected)
+	if err != nil {
+		panic(err)
+	}
 	end := now
-	for _, j := range selected {
-		direction := "d2h"
-		if load {
-			direction = "h2d"
-		}
+	if record != nil {
+		end = record.ServiceEndUS
+	}
+	// Validate all service before consuming staged work; invalid callbacks or
+	// costs cannot leave a partially scheduled phase.
+	costs := make([]int64, len(selected))
+	for i, j := range selected {
 		cost := p.model.HostSubmitUS(direction, max(1, j.units))
-		if cost <= 0 {
-			panic("engine phase submission cost must be positive")
+		if cost <= 0 || end < 0 || cost > math.MaxInt64-end {
+			panic("engine phase submission cost must be positive and fit the clock")
 		}
+		costs[i], end = cost, end+cost
+	}
+	if record != nil {
+		record.SubmitEndUS = end
+	}
+	p.staged = remaining
+	end = now
+	if record != nil {
+		end = record.ServiceEndUS
+	}
+	for i, j := range selected {
 		start := end
-		end += cost
+		end += costs[i]
 		p.schedule(start, func(at int64) { p.emit(at, "transfer_submit_begin", j) })
 		p.schedule(end, func(at int64) {
 			p.emit(at, "transfer_submit_end", j)
+			p.linkSubmission(at, direction, j)
 			j.notBefore = max(at, gpuReady)
 			j.record.Time, j.record.Name = at, "transfer_queued"
 			p.store.fabric.emit(j.record)
@@ -173,6 +248,9 @@ func (p *PeerEnginePhases) submit(now, gpuReady int64, load bool) int64 {
 			p.store.fabric.dispatch(at)
 		})
 	}
+	if record != nil && p.observeSubmission != nil {
+		p.observeSubmission(*record)
+	}
 	return end
 }
 
@@ -182,6 +260,7 @@ func (p *PeerEnginePhases) physicalComplete(now int64, j *peerJob) {
 		panic("duplicate or unknown physical completion")
 	}
 	state.physicalDone = true
+	state.predecessor = nil
 	if p.flush[j.record.Transaction] {
 		delete(p.flush, j.record.Transaction)
 		if len(p.flush) == 0 && p.afterFlush != nil {
@@ -210,13 +289,38 @@ func (p *PeerEnginePhases) begin(now int64, work []sim.BatchWork, done func(int6
 	if len(work) == 0 && len(p.jobs) == 0 {
 		return false, nil
 	}
-	t := p.model.PredictEngineStep(work)
+	t, fresh, err := p.predictWorkerStep(work)
+	if err != nil {
+		return false, err
+	}
 	if t.PreForwardUS < 0 || t.PostForwardUS < t.PreForwardUS || t.GPUReadyUS < 0 || t.OutputReadyUS < 0 || t.PollUS <= 0 || t.TailUS <= 0 {
 		return false, fmt.Errorf("invalid engine phase timing")
 	}
-	p.active = true
+	var loads, blocks, planning int64
+	for _, j := range p.staged {
+		if j.record.Destination == "hbm" {
+			loads++
+			blocks += max(1, j.units)
+		}
+	}
+	if model, ok := p.model.(EngineLoadPlanningModel); ok && loads > 0 {
+		var err error
+		planning, err = model.PredictLoadPlanning(loads, blocks)
+		if err != nil || planning < 0 {
+			return false, fmt.Errorf("invalid engine load planning: cost=%d error=%v", planning, err)
+		}
+	}
+	base := now + planning
+	if base < now {
+		return false, fmt.Errorf("engine load planning clock overflow")
+	}
+	p.started, p.active = true, true
+	p.commitWorkerStep(now, work, fresh, t)
 	p.emit(now, "engine_step_begin", nil)
-	p.schedule(now+t.PreForwardUS, func(pre int64) {
+	if planning > 0 {
+		p.store.fabric.emit(PeerRecord{Time: now, Name: "engine_load_planning", Instance: p.store.id, Duration: planning, Counters: map[string]int64{"loads": loads, "blocks": blocks}})
+	}
+	p.schedule(base+t.PreForwardUS, func(pre int64) {
 		p.emit(pre, "engine_pre_forward", nil)
 		storeEnd := p.submit(pre, p.lastGPUReady, false)
 		p.schedule(storeEnd, func(at int64) {
@@ -226,14 +330,14 @@ func (p *PeerEnginePhases) begin(now int64, work []sim.BatchWork, done func(int6
 				}
 				// Explicit host store/flush delays shift subsequent CPU and GPU work.
 				delay := ready - pre
-				gpuBase := max(now, p.lastGPUReady)
+				gpuBase := max(base, p.lastGPUReady)
 				gpuReady := gpuBase + t.GPUReadyUS + delay
 				outputReady := gpuBase + t.OutputReadyUS + delay
 				if len(work) == 0 {
 					gpuReady, outputReady = p.lastGPUReady, now
 				}
 				p.lastGPUReady = max(p.lastGPUReady, gpuReady)
-				post := now + t.PostForwardUS + delay
+				post := base + t.PostForwardUS + delay
 				p.schedule(post, func(at int64) {
 					p.emit(at, "engine_post_forward", nil)
 					loadEnd := p.submit(at, gpuReady, true)
@@ -242,18 +346,26 @@ func (p *PeerEnginePhases) begin(now int64, work []sim.BatchWork, done func(int6
 						completed := p.completed() // only this poll's snapshot can be adopted
 						end := max(poll, outputReady) + t.TailUS
 						p.schedule(end, func(at int64) {
-							for _, j := range completed {
-								p.emit(at, "transfer_adopted", j)
-								j.done(at)
-								delete(p.jobs, j.record.Transaction)
+							publish := func(at int64) {
+								for _, j := range completed {
+									p.emit(at, "transfer_adopted", j)
+									j.done(at)
+									delete(p.jobs, j.record.Transaction)
+									p.store.fabric.notifyDecisionTransfer(at, j)
+								}
+								p.emit(at, "engine_adopt", nil)
+								p.store.fabric.wakeStores(at)
+								p.active = false
+								if p.observe != nil {
+									p.observe(now, at, work)
+								}
+								done(at)
 							}
-							p.emit(at, "engine_adopt", nil)
-							p.store.fabric.wakeStores(at)
-							p.active = false
-							if p.observe != nil {
-								p.observe(now, at, work)
+							if p.completionBarrier != nil {
+								p.completionBarrier(at, work, publish)
+							} else {
+								publish(at)
 							}
-							done(at)
 						})
 					})
 				})
@@ -264,10 +376,11 @@ func (p *PeerEnginePhases) begin(now int64, work []sim.BatchWork, done func(int6
 			for id, state := range p.jobs {
 				j := state.job
 				blocked := j.blockedRequests != nil && len(j.blockedRequests()) > 0
-				if !state.physicalDone && j.record.Destination != "hbm" && (blocked || p.reuseFences[id]) {
+				if !state.physicalDone && j.record.Destination != "hbm" && (blocked || p.reuseFences[id] || p.preemptionFences[id]) {
 					p.flush[id] = true
 				}
 			}
+			p.preemptionFences = nil
 			if p.reuseSources {
 				p.reuseFences = map[int64]bool{}
 			}

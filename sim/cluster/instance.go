@@ -54,6 +54,11 @@ type InstanceSimulator struct {
 func NewInstanceSimulator(id InstanceID, cfg sim.SimConfig) *InstanceSimulator {
 	// Create KV store (single-tier or tiered based on config)
 	kvStore := kv.NewKVStore(cfg.KVCacheConfig, cfg.Seed)
+	return NewInstanceSimulatorWithKVStore(id, cfg, kvStore)
+}
+
+// NewInstanceSimulatorWithKVStore accepts a caller-owned cache implementation.
+func NewInstanceSimulatorWithKVStore(id InstanceID, cfg sim.SimConfig, kvStore sim.KVStore) *InstanceSimulator {
 	// Build the LoRA adapter-cost accessor (nil when the subsystem is inert) and
 	// supply it to the latency model at construction so the per-step compute
 	// overhead applies to both backends (#1467, R23). BuildAdapterCost is pure and
@@ -70,9 +75,18 @@ func NewInstanceSimulator(id InstanceID, cfg sim.SimConfig) *InstanceSimulator {
 	if err != nil {
 		panic(fmt.Sprintf("NewInstanceSimulator(%s): NewLatencyModel: %v", id, err))
 	}
+	return NewInstanceSimulatorWithBackends(id, cfg, kvStore, latencyModel)
+}
+
+// NewInstanceSimulatorWithBackends composes caller-supplied cache and latency
+// implementations without changing process-global factory registration.
+func NewInstanceSimulatorWithBackends(id InstanceID, cfg sim.SimConfig, kvStore sim.KVStore, latencyModel sim.LatencyModel) *InstanceSimulator {
 	s, err := sim.NewSimulator(cfg, kvStore, latencyModel)
 	if err != nil {
 		panic(fmt.Sprintf("NewInstanceSimulator(%s): %v", id, err))
+	}
+	if store, ok := kvStore.(sim.EventDrivenKVStore); ok {
+		store.BindEvents(s.Schedule, s.ScheduleStepIfIdle)
 	}
 	return &InstanceSimulator{
 		id:         id,
@@ -80,6 +94,10 @@ func NewInstanceSimulator(id InstanceID, cfg sim.SimConfig) *InstanceSimulator {
 		gpu:        cfg.GPU,
 		maxNumSeqs: cfg.MaxNumSeqs,
 	}
+}
+
+func (i *InstanceSimulator) SetEventObserver(observer func(sim.Event, bool)) {
+	i.sim.EventObserver = observer
 }
 
 // GPU returns the GPU type this instance was constructed with.

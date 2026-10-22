@@ -10,6 +10,15 @@ import (
 // PeerCache wraps BLIS's physical HBM allocator. DRAM and CXL are peers in
 // access, not stages in a chain. Only completed full input blocks are reusable.
 type PeerCache struct {
+	prefixCopies         map[string][]int64
+	decodeTargets        map[string]int64
+	allocationFailure    sim.AllocationFailure
+	promotionRetention   string
+	promotionControl     bool
+	batchPrefixes        *batchPrefixState
+	restoreControl       bool
+	restoreLimits        map[string]int64
+	restoredPrefixBlocks map[string]int64
 	*KVCacheState
 	id                string
 	fabric            *PeerFabric
@@ -18,6 +27,7 @@ type PeerCache struct {
 	clock             int64
 	schedule          func(sim.Event)
 	wake              func(int64)
+	decisionEvents    func(sim.DecisionEvent)
 	ready             map[int64]string
 	lookup            map[string]int64
 	frequency         map[string]int64
@@ -73,7 +83,9 @@ func (s *PeerCache) BindEvents(schedule func(sim.Event), wake func(int64)) {
 	s.schedule = schedule
 	s.wake = wake
 }
-func (s *PeerCache) SetClock(t int64) { s.clock = t }
+
+func (s *PeerCache) BindDecisionEvents(notify func(sim.DecisionEvent)) { s.decisionEvents = notify }
+func (s *PeerCache) SetClock(t int64)                                  { s.clock = t }
 func (s *PeerCache) emit(name, req, h, src, dst, reason string) {
 	s.fabric.emit(PeerRecord{Time: s.clock, Name: name, Instance: s.id, Request: req, Hash: h, Source: src, Destination: dst, Reason: reason})
 	if s.fabric.mechanisms != (PeerMechanisms{}) {
@@ -150,13 +162,10 @@ func (s *PeerCache) invalidate(b *KVBlock) {
 		s.emit("promotion_unused", "", b.Hash, "hbm", "", "evicted_before_use")
 		delete(s.promoted, b.ID)
 	}
-	if id, ok := s.lookup[b.Hash]; ok && id == b.ID {
-		delete(s.lookup, b.Hash)
-	}
+	s.forgetReadyCopy(b)
 	if id, ok := s.HashToBlock[b.Hash]; ok && id == b.ID {
 		delete(s.HashToBlock, b.Hash)
 	}
-	delete(s.ready, b.ID)
 	b.Hash = ""
 	b.Tokens = nil
 }
@@ -209,20 +218,15 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 			candidates = append(candidates, PeerCandidate{ID: b.ID, Hash: b.Hash, Frequency: s.frequency[b.Hash], ReadyCopies: s.copies(b.Hash)})
 		}
 	}
-	promised := int64(0)
 	// STORE sources leave the free list until completion is adopted. Retrying
 	// after a partial completion must include that outstanding physical space,
 	// rather than selecting another full set of victims on every wakeup.
 	// A source adopted by a request, or needed as a protected hit, cannot pay
 	// this allocation's deficit. Multiple STORE pins still promise one block.
-	for id, pins := range s.storePins {
-		if pins > 0 && s.Blocks[id].RefCount == pins && !protect[id] {
-			promised++
-		}
-	}
+	promised := s.reclaimingBlocks(protect)
 	s.spaceWait[req] = int64(len(empty)) < n
 	for int64(len(empty))+promised < n && len(candidates) > 0 {
-		d := s.policy.Choose(PeerReclaimContext{Candidates: candidates, Targets: s.targets()})
+		d := s.policy.Choose(cloneReclaimContext(PeerReclaimContext{Candidates: candidates, Targets: s.targets()}))
 		idx := -1
 		for i, c := range candidates {
 			if c.ID == d.BlockID {
@@ -262,7 +266,11 @@ func (s *PeerCache) makeSpace(n int64, protect map[int64]bool, req string) bool 
 		s.FreeHead = b
 		s.FreeBlockCnt++
 	}
-	return int64(len(empty)) >= n
+	if int64(len(empty)) < n {
+		s.noteAllocationPressure(req, "hbm_space", n, int64(len(empty)), protect)
+		return false
+	}
+	return true
 }
 func (s *PeerCache) store(b *KVBlock, pool, req string) bool {
 	return s.storeCopy(b, pool, req, false)
@@ -292,6 +300,13 @@ func (s *PeerCache) storeCopy(b *KVBlock, pool, req string, retain bool) bool {
 	if e.ready {
 		return false
 	} // an existing copy permits immediate local drop
+	return s.storeReservedCopy(b, pool, req, retain, path, e, fresh)
+}
+
+// The caller owns an existing unready destination reservation. Request spill
+// uses this after reserving the full prefix; ordinary storeCopy reserves one.
+func (s *PeerCache) storeReservedCopy(b *KVBlock, pool, req string, retain bool, path []string, e *peerEntry, fresh bool) bool {
+	h := b.Hash
 	// Background copies in the phase backend protect contents through a
 	// pre-forward fence, independently of request allocator ownership. Reclaim
 	// copies retain their existing pin semantics for arbitrary placement policies.
@@ -348,6 +363,7 @@ func (s *PeerCache) storeCopy(b *KVBlock, pool, req string, retain bool) bool {
 	}, done: func(now int64) {
 		e.ready = true
 		e.last = now
+		s.fabric.poolPolicyEvent(pool, "ready", req, []string{h}, now)
 		s.clock = now
 		s.emit("l2_publish", req, h, "hbm", pool, "store_complete")
 		for _, done := range e.waiters {
@@ -379,6 +395,10 @@ func (s *PeerCache) find(h string) (*peerEntry, *PeerAccess) {
 	return entry, best
 }
 func (s *PeerCache) fetch(h, req string, e *peerEntry, a *PeerAccess, protect map[int64]bool, background bool) bool {
+	return s.fetchWithRetention(h, req, e, a, protect, background, false)
+}
+
+func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAccess, protect map[int64]bool, background, retainRequest bool) bool {
 	if s.restoring[h] {
 		s.waiting[req] = true
 		return true
@@ -428,10 +448,13 @@ func (s *PeerCache) fetch(h, req string, e *peerEntry, a *PeerAccess, protect ma
 		}
 	}
 	var cancel func(int64)
-	if background {
+	// Phase submissions are not cancellable and may be grouped just like
+	// demand loads. Legacy queued promotion cancellation remains unchanged.
+	if background && s.fabric.phases == nil {
 		cancel = func(now int64) {
 			s.clock = now
 			e.readers--
+			s.fabric.poolPolicyEvent(a.Pool, "ready", req, []string{h}, now)
 			delete(s.restoring, h)
 			s.readPending[req]--
 			if s.readPending[req] == 0 {
@@ -451,16 +474,16 @@ func (s *PeerCache) fetch(h, req string, e *peerEntry, a *PeerAccess, protect ma
 		b.Hash = h
 		b.Tokens = append([]sim.TokenID(nil), e.tokens...)
 		s.HashToBlock[h] = b.ID
-		s.ready[b.ID] = h
-		s.lookup[h] = b.ID
+		s.publishReadyCopy(b)
 		e.readers--
 		e.last = now
+		s.fabric.poolPolicyEvent(a.Pool, "ready", req, []string{h}, now)
 		delete(s.restoring, h)
 		s.readPending[req]--
 		if s.readPending[req] == 0 {
 			delete(s.readPending, req)
 		}
-		if background || s.cancelledRestores[req] {
+		if (background && !retainRequest) || s.cancelledRestores[req] {
 			if s.fabric.mechanisms.Online != nil {
 				s.promoted[b.ID] = true
 			}
@@ -476,6 +499,22 @@ func (s *PeerCache) fetch(h, req string, e *peerEntry, a *PeerAccess, protect ma
 	return true
 }
 func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached []int64) bool {
+	s.noteAllocationWait(req.ID, "dependency")
+	known, restoreCandidates, pendingLookup := s.observeRestoreLookup(req, cached)
+	if known {
+		defer func() {
+			if s.allocationFailure.Kind != "" {
+				s.allocationFailure.RestoreLookupKnown = true
+				s.allocationFailure.RestoreCandidateBlocks = restoreCandidates
+			}
+		}()
+	}
+	if pendingLookup {
+		return false
+	}
+	if !s.reserveDecodeCapacity(req, end, cached) {
+		return false
+	}
 	if s.fabric.mechanisms.GroupTransfers {
 		s.fabric.beginTransferGroup()
 		defer func() { s.fabric.endTransferGroup(s.clock) }()
@@ -492,9 +531,13 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 		// pages before new admissions compete for the remaining capacity.
 		if !s.fabric.mechanisms.ConcurrentRestores && s.restoreOwner != "" && s.restoreOwner != req.ID && s.readPending[s.restoreOwner] == 0 {
 			s.waiting[req.ID] = true
+			s.noteAllocationWait(req.ID, "ready_restore_owner")
 			return false
 		}
 		hashes := s.hashes(req.FullInputTokens())
+		if s.readPending[req.ID] == 0 && len(s.holds[req.ID]) == 0 {
+			s.touchRequestPools(req.ID, req.FullInputTokens())
+		}
 		if !s.observed[req.ID] {
 			for _, h := range hashes {
 				s.frequency[h]++
@@ -504,7 +547,27 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 			s.emit("cache_lookup", req.ID, "", "", "", "request")
 		}
 		if s.fabric.mechanisms.ConcurrentRestores {
-			if !s.fullPrefillFits(req, cached) || s.concurrentRestore(req, cached, hashes) {
+			if s.restoreControl {
+				// A loading cap must not truncate request heat/frequency accounting.
+				hashes = s.restoreHashes(req)
+			}
+			if !s.fullPrefillFits(req, cached) {
+				// An in-flight target is already charged to HBM but is not yet
+				// a usable cached hit. Wait for adoption before inferring that
+				// another running request must be sacrificed for this admission.
+				if s.readPending[req.ID] > 0 {
+					s.noteAllocationWait(req.ID, "restore_in_flight")
+				} else {
+					for _, h := range hashes {
+						if s.restoring[h] {
+							s.noteAllocationWait(req.ID, "shared_restore_in_flight")
+							break
+						}
+					}
+				}
+				return false
+			}
+			if s.concurrentRestore(req, cached, hashes) {
 				return false
 			}
 		} else if len(cached) < len(hashes) {
@@ -546,7 +609,9 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 		}
 	}
 	newTokens := end - start
-	if req.ProgressIndex >= req.InputLen() {
+	replayLast := s.restoreControl && len(s.RequestMap[req.ID]) == 0 && start == req.PrefillEnd()-1 && end == req.PrefillEnd() &&
+		int64(len(cached))*s.BlockSizeTokens == req.PrefillEnd() && s.restoredPrefixBlocks[req.ID] >= int64(len(cached))
+	if req.ProgressIndex >= req.PrefillEnd() {
 		newTokens = 1
 	}
 	if ids := s.RequestMap[req.ID]; len(ids) > 0 {
@@ -554,6 +619,9 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 		newTokens -= min(spare, newTokens)
 	}
 	n := (newTokens + s.BlockSizeTokens - 1) / s.BlockSizeTokens
+	if replayLast {
+		n = 0 // logits replay writes into the already-loaded final block
+	}
 	if !s.makeSpace(n, protect, req.ID) {
 		s.emit("allocation_wait", req.ID, "", "", "", "hbm_space")
 		return false
@@ -568,8 +636,21 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 			previous[id] = true
 		}
 	}
-	ok := s.KVCacheState.AllocateKVBlocks(req, start, end, cached)
+	var ok bool
+	if replayLast {
+		s.commitCachedBlocks(req.ID, cached)
+		ok = true
+	} else {
+		ok = s.KVCacheState.AllocateKVBlocks(req, start, end, cached)
+	}
+	if !ok {
+		failure := s.KVCacheState.LastAllocationFailure()
+		if failure.Kind == "capacity" {
+			s.noteAllocationPressure(req.ID, failure.Reason, failure.NeededBlocks, failure.FreeBlocks, protect)
+		}
+	}
 	if ok {
+		s.allocationFailure = sim.AllocationFailure{}
 		if previous != nil {
 			var allocated []int64
 			for _, id := range s.RequestMap[req.ID] {
@@ -580,8 +661,8 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 			s.fabric.phases.allocated(s.clock, req.ID, allocated)
 		}
 		if s.fabric.mechanisms.ConcurrentRestores {
-			if end < req.InputLen() {
-				s.prefillTargets[req.ID] = (req.InputLen() + s.BlockSizeTokens - 1) / s.BlockSizeTokens
+			if end < req.PrefillEnd() {
+				s.prefillTargets[req.ID] = (req.PrefillEnd() + s.BlockSizeTokens - 1) / s.BlockSizeTokens
 			} else {
 				delete(s.prefillTargets, req.ID)
 			}
@@ -614,13 +695,14 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	// Compatibility method name in KVStore; peer mode publishes computed HBM
 	// blocks here. An explicitly configured background pool also receives them.
 	for _, req := range batch {
+		stored := false
 		if s.fabric.mechanisms.GroupTransfers {
 			s.fabric.beginTransferGroup()
 		}
 		for i, id := range s.RequestMap[req.ID] {
 			b := s.Blocks[id]
 			end := int64(i+1) * s.BlockSizeTokens
-			if end <= min(req.ProgressIndex, req.InputLen()) && b.Hash != "" && int64(len(b.Tokens)) == s.BlockSizeTokens {
+			if end <= min(req.ProgressIndex, req.PrefillEnd()) && b.Hash != "" && int64(len(b.Tokens)) == s.BlockSizeTokens {
 				if x := s.fabric.external; x != nil && x.memory != nil && s.ready[id] != b.Hash {
 					if err := x.memory.CheckContents(b.Hash, s.fabric.hbmBuffer(id)); err != nil {
 						panic(err)
@@ -629,19 +711,23 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 				if s.fabric.native != nil && s.ready[id] != b.Hash {
 					s.fabric.native.computed(s.clock, id, b.Hash)
 				}
-				s.ready[id] = b.Hash
-				s.lookup[b.Hash] = id
-				if pool := s.fabric.mechanisms.BackgroundStorePool; pool != "" {
+				s.publishReadyCopy(b)
+				if pool := s.fabric.mechanisms.BackgroundStorePool; pool != "" && s.fabric.mechanisms.BackgroundStoreMode != "on_preemption" {
 					if s.backgroundOffered[req.ID] == nil {
 						s.backgroundOffered[req.ID] = map[string]bool{}
 					}
 					if !s.backgroundOffered[req.ID][b.Hash] {
-						if s.fabric.pools[pool].entries[b.Hash] != nil || s.storeCopy(b, pool, req.ID, true) {
+						exists := s.fabric.pools[pool].entries[b.Hash] != nil
+						if exists || s.storeCopy(b, pool, req.ID, true) {
 							s.backgroundOffered[req.ID][b.Hash] = true
+							stored = stored || !exists
 						}
 					}
 				}
 			}
+		}
+		if stored {
+			s.touchRequestPools(req.ID, req.FullInputTokens())
 		}
 		if s.fabric.mechanisms.GroupTransfers {
 			s.fabric.endTransferGroup(s.clock)
@@ -649,6 +735,10 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	}
 }
 func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
+	s.releaseWorkerRequest(req)
+	s.releaseDecodeCapacity(req.ID)
+	delete(s.restoreLimits, req.ID)
+	delete(s.restoredPrefixBlocks, req.ID)
 	delete(s.prefillTargets, req.ID)
 	s.ClearDeferred(req.ID)
 	s.KVCacheState.ReleaseKVBlocks(req)
@@ -677,6 +767,11 @@ func (s *PeerCache) PollDeferred(_ int64) []string {
 	return sortedPeerIDs(m)
 }
 func (s *PeerCache) ClearDeferred(id string) {
+	if len(s.RequestMap[id]) == 0 {
+		s.releaseDecodeCapacity(id)
+		delete(s.restoreLimits, id)
+		delete(s.restoredPrefixBlocks, id)
+	}
 	if s.fabric.mechanisms.ConcurrentRestores && len(s.RequestMap[id]) == 0 {
 		delete(s.prefillTargets, id)
 		if s.readPending[id] > 0 {
@@ -757,6 +852,9 @@ func (s *PeerCache) promotePrefix(tokens []sim.TokenID, budget int, attempted ma
 }
 func (s *PeerCache) PeerSnapshot() map[string]int64 {
 	m := map[string]int64{"capacity": s.TotalBlocks, "free": s.FreeBlockCnt, "active_or_pinned": s.TotalBlocks - s.FreeBlockCnt, "ready": int64(len(s.ready)), "pending_reads": int64(len(s.restoring)), "held_restores": 0}
+	if p := s.fabric.phases; p != nil && p.workerResidents != nil {
+		m["worker_resident_requests"] = int64(len(p.workerResidents))
+	}
 	for _, ids := range s.RequestMap {
 		m["request_refs"] += int64(len(ids))
 	}
@@ -767,6 +865,10 @@ func (s *PeerCache) PeerSnapshot() map[string]int64 {
 		}
 	}
 	m["extra_refs"] = m["total_refs"] - m["request_refs"]
+	if s.decodeTargets != nil {
+		m["decode_reserved_blocks"] = s.decodeCapacityReserved("")
+		m["decode_capacity_requests"] = int64(len(s.decodeTargets))
+	}
 	for _, ids := range s.holds {
 		m["held_restores"] += int64(len(ids))
 	}

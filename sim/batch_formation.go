@@ -1,9 +1,9 @@
 package sim
 
 import (
-	"github.com/sirupsen/logrus"
+	"sort"
 
-	"github.com/inference-sim/inference-sim/sim/internal/util"
+	"github.com/sirupsen/logrus"
 )
 
 // BatchFormation encapsulates the batch composition strategy for a simulation step.
@@ -21,6 +21,11 @@ type BatchFormation interface {
 // increment ComputedTokens[req.ID] to the total computed tokens (including
 // cached). Phase 2 of Step() reads this map to advance ProgressIndex.
 type BatchContext struct {
+	ObserveExecutionWork  bool
+	executionWork         *BatchExecutionWork
+	readyRestores         map[string]bool
+	CapacityVictims       *DecisionCapacityVictims
+	capacityYielded       map[string]bool
 	RunningBatch          *Batch
 	WaitQ                 *WaitQueue
 	KVCache               KVStore
@@ -31,6 +36,19 @@ type BatchContext struct {
 	Now                   int64
 	StepCount             int
 	ComputedTokens        map[string]int64
+	// TokenLimits are validated positive per-request upper bounds supplied by
+	// the decision runtime. Missing entries preserve native chunk/decode rules.
+	TokenLimits map[string]int64
+	// PrefillPreemptions is resolved and validated by the decision runtime.
+	// Batch formation owns release/requeue, and excludes these victims this step.
+	PrefillPreemptions []*Request
+	PreemptionStorage  []DecisionPreemptionStorage
+	// WaitingEligible is a runtime-owned admission gate. False skips only this
+	// waiting request, without allocating it or blocking requests behind it.
+	WaitingEligible func(*Request) bool
+	// RunningEligible can pause a resident prefill without releasing its KV or
+	// sequence slot. The decision runtime validates eligibility and owns wakeup.
+	RunningEligible func(*Request) bool
 
 	// AdapterResident is the cold-load pre-admission gate predicate (#1466): it
 	// reports whether a request's LoRA adapter is currently resident on the
@@ -53,6 +71,13 @@ type BatchContext struct {
 	DecodeTokensPerStep func(req *Request) int64
 }
 
+func (ctx BatchContext) limitTokens(id string, tokens int64) int64 {
+	if limit, ok := ctx.TokenLimits[id]; ok {
+		return min(tokens, limit)
+	}
+	return tokens
+}
+
 // ScheduledRequest carries metadata about a newly scheduled request.
 type ScheduledRequest struct {
 	Request *Request
@@ -60,11 +85,16 @@ type ScheduledRequest struct {
 
 // PreemptedRequest carries metadata about a preempted request.
 type PreemptedRequest struct {
-	Request *Request
+	Request              *Request
+	Reason               string
+	ComputedTokensBefore int64
 }
 
 // BatchResult describes the outcome of batch formation.
 type BatchResult struct {
+	PreemptionStorage  []RequestSpillOutcome
+	ExecutionWork      *BatchExecutionWork
+	Capacity           []DecisionCapacityOutcome
 	RunningBatch       *Batch
 	NewlyScheduled     []ScheduledRequest
 	Preempted          []PreemptedRequest
@@ -121,6 +151,41 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 	result := BatchResult{
 		RunningBatch: ctx.RunningBatch,
 	}
+	if ctx.ObserveExecutionWork {
+		result.ExecutionWork = &BatchExecutionWork{TokenChecksKnown: true}
+		ctx.executionWork = result.ExecutionWork
+	}
+	if ctx.CapacityVictims != nil {
+		if b, ok := ctx.KVCache.(BatchPrefixStore); ok && b.BatchPrefixReuseEnabled() {
+			panic("capacity preemption cannot revoke batch prefix donors")
+		}
+		ctx.capacityYielded = map[string]bool{}
+		previousGate := ctx.WaitingEligible
+		ctx.WaitingEligible = func(req *Request) bool {
+			return !ctx.capacityYielded[req.ID] && (previousGate == nil || previousGate(req))
+		}
+	}
+	if len(ctx.PrefillPreemptions) > 0 {
+		applyPrefillPreemptions(&result, ctx)
+		previousGate := ctx.WaitingEligible
+		victims := map[*Request]bool{}
+		for _, req := range ctx.PrefillPreemptions {
+			victims[req] = true
+		}
+		ctx.WaitingEligible = func(req *Request) bool {
+			return !victims[req] && (previousGate == nil || previousGate(req))
+		}
+	}
+	var prefixBatch BatchPrefixStore
+	if p, ok := ctx.KVCache.(BatchPrefixStore); ok && p.BeginPrefixBatch() {
+		prefixBatch = p
+		defer p.AbortPrefixBatch()
+	}
+	offer := func(r *Request) {
+		if prefixBatch != nil && r.NumNewTokens > 0 && r.ProgressIndex < r.InputLen() {
+			prefixBatch.OfferPrefixWork(BatchWork{Request: r, PrefixTokens: ctx.ComputedTokens[r.ID] - int64(r.NumNewTokens), NewTokens: int64(r.NumNewTokens)})
+		}
+	}
 
 	tokenBudget := ctx.MaxNumBatchedTokens
 
@@ -144,8 +209,16 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 			break
 		}
 		req := result.RunningBatch.Requests[reqIndex]
+		check := ctx.tokenCheck(req, "running", req.ProgressIndex, 0)
+		if ctx.RunningEligible != nil && !ctx.RunningEligible(req) {
+			if check != nil {
+				check.Held = true
+			}
+			reqIndex++
+			continue
+		}
 
-		numNewTokens := req.InputLen() - req.ProgressIndex
+		numNewTokens := req.PrefillEnd() - req.ProgressIndex
 		// Chunked prefill for running requests
 		if numNewTokens > 0 {
 			if 0 < ctx.PrefillTokenThreshold && ctx.PrefillTokenThreshold < numNewTokens {
@@ -161,9 +234,19 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 				numNewTokens = min(numNewTokens, maxAllowed)
 			}
 
+			numNewTokens = ctx.limitTokens(req.ID, numNewTokens)
+			if check != nil {
+				check.Tokens = numNewTokens
+			}
 			canSchedule, adj := v.preemptForTokens(req, numNewTokens, &result, ctx, &tokenBudget, reqIndex)
 			reqIndex -= adj
 			if !canSchedule {
+				if ctx.CapacityVictims != nil {
+					if !ctx.capacityYielded[req.ID] {
+						reqIndex++
+					}
+					continue
+				}
 				break
 			}
 
@@ -172,7 +255,7 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 			ctx.ComputedTokens[req.ID] += numNewTokens
 		}
 		// Decode phase: allocate the accepted-token count for this step.
-		if req.ProgressIndex >= req.InputLen() && len(req.OutputTokens) > 0 {
+		if req.ProgressIndex >= req.PrefillEnd() && len(req.OutputTokens) > 0 {
 			// Base is 1 token/step. Under speculative decoding / MTP (#1528) the
 			// step advances by g = accepted tokens (1 + accepted drafts), proposed by
 			// the pure DecodeTokensPerStep peek. nil predicate ⇒ g=1 ⇒ byte-identical.
@@ -200,10 +283,20 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 			if ctx.MaxModelLen > 0 {
 				decodeTokens = min(decodeTokens, max(ctx.MaxModelLen-1-req.ProgressIndex, 0))
 			}
+			decodeTokens = ctx.limitTokens(req.ID, decodeTokens)
+			if check != nil {
+				check.Tokens = decodeTokens
+			}
 			if decodeTokens > 0 {
 				canSchedule, adj := v.preemptForTokens(req, decodeTokens, &result, ctx, &tokenBudget, reqIndex)
 				reqIndex -= adj
 				if !canSchedule {
+					if ctx.CapacityVictims != nil {
+						if !ctx.capacityYielded[req.ID] {
+							reqIndex++
+						}
+						continue
+					}
 					break
 				}
 				tokenBudget -= decodeTokens
@@ -211,6 +304,7 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 				ctx.ComputedTokens[req.ID] += decodeTokens
 			}
 		}
+		offer(req)
 		reqIndex++
 	}
 
@@ -232,6 +326,20 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 			}
 		}
 	}
+	if d, ok := ctx.KVCache.(DeferredAdmissionStore); ok {
+		if ids := d.ReadyDeferredRequests(); len(ids) > 0 {
+			ready := make(map[string]bool, len(ids))
+			for _, id := range ids {
+				ready[id] = true
+			}
+			ctx.readyRestores = ready
+			ctx.WaitQ.Reorder(func(reqs []*Request) {
+				sort.SliceStable(reqs, func(i, j int) bool {
+					return ready[reqs[i].ID] && !ready[reqs[j].ID]
+				})
+			})
+		}
+	}
 
 	// Phase 2: Dequeue new requests from wait queue.
 	// skipped counts requests set aside this step (offload-deferred). It is the scan
@@ -240,6 +348,10 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 	skipped := 0
 	for len(result.RunningBatch.Requests) < int(ctx.MaxNumSeqs) && ctx.WaitQ.Len() > skipped && tokenBudget > 0 && !result.PreemptionHappened {
 		next := ctx.WaitQ.PeekAt(skipped)
+		if ctx.WaitingEligible != nil && !ctx.WaitingEligible(next) {
+			skipped++
+			continue
+		}
 
 		// A request whose secondary-tier fetch is still in flight is not admittable
 		// this step — set it aside and try the next (offload only; inert otherwise).
@@ -312,7 +424,9 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 					break
 				}
 			}
-			if ok := ctx.KVCache.AllocateKVBlocks(next, next.ProgressIndex, next.ProgressIndex+decodeTokens, nil); !ok {
+			decodeTokens = ctx.limitTokens(next.ID, decodeTokens)
+			ctx.tokenCheck(next, "decode_transfer", next.ProgressIndex, decodeTokens)
+			if ok := ctx.allocate(next, next.ProgressIndex, next.ProgressIndex+decodeTokens, nil); !ok {
 				break
 			}
 			dequeueAdmitted(ctx.WaitQ, next, skipped)
@@ -326,23 +440,31 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 			continue
 		}
 
-		cachedBlocks := ctx.KVCache.GetCachedBlocks(next.FullInputTokens())
-		numNewTokens := next.InputLen() - util.Len64(cachedBlocks)*ctx.KVCache.BlockSize()
+		prefix := ctx.cachedPrefix(next)
+		cachedBlocks := prefix.Blocks
+		numNewTokens := next.PrefillEnd() - prefix.Tokens
 
 		if 0 < ctx.PrefillTokenThreshold && ctx.PrefillTokenThreshold < numNewTokens {
 			numNewTokens = ctx.PrefillTokenThreshold
 		}
 		numNewTokens = min(numNewTokens, tokenBudget)
-		startIndex := util.Len64(cachedBlocks) * ctx.KVCache.BlockSize()
+		startIndex := prefix.Tokens
 		// Proactive MaxModelLen cap (BC-2): BLIS safety extension (vLLM only caps running requests).
 		// For valid enqueued requests (input < maxModelLen), this is a no-op.
 		if ctx.MaxModelLen > 0 {
 			maxAllowed := max(ctx.MaxModelLen-1-startIndex, 0)
 			numNewTokens = min(numNewTokens, maxAllowed)
 		}
+		numNewTokens = ctx.limitTokens(next.ID, numNewTokens)
+		ctx.tokenCheck(next, "waiting", startIndex, numNewTokens)
 		endIndex := startIndex + numNewTokens
 
-		if ok := ctx.KVCache.AllocateKVBlocks(next, startIndex, endIndex, cachedBlocks); !ok {
+		if ok := ctx.allocate(next, startIndex, endIndex, cachedBlocks); !ok {
+			if ctx.CapacityVictims != nil {
+				if evictCapacityVictim(next, &result, ctx, &tokenBudget) >= 0 {
+					continue // re-query prefix after actual release and queue insertion
+				}
+			}
 			// H3: distinguish a fresh deferral (the offload chain set this request
 			// aside for a secondary fetch — skip and keep it in the WaitQ) from
 			// genuine GPU pressure (break, head-of-line as before).
@@ -364,9 +486,19 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 		tokenBudget -= numNewTokens
 		next.State = StateRunning
 		next.NumNewTokens = int(numNewTokens)
-		ctx.ComputedTokens[next.ID] = numNewTokens + util.Len64(cachedBlocks)*ctx.KVCache.BlockSize()
+		ctx.ComputedTokens[next.ID] = numNewTokens + prefix.Tokens
+		offer(next)
 	}
 
+	if prefixBatch != nil {
+		var work []BatchWork
+		for _, r := range result.RunningBatch.Requests {
+			if r.NumNewTokens > 0 {
+				work = append(work, BatchWork{Request: r, PrefixTokens: ctx.ComputedTokens[r.ID] - int64(r.NumNewTokens), NewTokens: int64(r.NumNewTokens)})
+			}
+		}
+		prefixBatch.CommitPrefixBatch(work)
+	}
 	return result
 }
 
@@ -392,7 +524,21 @@ func dequeueAdmitted(wq *WaitQueue, req *Request, skipped int) {
 func (v *VLLMBatchFormation) preemptForTokens(req *Request, numNewTokens int64, result *BatchResult, ctx BatchContext, tokenBudget *int64, reqIndex int) (bool, int) {
 	adjustment := 0
 	for {
-		if ok := ctx.KVCache.AllocateKVBlocks(req, req.ProgressIndex, req.ProgressIndex+numNewTokens, nil); !ok {
+		if ok := ctx.allocate(req, req.ProgressIndex, req.ProgressIndex+numNewTokens, nil); !ok {
+			if ctx.CapacityVictims != nil {
+				index := evictCapacityVictim(req, result, ctx, tokenBudget)
+				if index < 0 {
+					return false, adjustment
+				}
+				if index < reqIndex-adjustment {
+					adjustment++
+				}
+				result.PreemptionHappened = true
+				if ctx.capacityYielded[req.ID] {
+					return false, adjustment
+				}
+				continue
+			}
 			// Circuit breaker: empty batch means cache is too small (R19)
 			if len(result.RunningBatch.Requests) == 0 {
 				logrus.Warnf("[tick %07d] preemption: KV cache too small for request %s (need %d tokens, no running requests to evict)",
@@ -453,13 +599,7 @@ func (v *VLLMBatchFormation) preemptForTokens(req *Request, numNewTokens int64, 
 				preemptedRequest.NumNewTokens = 0
 			}
 
-			preemptedRequest.State = StateQueued
-			preemptedRequest.ProgressIndex = 0
-			preemptedRequest.ITL = nil
-			preemptedRequest.specDecodeCarry = 0 // reset spec-decode carry with progress; re-prefill starts a fresh decode phase (#1528)
-			preemptedRequest.TTFTSet = false     // lets the !TTFTSet guard in executeBatchStep fire on re-prefill, updating FirstTokenTime (#1122)
-			ctx.KVCache.ReleaseKVBlocks(preemptedRequest)
-			delete(ctx.ComputedTokens, preemptedRequest.ID)
+			resetPreemptedRequest(preemptedRequest, ctx)
 			ctx.WaitQ.PrependFront(preemptedRequest)
 
 			if preemptedRequest == req {

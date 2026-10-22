@@ -18,6 +18,7 @@ type PeerResource struct {
 type PeerPoolConfig struct {
 	ID             string `json:"id"`
 	CapacityBlocks int64  `json:"capacity_blocks"`
+	EvictionPolicy string `json:"eviction_policy,omitempty"`
 }
 type PeerAccess struct {
 	Pool      string   `json:"pool"`
@@ -58,8 +59,10 @@ type peerEntry struct {
 	blockers     []peerBlocker
 }
 type peerPool struct {
-	config  PeerPoolConfig
-	entries map[string]*peerEntry
+	config      PeerPoolConfig
+	entries     map[string]*peerEntry
+	policy      PoolEvictionPolicy
+	trackAccess bool
 }
 type peerJob struct {
 	notBefore         int64
@@ -114,7 +117,11 @@ func NewPeerFabric(resources []PeerResource, pools []PeerPoolConfig, blockBytes 
 		if _, ok := f.pools[p.ID]; ok || p.ID == "" || p.CapacityBlocks <= 0 {
 			return nil, fmt.Errorf("invalid or duplicate pool %q", p.ID)
 		}
-		f.pools[p.ID] = &peerPool{config: p, entries: map[string]*peerEntry{}}
+		policy, err := NewPoolEvictionPolicy(p.EvictionPolicy)
+		if err != nil {
+			return nil, err
+		}
+		f.pools[p.ID] = &peerPool{config: p, entries: map[string]*peerEntry{}, policy: policy, trackAccess: p.EvictionPolicy != ""}
 	}
 	return f, nil
 }
@@ -203,6 +210,9 @@ func (f *PeerFabric) dispatch(now int64) {
 		if j.notBefore > now {
 			continue
 		}
+		if f.phases != nil && !f.phases.submissionReady(j) {
+			continue
+		}
 		available := true
 		for _, id := range j.path {
 			if f.busy[id] {
@@ -288,12 +298,23 @@ func (e *peerTransferEvent) Execute(_ *sim.Simulator) {
 		f.dispatch(e.at)
 		return
 	}
-	finish := func(now int64) { j.done(now); f.dispatch(now); f.wakeStores(now) }
+	finish := func(now int64) { j.done(now); f.notifyDecisionTransfer(now, j); f.dispatch(now); f.wakeStores(now) }
 	if f.mechanisms.CompletionUS > 0 {
 		f.controlSubmit(e.at, &peerControlJob{record: PeerRecord{Instance: j.record.Instance, Request: j.record.Request, Transaction: j.record.Transaction, Reason: "completion"}, service: f.mechanisms.CompletionUS, schedule: j.schedule, done: finish})
 		f.dispatch(e.at)
 	} else {
 		finish(e.at)
+	}
+}
+
+// One notification per completed job (a group calls all member callbacks
+// before this point). No physical block identity or predicted time is exposed.
+func (f *PeerFabric) notifyDecisionTransfer(now int64, j *peerJob) {
+	for _, s := range f.stores {
+		if s.id == j.record.Instance && s.decisionEvents != nil {
+			s.decisionEvents(sim.DecisionEvent{Kind: "transfer_adopted", OccurredUS: now, Request: j.record.Request,
+				Transfer: &sim.DecisionTransfer{ID: j.record.Transaction, Request: j.record.Request, Source: j.record.Source, Destination: j.record.Destination, Bytes: j.record.Bytes}})
+		}
 	}
 }
 func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64) (*peerEntry, bool) {
@@ -302,12 +323,7 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 		return e, false
 	}
 	if int64(len(p.entries)) == p.config.CapacityBlocks {
-		var victim *peerEntry
-		for _, e := range p.entries {
-			if e.ready && e.readers == 0 && (victim == nil || e.last < victim.last || e.last == victim.last && e.hash < victim.hash) {
-				victim = e
-			}
-		}
+		victim := p.evictionVictim()
 		if victim == nil {
 			return nil, false
 		}
@@ -317,6 +333,7 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 			f.external.release(victim.nativeBuffer)
 		}
 		delete(p.entries, victim.hash)
+		f.poolPolicyEvent(pool, "remove", "", []string{victim.hash}, now)
 		f.emit(PeerRecord{Time: now, Name: "l2_evict", Source: pool, Hash: victim.hash, Bytes: f.bytes})
 	}
 	e := &peerEntry{hash: hash, tokens: append([]sim.TokenID(nil), tokens...), last: now}

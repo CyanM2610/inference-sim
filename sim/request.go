@@ -38,11 +38,16 @@ const (
 )
 
 type Request struct {
-	ID string // Unique identifier for the request
+	// The engine owns output history independently of KV computation. Nonzero
+	// only after a backend with history-aware restoration preempts a decoder.
+	recomputeUntil        int64
+	preservedOutputTokens int64
+	lastOutputTime        int64
+	ID                    string // Unique identifier for the request
 
 	InputTokens  []TokenID // Prompt tokens
 	OutputTokens []TokenID // Pre-specified output tokens (already known for the simulation)
-	MaxOutputLen int   // Client output budget (vLLM max_tokens); 0 = no budget (input-only check, runtime stop enforces limit)
+	MaxOutputLen int       // Client output budget (vLLM max_tokens); 0 = no budget (input-only check, runtime stop enforces limit)
 
 	State         RequestState // queued, running, completed
 	ProgressIndex int64        // Total number of input tokens processed so far + number of output tokens generated so far

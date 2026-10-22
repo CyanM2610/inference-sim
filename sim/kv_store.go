@@ -1,5 +1,46 @@
 package sim
 
+// CachedPrefix separates physical cache blocks from reusable computation. A
+// complete offload hit may load the last block but must replay one token for logits.
+// Physical IDs are exchanged only inside the trusted runtime, never with policies.
+type CachedPrefix struct {
+	Blocks []int64
+	Tokens int64
+}
+
+type RequestPrefixStore interface {
+	GetRequestCachedPrefix(*Request) CachedPrefix
+}
+
+// BatchPrefixStore exposes prefixes only within one batch's formation scope.
+// Offers describe granted work, not policy proposals. Commit validates donors
+// against final work and protects submitted content through request cancellation.
+// Completion publishes content after execution; Abort only closes planning.
+type BatchPrefixStore interface {
+	BatchPrefixReuseEnabled() bool
+	BeginPrefixBatch() bool
+	OfferPrefixWork(BatchWork)
+	CommitPrefixBatch([]BatchWork)
+	AbortPrefixBatch()
+	CompletePrefixBatch()
+}
+
+func RequestCachedPrefix(store KVStore, req *Request) CachedPrefix {
+	if backend, ok := store.(RequestPrefixStore); ok {
+		return backend.GetRequestCachedPrefix(req)
+	}
+	blocks := store.GetCachedBlocks(req.FullInputTokens())
+	return CachedPrefix{Blocks: blocks, Tokens: int64(len(blocks)) * store.BlockSize()}
+}
+
+// RestoreDecisionStore validates all updates without side effects before the
+// runtime applies them. Updates choose future loading, not physical ownership.
+type RestoreDecisionStore interface {
+	RestoreDecisionsEnabled() bool
+	ValidateRestoreDecisions([]DecisionRestore) error
+	ApplyRestoreDecisions([]DecisionRestore)
+}
+
 // KVStore abstracts KV cache operations for the simulator.
 // kv.KVCacheState (single-tier GPU) and kv.TieredKVCache (GPU+CPU) both implement this.
 type KVStore interface {
@@ -46,6 +87,13 @@ type DeferrableKVStore interface {
 	// in-flight promotion bookkeeping do not leak. Idempotent; a no-op for an
 	// untracked id.
 	ClearDeferred(id string)
+}
+
+// DeferredAdmissionStore identifies requests that finished a deferred load and
+// still own its reservations. Batch formation visits them before fresh waiting
+// requests, preserving the request policy's order within each group.
+type DeferredAdmissionStore interface {
+	ReadyDeferredRequests() []string
 }
 
 // NewKVCacheStateFunc is a factory function for creating single-tier KVStore implementations.

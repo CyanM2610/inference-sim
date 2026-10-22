@@ -10,6 +10,18 @@ import (
 	"github.com/inference-sim/inference-sim/sim/internal/tokenid"
 )
 
+func TestHashTokenLineagePreservesNativeReferenceEncoding(t *testing.T) {
+	// Independent SHA256 reference vectors for zero seed, then uint32-LE 10/20/30.
+	want := []string{"d6bfa4ddba0379d94c81ee2174e2bf1e610e27bcad638a14f0022b92b823dd79", "ef4916458cade7c8045e9b83f6e03f343d303ad494a01aa2c38e34e537ec3167", "6658d8aa4fd50bd77a1c087520c928ae9861f4c50da331f2eeab9c37c338d1e6"}
+	var previous [32]byte
+	for i, token := range []tokenid.TokenID{10, 20, 30} {
+		previous = HashTokenLineage(previous, token)
+		if hex.EncodeToString(previous[:]) != want[i] {
+			t.Fatal("native lineage encoding changed", i)
+		}
+	}
+}
+
 func TestHashBlock_ChainsDeterministically(t *testing.T) {
 	tokens := []tokenid.TokenID{10, 20, 30}
 	h1 := HashBlock("", tokens)

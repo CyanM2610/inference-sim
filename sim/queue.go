@@ -110,6 +110,25 @@ func (wq *WaitQueue) Remove(req *Request) bool {
 	return false
 }
 
+// Extract removes matching requests in one pass. Both retained and returned
+// requests preserve queue order. Used to hold arrivals outside a frozen plan
+// until its batch is formed; callers return them through Enqueue afterwards.
+func (wq *WaitQueue) Extract(match func(*Request) bool) []*Request {
+	if match == nil {
+		panic("Extract: match must not be nil")
+	}
+	var kept, removed []*Request
+	for _, r := range wq.queue {
+		if match(r) {
+			removed = append(removed, r)
+		} else {
+			kept = append(kept, r)
+		}
+	}
+	wq.queue = kept
+	return removed
+}
+
 // DequeueBatch removes a request from the front of the queue.
 // This is used by the scheduler to construct a batch for processing.
 func (wq *WaitQueue) DequeueBatch() *Request {

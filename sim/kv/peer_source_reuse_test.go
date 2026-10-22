@@ -8,6 +8,11 @@ import (
 
 func reuseFixture(t *testing.T) (*peerHarness, *PeerCache) {
 	t.Helper()
+	return reuseFixtureCapacity(t, 2)
+}
+
+func reuseFixtureCapacity(t *testing.T, capacity int64) (*peerHarness, *PeerCache) {
+	t.Helper()
 	h := &peerHarness{}
 	var err error
 	h.f, err = NewPeerFabric([]PeerResource{{ID: "copy", BytesPerUS: 1}}, []PeerPoolConfig{{ID: "cpu", CapacityBlocks: 8}}, 100, func(r PeerRecord) { h.records = append(h.records, r) })
@@ -17,7 +22,7 @@ func reuseFixture(t *testing.T) (*peerHarness, *PeerCache) {
 	if err = h.f.ConfigureMechanisms(PeerMechanisms{GroupTransfers: true, ConcurrentRestores: true, BackgroundStorePool: "cpu", RestoreWindow: 8}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := NewPeerCache("one", 2, 2, h.f, []PeerAccess{{Pool: "cpu", ReadPath: []string{"copy"}, WritePath: []string{"copy"}}}, BuiltinPeerPolicy{Name: "lru_drop"})
+	s, err := NewPeerCache("one", capacity, 2, h.f, []PeerAccess{{Pool: "cpu", ReadPath: []string{"copy"}, WritePath: []string{"copy"}}}, BuiltinPeerPolicy{Name: "lru_drop"})
 	if err != nil {
 		t.Fatal(err)
 	}
