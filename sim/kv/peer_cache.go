@@ -10,18 +10,43 @@ import (
 // PeerCache wraps BLIS's physical HBM allocator. DRAM and CXL are peers in
 // access, not stages in a chain. Only completed full input blocks are reusable.
 type PeerCache struct {
-	nativeRestoreAdmission bool
-	cacheMetrics           *cacheMetricState
-	hotprefix              *hotPrefixRuntime
-	prefixCopies           map[string][]int64
-	decodeTargets          map[string]int64
-	allocationFailure      sim.AllocationFailure
-	promotionRetention     string
-	promotionControl       bool
-	batchPrefixes          *batchPrefixState
-	restoreControl         bool
-	restoreLimits          map[string]int64
-	restoredPrefixBlocks   map[string]int64
+	nativeAsync             bool
+	nativePhaseTransfers    bool
+	nativeExecutor          *sim.NativeExecutor
+	nativeCopyResource      string
+	nativePrepared          []*peerJob
+	nativePromotionPrepared []*peerJob
+	nativePromotionReceipts []int64
+	nativeControl           *nativePromotion
+	nativeControlSerial     int64
+	nativeControlRPCs       int64
+	nativeRequestLookups    map[string]*nativeRequestLookup
+	nativeRequestRPCs       int64
+	nativeRequestRPCSerial  int64
+	nativePartialFailure    int
+	nativePageAccess        map[int64]nativePendingPageAccess
+	nativeReserving         bool
+	nativeBatchPins         int64
+	nativePending           map[string]int
+	nativeDeferred          []nativeRetiredAllocation
+	nativeScheduledStep     int64
+	nativeProcessedStep     int64
+	nativeLastStep          map[string]int64
+	nativeLoadPending       map[string]bool
+	nativeLoadTargets       map[string][]int64
+	nativeStored            map[string]nativeStorePosition
+	nativeRestoreAdmission  bool
+	cacheMetrics            *cacheMetricState
+	hotprefix               *hotPrefixRuntime
+	prefixCopies            map[string][]int64
+	decodeTargets           map[string]int64
+	allocationFailure       sim.AllocationFailure
+	promotionRetention      string
+	promotionControl        bool
+	batchPrefixes           *batchPrefixState
+	restoreControl          bool
+	restoreLimits           map[string]int64
+	restoredPrefixBlocks    map[string]int64
 	*KVCacheState
 	id                string
 	fabric            *PeerFabric
@@ -52,6 +77,9 @@ type PeerCache struct {
 }
 
 func NewPeerCache(id string, blocks, blockTokens int64, fabric *PeerFabric, access []PeerAccess, policy PeerPolicy) (*PeerCache, error) {
+	if fabric.hostChunks != nil {
+		return nil, fmt.Errorf("host chunks currently require one configured instance")
+	}
 	if blocks <= 0 || blockTokens <= 0 || policy == nil {
 		return nil, fmt.Errorf("positive HBM/block sizes and a policy are required")
 	}
@@ -143,6 +171,10 @@ func (s *PeerCache) pin(b *KVBlock) {
 	b.RefCount++
 }
 func (s *PeerCache) unpin(b *KVBlock) {
+	if s.nativeAsync {
+		s.releaseNativeReferences([]int64{b.ID})
+		return
+	}
 	b.RefCount--
 	if b.RefCount == 0 {
 		b.InUse = false
@@ -370,8 +402,10 @@ func (s *PeerCache) storeReservedCopy(b *KVBlock, pool, req string, retain bool,
 		return true
 	}
 	var sourceBlocks []int64
-	if leased {
+	if leased || s.fabric.hostChunks != nil && s.fabric.hostChunks.segmentBytes > 0 {
 		sourceBlocks = []int64{b.ID}
+	}
+	if leased {
 		s.emit("source_lease", req, h, "hbm", pool, "store")
 	} else {
 		s.pin(b)
@@ -402,7 +436,7 @@ func (s *PeerCache) storeReservedCopy(b *KVBlock, pool, req string, retain bool,
 		s.emit("store_join", req, h, "hbm", pool, "deduplicated")
 		return true
 	}
-	s.fabric.submit(s.clock, &peerJob{nativeSource: func() string { return s.fabric.hbmBuffer(b.ID) }, nativeDestination: func() string { return e.nativeBuffer }, record: PeerRecord{Instance: s.id, Request: req, Source: "hbm", Destination: pool, Hash: h, HBMBlocks: sourceBlocks, Reason: "store"}, path: path, schedule: s.schedule, blockedRequests: func() []string {
+	s.fabric.submit(s.clock, &peerJob{hostObject: e.object, nativeSource: func() string { return s.fabric.hbmBuffer(b.ID) }, nativeDestination: func() string { return e.nativeBuffer }, record: PeerRecord{Instance: s.id, Request: req, Source: "hbm", Destination: pool, Hash: h, HBMBlocks: sourceBlocks, Reason: "store"}, path: path, schedule: s.schedule, blockedRequests: func() []string {
 		var ids []string
 		for _, b := range e.blockers {
 			if b.active() {
@@ -423,7 +457,11 @@ func (s *PeerCache) storeReservedCopy(b *KVBlock, pool, req string, retain bool,
 		e.last = now
 		s.fabric.poolPolicyEvent(pool, "ready", req, []string{h}, now)
 		s.clock = now
-		s.emit("l2_publish", req, h, "hbm", pool, "store_complete")
+		if e.object != nil {
+			s.fabric.emit(PeerRecord{Time: now, Name: "l2_publish", Instance: s.id, Request: req, Hash: h, Source: "hbm", Destination: pool, Reason: "store_complete", HostObjects: []string{e.object.key}, HostChunkBlocks: s.fabric.hostChunks.blocks})
+		} else {
+			s.emit("l2_publish", req, h, "hbm", pool, "store_complete")
+		}
 		for _, done := range e.waiters {
 			done(now)
 		}
@@ -457,15 +495,26 @@ func (s *PeerCache) fetch(h, req string, e *peerEntry, a *PeerAccess, protect ma
 }
 
 func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAccess, protect map[int64]bool, background, retainRequest bool) bool {
-	if s.restoring[h] {
+	return s.fetchInto(h, req, e, a, protect, background, retainRequest, nil, nil)
+}
+
+// A native control owns its complete reservation before worker submission;
+// legacy/demand paths reserve here. Both use the same physical transfer path.
+func (s *PeerCache) fetchInto(h, req string, e *peerEntry, a *PeerAccess, protect map[int64]bool, background, retainRequest bool, target *KVBlock, control *nativePromotion) bool {
+	nativePromotion := s.nativePhaseTransfers && background
+	if nativePromotion && retainRequest {
+		panic("native phase promotion uses independent cache ownership")
+	}
+	identity := s.restoreIdentity(req, h)
+	if s.restoring[identity] {
 		s.waiting[req] = true
 		return true
 	}
-	if background && s.fabric.mechanisms.MaxPromotionQueueUS > 0 && s.fabric.EstimateQueueUS(s.clock, a.ReadPath) > s.fabric.mechanisms.MaxPromotionQueueUS {
+	if control == nil && background && s.fabric.mechanisms.MaxPromotionQueueUS > 0 && s.fabric.EstimateQueueUS(s.clock, a.ReadPath) > s.fabric.mechanisms.MaxPromotionQueueUS {
 		s.emit("promotion_rejected", req, h, a.Pool, "hbm", "queue_budget")
 		return false
 	}
-	var b *KVBlock
+	b := target
 	reserve := func(now int64) bool {
 		s.clock = now
 		if !s.makeSpace(1, protect, req) {
@@ -481,13 +530,19 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		s.pendingTargets[b.ID] = true
 		return true
 	}
-	if !s.fabric.mechanisms.ReserveAtDispatch && !reserve(s.clock) {
+	if control != nil && (target == nil || target.RefCount != 1 || target.Hash != "" || !s.pendingTargets[target.ID]) {
+		panic("native control lost its reserved destination")
+	}
+	if target == nil && !s.fabric.mechanisms.ReserveAtDispatch && !reserve(s.clock) {
 		return false
 	}
-	s.restoring[h] = true
+	s.restoring[identity] = true
 	e.readers++
 	e.last = s.clock
 	s.readPending[req]++
+	if s.nativeAsync && !background {
+		s.nativeLoadPending[req] = true
+	}
 	reason := "restore"
 	if background {
 		reason = "promotion"
@@ -508,12 +563,12 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 	var cancel func(int64)
 	// Phase submissions are not cancellable and may be grouped just like
 	// demand loads. Legacy queued promotion cancellation remains unchanged.
-	if background && s.fabric.phases == nil {
+	if background && s.fabric.phases == nil && s.fabric.hostChunks == nil {
 		cancel = func(now int64) {
 			s.clock = now
 			e.readers--
 			s.fabric.poolPolicyEvent(a.Pool, "ready", req, []string{h}, now)
-			delete(s.restoring, h)
+			delete(s.restoring, identity)
 			s.readPending[req]--
 			if s.readPending[req] == 0 {
 				delete(s.readPending, req)
@@ -526,39 +581,79 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 			s.emit("promotion_cancelled", req, h, a.Pool, "hbm", "foreground_arrival")
 		}
 	}
-	s.fabric.submit(s.clock, &peerJob{nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.hbmBuffer(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
+	var targetIDs []int64
+	if b != nil {
+		targetIDs = []int64{b.ID}
+	} // legacy dispatch-time reservation has no target yet
+	s.fabric.submit(s.clock, &peerJob{nativeControl: control, hostObject: e.object, nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.hbmBuffer(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, HBMBlocks: targetIDs, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
 		s.clock = now
 		delete(s.pendingTargets, b.ID)
-		b.Hash = h
-		b.Tokens = append([]sim.TokenID(nil), e.tokens...)
-		s.HashToBlock[h] = b.ID
-		s.publishReadyCopy(b)
-		s.metricLoad(b, a.Pool, reason, req)
+		copied := control == nil || control.copiedTargets == nil || control.copiedTargets[b.ID]
+		if copied {
+			b.Tokens = append([]sim.TokenID(nil), e.tokens...)
+		}
+		if control == nil {
+			b.Hash = h
+			s.HashToBlock[h] = b.ID
+		}
+		if !s.nativeAsync || background && !nativePromotion {
+			s.publishReadyCopy(b)
+		}
+		if copied {
+			s.metricLoad(b, a.Pool, reason, req)
+		}
 		s.releaseHotPrefixParent(h)
 		e.readers--
 		e.last = now
 		s.fabric.poolPolicyEvent(a.Pool, "ready", req, []string{h}, now)
-		delete(s.restoring, h)
+		if !nativePromotion {
+			delete(s.restoring, identity)
+		}
 		s.readPending[req]--
 		if s.readPending[req] == 0 {
 			delete(s.readPending, req)
 		}
-		if (background && !retainRequest) || s.cancelledRestores[req] {
+		if control != nil {
+			control.settled++
+			if control.settled > len(control.ids)-control.cached {
+				panic("native control settled a destination twice")
+			}
+		} else if nativePromotion {
+			// Keep this target owned and undiscoverable until an actual worker
+			// poll and FIFO consumption adopt the receipt. Further promotions
+			// of the same hash still see restoring=true in this interval.
+			s.nativePromotionReceipts = append(s.nativePromotionReceipts, b.ID)
+		} else if (background && !retainRequest) || s.cancelledRestores[req] {
 			if s.fabric.mechanisms.Online != nil || s.hotprefix != nil {
 				s.promoted[b.ID] = true
 			}
 			s.unpin(b)
 		} else {
 			s.holds[req] = append(s.holds[req], b.ID)
+			if s.nativeAsync && !background {
+				s.nativeLoadTargets[req] = append(s.nativeLoadTargets[req], b.ID)
+			}
 		}
 		if s.readPending[req] == 0 {
 			delete(s.cancelledRestores, req)
 		}
-		s.emit("hbm_publish", req, h, a.Pool, "hbm", reason)
+		if !copied {
+			s.emit("native_load_not_submitted", req, h, a.Pool, "hbm", "partial_submission_failed")
+		} else if s.nativeAsync && (!background || nativePromotion) {
+			s.emit("native_load_device_complete", req, h, a.Pool, "hbm", reason)
+		} else {
+			s.emit("hbm_publish", req, h, a.Pool, "hbm", reason)
+		}
 	}})
 	return true
 }
 func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached []int64) bool {
+	if s.fabric.hostChunks != nil && s.readPending[req.ID] == 0 && len(s.holds[req.ID]) > 0 {
+		cached = s.GetRequestCachedPrefix(req).Blocks
+	}
+	if s.fabric.hostChunks != nil && len(s.RequestMap[req.ID]) == 0 && s.nativeRequestLookups == nil {
+		s.ensureHostLookup(req.ID, req.PrefillTokens())
+	}
 	s.observeCacheLookup(req.ID, req.FullInputTokens())
 	s.observeHotPrefix(req)
 	fresh := len(s.RequestMap[req.ID]) == 0
@@ -622,7 +717,7 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 					s.noteAllocationWait(req.ID, "restore_in_flight")
 				} else {
 					for _, h := range hashes {
-						if s.restoring[h] {
+						if s.restoring[s.restoreIdentity(req.ID, h)] {
 							s.noteAllocationWait(req.ID, "shared_restore_in_flight")
 							break
 						}
@@ -643,7 +738,7 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 				if submitted == window {
 					break
 				}
-				e, a := s.find(h)
+				e, a := s.findForRestore(req.ID, h, req.PrefillTokens())
 				if e == nil {
 					break
 				}
@@ -704,7 +799,7 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 		s.commitCachedBlocks(req.ID, cached)
 		ok = true
 	} else {
-		ok = s.KVCacheState.AllocateKVBlocks(req, start, end, cached)
+		ok = s.KVCacheState.allocateKVBlocks(req, start, end, cached, s.nativeReserving)
 	}
 	if !ok {
 		failure := s.KVCacheState.LastAllocationFailure()
@@ -713,6 +808,7 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 		}
 	}
 	if ok {
+		s.admitHostLookup(req.ID)
 		s.stageCacheReuse(req, start, cached, fresh)
 		s.stageHotPrefixReuse(req, start, cached, fresh)
 		s.allocationFailure = sim.AllocationFailure{}
@@ -783,7 +879,7 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 				}
 				s.publishHotPrefixCompute(req, b)
 				s.publishReadyCopy(b)
-				if pool := s.fabric.mechanisms.BackgroundStorePool; pool != "" && (s.fabric.mechanisms.BackgroundStoreMode == "" || s.fabric.mechanisms.BackgroundStoreMode == "continuous") {
+				if pool := s.fabric.mechanisms.BackgroundStorePool; s.fabric.hostChunks == nil && pool != "" && (s.fabric.mechanisms.BackgroundStoreMode == "" || s.fabric.mechanisms.BackgroundStoreMode == "continuous") {
 					if s.backgroundOffered[req.ID] == nil {
 						s.backgroundOffered[req.ID] = map[string]bool{}
 					}
@@ -796,6 +892,9 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 					}
 				}
 			}
+		}
+		if s.fabric.hostChunks != nil {
+			stored = s.storeHostChunks(req)
 		}
 		if stored {
 			s.touchRequestPools(req.ID, req.FullInputTokens())
@@ -810,6 +909,9 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	}
 }
 func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
+	if s.nativeAsync {
+		s.retireNativeAllocation(req)
+	}
 	if s.hotprefix != nil {
 		if r := s.hotprefix.requests[req.ID]; r != nil {
 			r.pending = nil
@@ -826,7 +928,24 @@ func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
 	delete(s.restoredPrefixBlocks, req.ID)
 	delete(s.prefillTargets, req.ID)
 	s.ClearDeferred(req.ID)
-	s.KVCacheState.ReleaseKVBlocks(req)
+	// request_finished retains allocation for pending STORE; a preemption is
+	// not request_finished. Native page conflicts are fenced at actual access.
+	if !s.nativePhaseTransfers || req.State != sim.StateRunning {
+		s.holdHostStoreRequest(req)
+	}
+	if req.State != sim.StateRunning {
+		s.endRequestHostLookup(req.ID)
+	}
+	if s.fabric.hostChunks != nil && s.nativeRequestLookups[req.ID] == nil {
+		delete(s.fabric.hostChunks.inputs, req.ID)
+	}
+	if s.nativeAsync {
+		ids := s.RequestMap[req.ID]
+		delete(s.RequestMap, req.ID)
+		s.releaseNativeReferences(ids)
+	} else {
+		s.KVCacheState.ReleaseKVBlocks(req)
+	}
 	if s.fabric.mechanisms.ReserveAtDispatch {
 		s.fabric.dispatch(s.clock)
 	}
@@ -834,7 +953,7 @@ func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
 }
 func (s *PeerCache) IsDeferred(id string) bool {
 	ready, started := s.directory[id]
-	return s.waiting[id] || s.readPending[id] > 0 || started && !ready
+	return s.waiting[id] || s.readPending[id] > 0 || started && !ready || s.nativeLoadPending[id]
 }
 func (s *PeerCache) PollDeferred(_ int64) []string {
 	m := map[string]bool{}
@@ -849,10 +968,21 @@ func (s *PeerCache) PollDeferred(_ int64) []string {
 			m[id] = true
 		}
 	}
+	for id, pending := range s.nativeLoadPending {
+		if pending {
+			m[id] = true
+		}
+	}
 	return sortedPeerIDs(m)
 }
 func (s *PeerCache) ClearDeferred(id string) {
 	if len(s.RequestMap[id]) == 0 {
+		delete(s.nativeLoadPending, id)
+		delete(s.nativeLoadTargets, id)
+		s.endRequestHostLookup(id)
+		if s.fabric.hostChunks != nil && s.nativeRequestLookups[id] == nil {
+			delete(s.fabric.hostChunks.inputs, id)
+		}
 		s.releaseDecodeCapacity(id)
 		delete(s.restoreLimits, id)
 		delete(s.restoredPrefixBlocks, id)
@@ -902,6 +1032,16 @@ func (s *PeerCache) Promote(tokens []sim.TokenID, budget int) int {
 	return s.promotePrefix(tokens, budget, nil)
 }
 func (s *PeerCache) promotePrefix(tokens []sim.TokenID, budget int, attempted map[string]bool) int {
+	if s.nativePhaseTransfers && !s.nativeExecutor.HasTransferModel() {
+		s.emit("promotion_rejected", "@promotion", "", "", "hbm", "native_transfer_model_required")
+		return 0
+	}
+	if s.fabric.hostChunks != nil {
+		delete(s.fabric.hostChunks.inputs, "@promotion")
+		defer delete(s.fabric.hostChunks.inputs, "@promotion")
+		s.fabric.beginTransferGroup()
+		defer func() { s.fabric.endTransferGroup(s.clock) }()
+	}
 	count := 0
 	protect := map[int64]bool{}
 	for _, id := range s.GetCachedBlocks(tokens) {
@@ -914,7 +1054,7 @@ func (s *PeerCache) promotePrefix(tokens []sim.TokenID, budget int, attempted ma
 		if _, ok := s.lookup[h]; ok {
 			continue
 		}
-		if s.restoring[h] {
+		if s.restoring[s.restoreIdentity("@promotion", h)] {
 			continue
 		}
 		if attempted != nil {
@@ -923,7 +1063,7 @@ func (s *PeerCache) promotePrefix(tokens []sim.TokenID, budget int, attempted ma
 			}
 			attempted[h] = true
 		}
-		e, a := s.find(h)
+		e, a := s.findForInput("@promotion", h, tokens)
 		if e == nil {
 			break
 		}
@@ -962,6 +1102,30 @@ func (s *PeerCache) PeerSnapshot() map[string]int64 {
 		}
 	}
 	m["extra_refs"] = m["total_refs"] - m["request_refs"]
+	if s.nativeAsync {
+		m["native_batch_pins"] = s.nativeBatchPins
+		m["native_page_accesses_pending"] = int64(len(s.nativePageAccess))
+		m["native_receives_unadopted"] = int64(len(s.nativeLoadPending))
+		m["native_scheduled_step"] = s.nativeScheduledStep
+		m["native_processed_step"] = s.nativeProcessedStep
+		if s.nativeRequestLookups != nil {
+			m["native_request_rpcs"] = s.nativeRequestRPCs
+			m["native_request_lookup_sessions"] = int64(len(s.nativeRequestLookups))
+		}
+		m["native_promotion_prepared"] = int64(len(s.nativePromotionPrepared))
+		m["native_promotion_receipts"] = int64(len(s.nativePromotionReceipts))
+		if s.nativeControlSerial != 0 {
+			m["native_control_rpcs"] = s.nativeControlRPCs
+			m["native_control_pending"] = 0
+			if s.nativeControl != nil {
+				m["native_control_pending"] = 1
+			}
+		}
+		m["promoted_unconsumed_resident"] = int64(len(s.promoted))
+		for _, retired := range s.nativeDeferred {
+			m["native_deferred_free_refs"] += int64(len(retired.ids))
+		}
+	}
 	if s.decodeTargets != nil {
 		m["decode_reserved_blocks"] = s.decodeCapacityReserved("")
 		m["decode_capacity_requests"] = int64(len(s.decodeTargets))

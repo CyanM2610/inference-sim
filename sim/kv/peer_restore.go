@@ -75,11 +75,11 @@ func (s *PeerCache) concurrentRestore(req *sim.Request, cached []int64, hashes [
 		if !s.nativeRestoreAdmission && len(pages) == max(1, s.fabric.mechanisms.RestoreWindow) {
 			break
 		}
-		e, a := s.find(h)
+		e, a := s.findForRestore(req.ID, h, req.PrefillTokens())
 		if e == nil {
 			break
 		}
-		if s.restoring[h] {
+		if s.restoring[s.restoreIdentity(req.ID, h)] {
 			// Join the existing physical load by retrying its published prefix.
 			// Do not duplicate its target allocation or increment its read count.
 			s.waiting[req.ID] = true

@@ -75,6 +75,13 @@ func (s *PeerCache) restoreHashes(req *sim.Request) []string {
 // the lookup cannot reserve HBM or trigger a victim. Loads and already-running
 // requests retain their own admission/ownership paths.
 func (s *PeerCache) observeRestoreLookup(req *sim.Request, cached []int64) (known bool, readyBlocks int64, deferred bool) {
+	if s.fabric.hostChunks != nil {
+		lookup := s.fabric.hostChunks.lookups[req.ID]
+		if lookup == nil || lookup.admitted {
+			return false, 0, false
+		}
+		return true, max(0, int64(len(lookup.prefix))*s.fabric.hostChunks.blocks-int64(len(cached))), false
+	}
 	if !s.restoreControl || len(s.RequestMap[req.ID]) > 0 || s.readPending[req.ID] > 0 {
 		return false, 0, false
 	}
@@ -83,9 +90,15 @@ func (s *PeerCache) observeRestoreLookup(req *sim.Request, cached []int64) (know
 		return true, 0, false
 	}
 	for _, key := range keys[len(cached):] {
-		if ready, _ := s.find(key); ready != nil {
+		if ready, _ := s.findForInput(req.ID, key, req.PrefillTokens()); ready != nil {
 			readyBlocks++
 			continue
+		}
+		if s.fabric.hostChunks != nil {
+			// LMCache reserve_read rejects a write-locked object. With peer
+			// DRAM/CXL and no further backend that is a miss, not the older
+			// native CPU offload connector's HIT_PENDING wait contract.
+			break
 		}
 		for _, access := range s.access {
 			if entry := s.fabric.pools[access.Pool].entries[key]; entry != nil && !entry.ready {
@@ -122,8 +135,19 @@ func (s *PeerCache) localPrefix(id string, inputTokens int64, keys []string) sim
 	}
 	end = min(end, int64(len(keys)))
 	var blocks []int64
+	owned := map[string]int64{}
+	if s.fabric.hostChunks != nil {
+		for _, bid := range s.holds[id] {
+			if key, ready := s.ready[bid]; ready {
+				owned[key] = bid
+			}
+		}
+	}
 	for _, key := range keys[:end] {
 		bid, ok := s.lookup[key]
+		if held, exists := owned[key]; exists {
+			bid, ok = held, true
+		}
 		if !ok {
 			break
 		}
@@ -136,7 +160,7 @@ func (s *PeerCache) GetRequestCachedPrefix(req *sim.Request) sim.CachedPrefix {
 	if s.batchPrefixes != nil && s.batchPrefixes.planning {
 		return s.batchCachedPrefix(req)
 	}
-	if !s.restoreControl {
+	if !s.restoreControl && s.fabric.hostChunks == nil {
 		blocks := s.GetCachedBlocks(req.FullInputTokens())
 		return sim.CachedPrefix{Blocks: blocks, Tokens: int64(len(blocks)) * s.BlockSizeTokens}
 	}

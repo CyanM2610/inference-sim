@@ -69,7 +69,7 @@ func (f *PeerFabric) ValidateExternalMemory() error {
 }
 
 func (f *PeerFabric) ConfigureExternalTransfers() error {
-	if f.native != nil || f.external != nil || f.serial != 0 || len(f.stores) != 1 || len(f.pools) != 1 || f.pools["dram"] == nil || f.bytes != 917504 || f.stores[0].BlockSizeTokens != 16 {
+	if f.hostChunks != nil || f.native != nil || f.external != nil || f.serial != 0 || len(f.stores) != 1 || len(f.pools) != 1 || f.pools["dram"] == nil || f.bytes != 917504 || f.stores[0].BlockSizeTokens != 16 {
 		return fmt.Errorf("external transfers require one idle native-shaped cache and DRAM pool")
 	}
 	if f.mechanisms.DirectoryUS != 0 || f.mechanisms.CompletionUS != 0 || f.mechanisms.PolicyUS != 0 {

@@ -8,7 +8,7 @@ import (
 )
 
 // Observed on installed vLLM 5e7136e30027 with its real scheduler, allocator
-// and CPU manager. Evidence: experiment/[2026.09.18]restore-liveness/native-cpu-v2.
+// and CPU manager. Evidence: experiment/[2026.09.18] 原生KV恢复准入停滞修复与实机验证/native-cpu-v2.
 // The second case exceeds both the old 32-block window and 48-block profile.
 func TestNativeRestoreAdmissionMatchesServerAllocation(t *testing.T) {
 	for _, c := range []struct{ capacity, a, b, loaded, free, reserved int64 }{

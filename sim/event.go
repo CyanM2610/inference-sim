@@ -169,6 +169,9 @@ func (e *TimeoutEvent) Execute(sim *Simulator) {
 	}
 	wasRunning := e.Request.State == StateRunning
 	e.Request.State = StateTimedOut
+	if sim.nativeAsync != nil {
+		sim.nativeAsync.cancelled(e.Request)
+	}
 	sim.Metrics.TimedOutRequests++
 
 	// Release the adapter pin (cold-load gate, #1466) for a request cancelled while
@@ -177,6 +180,9 @@ func (e *TimeoutEvent) Execute(sim *Simulator) {
 	sim.releaseAdapterPin(e.Request)
 
 	// Release KV blocks (safe for zero-block queued requests per BC-15)
+	// Cancellation can enqueue asynchronous END/cleanup. Use this event's
+	// clock, not the last batch or transfer callback's cached KV timestamp.
+	sim.KVCache.SetClock(e.time)
 	sim.KVCache.ReleaseKVBlocks(e.Request)
 
 	// Clean up computed-token tracking for ALL timed-out requests (prevents memory leak).

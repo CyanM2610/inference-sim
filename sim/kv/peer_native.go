@@ -91,7 +91,7 @@ func (s *PeerCache) NativeForward(req string, prefix, query int64) (int64, error
 }
 
 func (f *PeerFabric) ConfigureNative(p *kvruntime.Profile, numa int, sink func(kvruntime.Record)) error {
-	if f.native != nil || f.external != nil || len(f.stores) != 1 || len(f.pools) != 1 || f.pools["dram"] == nil || f.bytes != 917504 || f.stores[0].BlockSizeTokens != 16 || f.active != 0 || f.serial != 0 {
+	if f.hostChunks != nil || f.native != nil || f.external != nil || len(f.stores) != 1 || len(f.pools) != 1 || f.pools["dram"] == nil || f.bytes != 917504 || f.stores[0].BlockSizeTokens != 16 || f.active != 0 || f.serial != 0 {
 		return fmt.Errorf("native backend requires one idle 7B-GQA instance, 16-token blocks and one DRAM pool")
 	}
 	if f.mechanisms.CompletionUS != 0 {

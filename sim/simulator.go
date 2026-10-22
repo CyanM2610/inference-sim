@@ -113,6 +113,7 @@ type Simulator struct {
 	Metrics               *Metrics
 	EventObserver         func(Event, bool) // before/after execution; observation only
 	batchCompletionEvents bool
+	nativeAsync           *nativeAsyncRuntime
 	// max number of requests RunningBatch can hold
 	maxNumSeqs int64
 	// max total number of new tokens across all requests in RunningBatch
@@ -333,11 +334,17 @@ func (sim *Simulator) ProcessNextEvent() Event {
 	}
 
 	sim.Clock = ev.Timestamp()
+	if sim.nativeAsync != nil {
+		sim.nativeAsync.account(sim.Clock)
+	}
 	logrus.Debugf("[tick %07d] Executing %T", sim.Clock, ev)
 	if sim.EventObserver != nil {
 		sim.EventObserver(ev, true)
 	}
 	ev.Execute(sim)
+	if sim.nativeAsync != nil {
+		sim.nativeAsync.account(sim.Clock)
+	}
 	sim.refreshDecisionTimer(sim.Clock)
 	if sim.EventObserver != nil {
 		sim.EventObserver(ev, false)
@@ -514,6 +521,9 @@ func (sim *Simulator) SimHorizon() int64 { return sim.Horizon }
 func (sim *Simulator) ScheduleStepIfIdle(time int64) {
 	work := sim.WaitQ.Len() > 0 || sim.pendingRegistrations() ||
 		(sim.decision != nil && (sim.decision.prefillWaits || sim.decision.prefillDeferrals) && sim.RunningBatch != nil && len(sim.RunningBatch.Requests) > 0)
+	if sim.nativeAsync != nil {
+		work = work || sim.nativeAsync.store.NativeControlPending()
+	}
 	if sim.postStep != nil && sim.postStep.active {
 		sim.postStep.revisit = sim.postStep.revisit || work
 		return
@@ -846,6 +856,10 @@ func (sim *Simulator) recordRequestCompletion(req *Request) {
 // sim.stepEvent here prevents future QueuedEvent INV-8 guards from seeing a stale
 // non-nil pointer and skipping their step-scheduling.
 func (sim *Simulator) Step(now int64) {
+	if sim.nativeAsync != nil {
+		sim.nativeAsync.step(now)
+		return
+	}
 	if sim.postStep != nil && sim.postStep.active {
 		return
 	}
