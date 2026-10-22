@@ -6,8 +6,9 @@ import (
 )
 
 type DecisionPolicyConfig struct {
-	QueueOrder      string `json:"queue_order,omitempty"`
-	PrefillTokenCap int64  `json:"prefill_token_cap,omitempty"`
+	QueueOrder      string                  `json:"queue_order,omitempty"`
+	PrefillTokenCap int64                   `json:"prefill_token_cap,omitempty"`
+	ExtraCost       *sim.LinearDecisionCost `json:"extra_cost,omitempty"`
 }
 
 // decisionAdapter retains the existing queue observation at the same boundary

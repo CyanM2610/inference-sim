@@ -1,8 +1,6 @@
 package sim
 
 import (
-	"sort"
-
 	"github.com/sirupsen/logrus"
 
 	"github.com/inference-sim/inference-sim/sim/internal/util"
@@ -33,9 +31,6 @@ type BatchContext struct {
 	Now                   int64
 	StepCount             int
 	ComputedTokens        map[string]int64
-	// TokenLimits are validated positive per-request upper bounds supplied by
-	// the decision runtime. Missing entries preserve native chunk/decode rules.
-	TokenLimits map[string]int64
 
 	// AdapterResident is the cold-load pre-admission gate predicate (#1466): it
 	// reports whether a request's LoRA adapter is currently resident on the
@@ -56,13 +51,6 @@ type BatchContext struct {
 	// a per-step execution read of OutputTokens that INV-9 permits here, not a
 	// servability decision.
 	DecodeTokensPerStep func(req *Request) int64
-}
-
-func (ctx BatchContext) limitTokens(id string, tokens int64) int64 {
-	if limit, ok := ctx.TokenLimits[id]; ok {
-		return min(tokens, limit)
-	}
-	return tokens
 }
 
 // ScheduledRequest carries metadata about a newly scheduled request.
@@ -173,7 +161,6 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 				numNewTokens = min(numNewTokens, maxAllowed)
 			}
 
-			numNewTokens = ctx.limitTokens(req.ID, numNewTokens)
 			canSchedule, adj := v.preemptForTokens(req, numNewTokens, &result, ctx, &tokenBudget, reqIndex)
 			reqIndex -= adj
 			if !canSchedule {
@@ -213,7 +200,6 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 			if ctx.MaxModelLen > 0 {
 				decodeTokens = min(decodeTokens, max(ctx.MaxModelLen-1-req.ProgressIndex, 0))
 			}
-			decodeTokens = ctx.limitTokens(req.ID, decodeTokens)
 			if decodeTokens > 0 {
 				canSchedule, adj := v.preemptForTokens(req, decodeTokens, &result, ctx, &tokenBudget, reqIndex)
 				reqIndex -= adj
@@ -244,19 +230,6 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 			for _, id := range ids {
 				deferredSet[id] = true
 			}
-		}
-	}
-	if d, ok := ctx.KVCache.(DeferredAdmissionStore); ok {
-		if ids := d.ReadyDeferredRequests(); len(ids) > 0 {
-			ready := make(map[string]bool, len(ids))
-			for _, id := range ids {
-				ready[id] = true
-			}
-			ctx.WaitQ.Reorder(func(reqs []*Request) {
-				sort.SliceStable(reqs, func(i, j int) bool {
-					return ready[reqs[i].ID] && !ready[reqs[j].ID]
-				})
-			})
 		}
 	}
 
@@ -339,7 +312,6 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 					break
 				}
 			}
-			decodeTokens = ctx.limitTokens(next.ID, decodeTokens)
 			if ok := ctx.KVCache.AllocateKVBlocks(next, next.ProgressIndex, next.ProgressIndex+decodeTokens, nil); !ok {
 				break
 			}
@@ -368,7 +340,6 @@ func (v *VLLMBatchFormation) FormBatch(ctx BatchContext) BatchResult {
 			maxAllowed := max(ctx.MaxModelLen-1-startIndex, 0)
 			numNewTokens = min(numNewTokens, maxAllowed)
 		}
-		numNewTokens = ctx.limitTokens(next.ID, numNewTokens)
 		endIndex := startIndex + numNewTokens
 
 		if ok := ctx.KVCache.AllocateKVBlocks(next, startIndex, endIndex, cachedBlocks); !ok {

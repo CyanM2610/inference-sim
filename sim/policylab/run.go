@@ -106,6 +106,11 @@ type Result struct {
 
 func (c Config) Validate() error {
 	if c.DecisionPolicy != nil {
+		if c.DecisionPolicy.ExtraCost != nil {
+			if err := c.DecisionPolicy.ExtraCost.Validate(); err != nil {
+				return err
+			}
+		}
 		if c.DecisionPolicy.PrefillTokenCap > c.MaxBatchTokens {
 			return fmt.Errorf("decision prefill cap exceeds batch token limit")
 		}
@@ -439,6 +444,13 @@ func run(c Config, decisionFactory func(string) sim.DecisionPolicy) (*Result, er
 				panic(e)
 			}
 			out.DecisionCostCoverage = "host_measured_sim_time_uncalibrated"
+			if c.DecisionPolicy.ExtraCost != nil {
+				model := *c.DecisionPolicy.ExtraCost
+				if e := inst.SetDecisionCostModel(model); e != nil {
+					panic(e)
+				}
+				out.DecisionCostCoverage = sim.ExplicitDecisionCostCoverage
+			}
 		} else if c.RequestScheduler != "" {
 			deadlines := make(map[string]int64)
 			for _, r := range c.Requests {

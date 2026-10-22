@@ -107,6 +107,7 @@ type DecisionUnselected struct {
 }
 type DecisionFeedback struct {
 	Version    uint64               `json:"version"`
+	AtUS       int64                `json:"at_us"`
 	Status     string               `json:"status"`
 	Reason     string               `json:"reason,omitempty"`
 	Grants     []DecisionGrant      `json:"grants,omitempty"`
@@ -122,6 +123,7 @@ type DecisionRecord struct {
 	FeedbackWallNS int64            `json:"feedback_wall_ns"`
 	RuntimeWallNS  int64            `json:"runtime_wall_ns"`
 	CostCoverage   string           `json:"cost_coverage"`
+	Service        *DecisionService `json:"service,omitempty"`
 }
 type DecisionPolicy interface {
 	Decide(DecisionView) DecisionPlan
@@ -131,6 +133,8 @@ type decisionRuntime struct {
 	policy  DecisionPolicy
 	observe func(DecisionRecord)
 	record  DecisionRecord
+	cost    DecisionCostModel
+	pending *DecisionCompleteEvent
 }
 
 func (s *Simulator) SetDecisionPolicy(policy DecisionPolicy, observe func(DecisionRecord)) error {
@@ -246,6 +250,38 @@ func (s *Simulator) prepareDecision(now int64) map[string]int64 {
 		s.deliverDecision(DecisionFeedback{Version: view.Version, Status: "rejected", Reason: err.Error()})
 		panic(err) // malformed policy is a run failure, never a silent fallback
 	}
+	if d.cost != nil {
+		cost, err := d.cost.Estimate(cloneDecisionView(view), cloneDecisionPlan(plan))
+		if err == nil {
+			err = cost.validate(now)
+		}
+		if err != nil {
+			d.record.RuntimeWallNS = time.Since(runtimeStart).Nanoseconds()
+			s.deliverDecision(DecisionFeedback{Version: view.Version, Status: "rejected", Reason: err.Error()})
+			panic(err)
+		}
+		d.record.Service = &DecisionService{StartUS: now, EndUS: now + cost.ExtraUS, ExtraUS: cost.ExtraUS, Provenance: cost.Provenance}
+		d.record.CostCoverage = ExplicitDecisionCostCoverage
+		if cost.ExtraUS > 0 {
+			ev := &DecisionCompleteEvent{At: now + cost.ExtraUS, waiting: append([]*Request(nil), s.WaitQ.Items()...)}
+			if s.RunningBatch != nil {
+				ev.running = append([]*Request(nil), s.RunningBatch.Requests...)
+			}
+			d.pending = ev
+			s.stepEvent = ev
+			s.Schedule(ev)
+			d.record.RuntimeWallNS = time.Since(runtimeStart).Nanoseconds()
+			return nil
+		}
+	}
+	d.record.RuntimeWallNS = time.Since(runtimeStart).Nanoseconds()
+	return s.applyDecisionPlan()
+}
+
+func (s *Simulator) applyDecisionPlan() map[string]int64 {
+	d := s.decision
+	start := time.Now()
+	plan := d.record.Plan
 	if plan.QueueOrder != nil {
 		rank := map[string]int{}
 		for i, id := range plan.QueueOrder {
@@ -259,7 +295,7 @@ func (s *Simulator) prepareDecision(now int64) map[string]int64 {
 	for _, cap := range plan.TokenCaps {
 		caps[cap.Request] = cap.Tokens
 	}
-	d.record.RuntimeWallNS = time.Since(runtimeStart).Nanoseconds()
+	d.record.RuntimeWallNS += time.Since(start).Nanoseconds()
 	return caps
 }
 func (s *Simulator) finishDecision(result BatchResult) {
@@ -279,7 +315,7 @@ func (s *Simulator) finishDecision(result BatchResult) {
 	for _, r := range result.Preempted {
 		preempted[r.Request.ID] = true
 	}
-	for _, r := range s.decisionView(d.record.View.NowUS).KV.Requests {
+	for _, r := range s.decisionView(s.decisionAppliedAt()).KV.Requests {
 		pending[r.ID] = r.TransferPending || r.Deferred
 	}
 	for _, r := range append(append([]DecisionRequest(nil), d.record.View.Running...), d.record.View.Waiting...) {
@@ -300,6 +336,7 @@ func (s *Simulator) finishDecision(result BatchResult) {
 }
 func (s *Simulator) deliverDecision(f DecisionFeedback) {
 	d := s.decision
+	f.AtUS = s.decisionAppliedAt()
 	d.record.Feedback = f
 	start := time.Now()
 	d.policy.Observe(cloneDecisionFeedback(f))
@@ -308,4 +345,11 @@ func (s *Simulator) deliverDecision(f DecisionFeedback) {
 	if d.observe != nil {
 		d.observe(d.record)
 	}
+}
+
+func (s *Simulator) decisionAppliedAt() int64 {
+	if service := s.decision.record.Service; service != nil {
+		return service.EndUS
+	}
+	return s.decision.record.View.NowUS
 }
