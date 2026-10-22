@@ -30,7 +30,7 @@ func TestNativePhasePromotionRunsWithoutRequestsAndPublishesAfterReceipt(t *test
 		t.Fatal(err)
 	}
 	h.records = nil
-	programs, consumed := 0, 0
+	programs, consumed, pendingPolls, receiptPolls := 0, 0, 0, 0
 	cuda, reply, published := int64(-1), int64(-1), int64(-1)
 	e.EventObserver = func(event sim.Event, before bool) {
 		x, ok := event.(*sim.NativeAsyncEvent)
@@ -41,6 +41,21 @@ func TestNativePhasePromotionRunsWithoutRequestsAndPublishesAfterReceipt(t *test
 			programs++
 			if len(x.Shape) != 0 {
 				t.Fatal("promotion fabricated model computation")
+			}
+		}
+		if x.QueueDepth > 2 {
+			t.Fatal("control polling exceeded native output queue depth")
+		}
+		if x.Name == "native_phase_end" && x.Phase == "poll" && reply < 0 {
+			pendingPolls++
+			if !s.NativeControlPending() {
+				t.Fatal("in-flight promotion lost native scheduler keepalive")
+			}
+		}
+		if x.Name == "native_phase_end" && x.Phase == "poll" && reply >= 0 && len(s.GetCachedBlocks(input)) == 0 {
+			receiptPolls++
+			if !s.NativeControlPending() {
+				t.Fatal("claimed receipt lost keepalive before FIFO adoption")
 			}
 		}
 		if x.Name == "native_transfer_plan" {
@@ -70,12 +85,89 @@ func TestNativePhasePromotionRunsWithoutRequestsAndPublishesAfterReceipt(t *test
 	}
 	s.SchedulePromotion(0, input, 3)
 	e.Run()
-	if cuda < 0 || reply <= cuda || published <= reply || programs != 2 || consumed != 2 {
-		t.Fatal("promotion control did not wake, drain, or avoid polling spin", cuda, reply, published, programs, consumed)
+	if cuda < 0 || reply <= cuda || published <= reply || pendingPolls < 2 || receiptPolls < 1 || programs != consumed {
+		t.Fatal("promotion did not keep polling through physical/model completion and FIFO adoption", cuda, reply, published, programs, consumed, pendingPolls)
 	}
 	if e.Metrics.CompletedRequests != 0 || e.Metrics.TotalOutputTokens != 0 || s.nativeScheduledStep != 0 ||
-		s.fabric.Pending() != 0 || s.UsedBlocks() != 0 || s.PeerSnapshot()["pending_reads"] != 0 {
+		s.fabric.Pending() != 0 || s.UsedBlocks() != 0 || s.NativeControlPending() || s.PeerSnapshot()["pending_reads"] != 0 {
 		t.Fatal("promotion fabricated request work or retained ownership", s.PeerSnapshot())
+	}
+}
+
+// Native request LOOKUP/LOAD owns its own destination until control receipt
+// adoption has actually published the Promotion. Do not silently coalesce the
+// new request with a speculative, still-unpublished target or free its copy.
+func TestNativePhaseForegroundUsesIndependentTargetsUntilPromotionAdoption(t *testing.T) {
+	for _, arrival := range []string{"submitted", "cuda_complete", "reply_before_adoption"} {
+		t.Run(arrival, func(t *testing.T) {
+			h, s := hostChunkHarness(t, 2, 4)
+			input := []sim.TokenID{1, 2, 3, 4, 5}
+			if err := s.ConfigureNativeHostGeometry(1, 64<<20); err != nil {
+				t.Fatal(err)
+			}
+			seedPeer(t, s, "seed", input)
+			drainHost(t, h, s)
+			for _, b := range s.Blocks {
+				if b.Hash != "" {
+					s.invalidate(b)
+				}
+			}
+			e, err := sim.NewSimulator(sim.SimConfig{Horizon: 100000, Seed: 1, BatchCompletionEvents: true,
+				KVCacheConfig: sim.KVCacheConfig{TotalKVBlocks: 24, BlockSizeTokens: 2},
+				BatchConfig:   sim.BatchConfig{MaxNumSeqs: 2, MaxNumBatchedTokens: 16}}, s, nativeTestCost{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = e.EnableNativeAsync(2, nativePageAccessCost{}); err != nil {
+				t.Fatal(err)
+			}
+			h.records = nil
+			request := &sim.Request{ID: "overlap", InputTokens: input, OutputTokens: []sim.TokenID{9}, MaxOutputLen: 1}
+			injected := false
+			e.EventObserver = func(event sim.Event, before bool) {
+				x, ok := event.(*sim.NativeAsyncEvent)
+				if !ok || before || injected {
+					return
+				}
+				trigger := arrival == "submitted" && x.Name == "native_transfer_plan" ||
+					arrival == "cuda_complete" && x.Name == "native_phase_end" && strings.HasSuffix(x.Phase, "/copy") ||
+					arrival == "reply_before_adoption" && x.Name == "native_phase_end" && strings.HasSuffix(x.Phase, "/reply")
+				if trigger {
+					if !s.NativeControlPending() || len(s.GetCachedBlocks(input)) != 0 {
+						t.Fatal("foreground fixture did not arrive during unpublished control ownership")
+					}
+					request.ArrivalTime = x.At
+					injected = true
+					e.InjectArrival(request)
+				}
+			}
+			s.SchedulePromotion(0, input, 2)
+			e.Run()
+			loads := map[string]PeerRecord{}
+			for _, row := range h.records {
+				if row.Name == "transfer_start" && row.Destination == "hbm" {
+					if _, duplicate := loads[row.Request]; duplicate {
+						t.Fatal("unexpected duplicate LOAD", row)
+					}
+					loads[row.Request] = row
+				}
+			}
+			promotion, foreground := loads["@promotion"], loads[request.ID]
+			if !injected || len(loads) != 2 || len(promotion.HBMBlocks) != 2 || len(foreground.HBMBlocks) != 2 {
+				t.Fatal("unpublished promotion incorrectly replaced an independent demand LOAD", loads)
+			}
+			for _, a := range promotion.HBMBlocks {
+				for _, b := range foreground.HBMBlocks {
+					if a == b {
+						t.Fatal("concurrent controls borrowed the same target", a)
+					}
+				}
+			}
+			if request.State != sim.StateCompleted || request.EmittedTokens() != 1 || s.NativeControlPending() ||
+				s.fabric.Pending() != 0 || s.UsedBlocks() != 0 || s.nativeBatchPins != 0 || len(s.restoring) != 0 {
+				t.Fatal("overlapping control/request did not complete and drain", s.PeerSnapshot())
+			}
+		})
 	}
 }
 

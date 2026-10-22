@@ -3,6 +3,7 @@ package kv
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/inference-sim/inference-sim/sim"
 )
@@ -13,9 +14,22 @@ func (s *PeerCache) NativeRequiresKVDelivery() bool { return true }
 
 // Promotion is an explicit connector-control extension. Ordinary request
 // scheduling stays native; idle control iterations pay the same empty worker
-// plan and host schedule/consume services. In-flight copies do not cause spin.
+// plan and positive host schedule/consume services. The native connector keeps
+// polling throughout transfer and receipt adoption, including after a worker
+// has claimed the receipt but before FIFO consumption publishes the target.
 func (s *PeerCache) NativeControlPending() bool {
-	return s.nativePhaseTransfers && (len(s.nativePromotionPrepared) > 0 || len(s.nativePromotionReceipts) > 0)
+	if !s.nativePhaseTransfers {
+		return false
+	}
+	// This ownership already spans reservation through adoption. Prepared and
+	// receipt queues alone miss both the copy and claimed-receipt intervals.
+	prefix := s.restoreIdentity("@promotion", "")
+	for identity := range s.restoring {
+		if strings.HasPrefix(identity, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // Native BlockPool.free_blocks preserves reusable cached pages at the tail,
