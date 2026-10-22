@@ -40,16 +40,21 @@ type nativeAsyncRuntime struct {
 // NativeAsyncEvent exposes actual runtime transitions, never trace-forced times.
 // Shape is a submission snapshot, so later formation cannot rewrite past work.
 type NativeAsyncEvent struct {
-	At         int64                `json:"time_us"`
-	Name       string               `json:"name"`
-	BatchID    int64                `json:"batch_id"`
-	Shape      []NativeBatchShape   `json:"shape,omitempty"`
-	QueueDepth int                  `json:"queue_depth"`
-	Phase      string               `json:"phase,omitempty"`
-	Resource   string               `json:"resource,omitempty"`
-	DurationUS int64                `json:"duration_us,omitempty"`
-	Execution  *NativeExecutionPlan `json:"execution,omitempty"`
-	run        func()
+	At            int64                `json:"time_us"`
+	Name          string               `json:"name"`
+	BatchID       int64                `json:"batch_id"`
+	Shape         []NativeBatchShape   `json:"shape,omitempty"`
+	QueueDepth    int                  `json:"queue_depth"`
+	Phase         string               `json:"phase,omitempty"`
+	Resource      string               `json:"resource,omitempty"`
+	DurationUS    int64                `json:"duration_us,omitempty"`
+	Execution     *NativeExecutionPlan `json:"execution,omitempty"`
+	Transaction   int64                `json:"transaction,omitempty"`
+	Transfer      *NativeTransferPlan  `json:"transfer,omitempty"`
+	TransferShape *NativeTransferShape `json:"transfer_shape,omitempty"`
+	ProducerBatch int64                `json:"producer_batch,omitempty"`
+	ProducerPhase string               `json:"producer_phase,omitempty"`
+	run           func()
 }
 
 func (e *NativeAsyncEvent) Timestamp() int64 { return e.At }

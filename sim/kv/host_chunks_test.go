@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -90,6 +91,9 @@ func TestHostChunksDivergentSuffixHasNoFalsePrefixHit(t *testing.T) {
 
 func TestHostChunkPartialRestorePaysWholeObjectAndPinsIt(t *testing.T) {
 	h, s := hostChunkHarness(t, 2, 2)
+	if err := s.ConfigureNativeHostGeometry(1, 64<<20); err != nil {
+		t.Fatal(err)
+	}
 	input := []sim.TokenID{1, 2, 3, 4, 5}
 	seedPeer(t, s, "seed", input)
 	drainHost(t, h, s)
@@ -109,6 +113,19 @@ func TestHostChunkPartialRestorePaysWholeObjectAndPinsIt(t *testing.T) {
 	if load == nil || load.Bytes != 200 || load.EffectiveBytes != 100 || len(load.HostObjects) != 1 || load.HostChunkBlocks != 2 {
 		t.Fatal("partial suffix did not pay whole chunk", load)
 	}
+	if len(load.NativeObjects) != 1 || load.NativeObjects[0].StagingBytes != 200 || load.NativeObjects[0].KernelBytes != 100 ||
+		load.NativeObjects[0].SkipTokens != 2 || len(load.NativeObjects[0].HBMBlocks) != 1 {
+		t.Fatal("incorrect native suffix geometry", load.NativeObjects)
+	}
+	for _, record := range h.records {
+		if record.Name == "transfer_end" && record.Source == "hbm" {
+			for _, object := range record.NativeObjects {
+				if len(object.HBMBlocks) != 2 {
+					t.Fatal("STORE lost captured source geometry", object)
+				}
+			}
+		}
+	}
 	for _, object := range h.f.hostChunks.objects {
 		if object.evictable() {
 			t.Fatal("read pin did not protect complete object")
@@ -122,6 +139,36 @@ func TestHostChunkPartialRestorePaysWholeObjectAndPinsIt(t *testing.T) {
 	assertPeerConservation(t, s)
 	if s.UsedBlocks() != 0 || h.f.Snapshot()["dram"]["read_pins"] != 0 {
 		t.Fatal("restore ownership leaked")
+	}
+}
+
+func TestNativeHostGeometryFirstFitSlotsAndRegistrationSegments(t *testing.T) {
+	h, s := hostChunkHarness(t, 2, 10)
+	h.f.bytes = 7 << 20 // two HBM blocks form the real 14 MiB dense host object
+	if err := s.ConfigureNativeHostGeometry(4096, 64<<20); err != nil {
+		t.Fatal(err)
+	}
+	var copies []sim.NativeTransferObject
+	for i := 0; i < 7; i++ {
+		base := sim.TokenID(10 * i)
+		seedPeer(t, s, fmt.Sprintf("slot-%d", i), []sim.TokenID{base + 1, base + 2, base + 3, base + 4, base + 5})
+		drainHost(t, h, s)
+	}
+	for _, r := range h.records {
+		if r.Name == "transfer_start" {
+			copies = append(copies, r.NativeObjects...)
+		}
+	}
+	if len(copies) != 7 {
+		t.Fatal("missing host geometry", len(copies))
+	}
+	boundary, reused := copies[5], copies[6]
+	if boundary.Pool != "cxl" || boundary.HostOffset != 56<<20 || len(boundary.Segments) != 2 ||
+		boundary.Segments[0].Bytes != 8<<20 || boundary.Segments[1].Bytes != 6<<20 || boundary.Segments[1].HostOffset != 64<<20 {
+		t.Fatal("registered-region boundary was not preserved", boundary)
+	}
+	if reused.Pool != "cxl" || reused.HostOffset != 0 {
+		t.Fatal("first-fit did not reuse the released lowest slot", reused)
 	}
 }
 

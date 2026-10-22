@@ -385,8 +385,10 @@ func (s *PeerCache) storeReservedCopy(b *KVBlock, pool, req string, retain bool,
 		return true
 	}
 	var sourceBlocks []int64
-	if leased {
+	if leased || s.fabric.hostChunks != nil && s.fabric.hostChunks.segmentBytes > 0 {
 		sourceBlocks = []int64{b.ID}
+	}
+	if leased {
 		s.emit("source_lease", req, h, "hbm", pool, "store")
 	} else {
 		s.pin(b)
@@ -549,7 +551,11 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 			s.emit("promotion_cancelled", req, h, a.Pool, "hbm", "foreground_arrival")
 		}
 	}
-	s.fabric.submit(s.clock, &peerJob{hostObject: e.object, nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.hbmBuffer(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
+	var targetIDs []int64
+	if b != nil {
+		targetIDs = []int64{b.ID}
+	} // legacy dispatch-time reservation has no target yet
+	s.fabric.submit(s.clock, &peerJob{hostObject: e.object, nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.hbmBuffer(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, HBMBlocks: targetIDs, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
 		s.clock = now
 		delete(s.pendingTargets, b.ID)
 		b.Hash = h

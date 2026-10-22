@@ -41,6 +41,7 @@ type PeerRecord struct {
 	Bytes           int64                       `json:"bytes,omitempty"`
 	EffectiveBytes  int64                       `json:"effective_bytes,omitempty"`
 	HostObjects     []string                    `json:"host_objects,omitempty"`
+	NativeObjects   []sim.NativeTransferObject  `json:"native_objects,omitempty"`
 	HostChunkBlocks int64                       `json:"host_chunk_blocks,omitempty"`
 	Duration        int64                       `json:"duration_us,omitempty"`
 	Reason          string                      `json:"reason,omitempty"`

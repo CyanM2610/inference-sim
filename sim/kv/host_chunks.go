@@ -88,6 +88,7 @@ func (p OrderedHostPlacement) Place(v HostPlacementView) HostPlacementPlan {
 
 type hostObject struct {
 	key, pool     string
+	slot          int64
 	entries       []*peerEntry
 	lookupReaders int64
 	transferRefs  int64
@@ -123,6 +124,25 @@ type hostChunkState struct {
 	inputs       map[string]hostInputIndex
 	lookups      map[string]*hostLookup
 	ended        map[string]bool
+	segmentBytes int64
+}
+
+// ConfigureNativeHostGeometry binds the native registration granularity. The
+// current dense equal-object adapter requires no padding; variable-size objects
+// or unaligned object layouts need a byte arena rather than hidden overcommit.
+func (s *PeerCache) ConfigureNativeHostGeometry(alignment, segmentBytes int64) error {
+	h := s.fabric.hostChunks
+	if h == nil || len(h.objects) != 0 || s.fabric.serial != 0 || alignment <= 0 || alignment&(alignment-1) != 0 || segmentBytes <= 0 ||
+		h.blocks*s.fabric.bytes%alignment != 0 {
+		return fmt.Errorf("native host geometry requires unused aligned equal-sized chunks")
+	}
+	for _, p := range s.fabric.pools {
+		if p.config.CapacityBlocks > math.MaxInt64/s.fabric.bytes || p.config.CapacityBlocks*s.fabric.bytes%alignment != 0 {
+			return fmt.Errorf("host pool bytes overflow or violate alignment")
+		}
+	}
+	h.segmentBytes = segmentBytes
+	return nil
 }
 
 type hostInputMember struct {
@@ -279,6 +299,17 @@ func (s *PeerCache) reserveHostChunks(chunks [][]*KVBlock, protected map[string]
 	var reserved []*hostObject
 	for i, chunk := range chunks {
 		object := &hostObject{key: incoming[i], pool: plan.Destinations[i]}
+		// Native AddressManager is first-fit in address order. For one fixed,
+		// aligned object size this is exactly the lowest unoccupied slot.
+		occupied := map[int64]bool{}
+		for _, live := range h.objects {
+			if live.pool == object.pool {
+				occupied[live.slot] = true
+			}
+		}
+		for occupied[object.slot] {
+			object.slot++
+		}
 		for j, b := range chunk {
 			e := &peerEntry{hash: b.Hash, tokens: append([]sim.TokenID(nil), b.Tokens...), last: s.clock, object: object}
 			object.entries = append(object.entries, e)
@@ -295,8 +326,10 @@ func (s *PeerCache) storeHostChunks(req *sim.Request) bool {
 	return s.storeHostChunksFrom(req, s.RequestMap[req.ID], 0, min(req.ProgressIndex, req.PrefillEnd()), true)
 }
 
-// Captured native work may finish after the request's current allocation has
-// changed. Explicit IDs and a computed/known boundary prevent reading new pages.
+// Captured native work may finish after the request's allocation has changed.
+// Explicit IDs and a schedule-known range prevent reading new pages. A native
+// phased STORE can reserve host space before compute finishes; its physical copy
+// must then wait on the producer fence. Legacy calls require already-ready data.
 func (s *PeerCache) storeHostChunksFrom(req *sim.Request, ids []int64, startToken, computedEnd int64, requireReady bool) bool {
 	f := s.fabric
 	h := f.hostChunks
@@ -411,11 +444,15 @@ func (f *PeerFabric) accountHostTransfer(group *peerJob, members []*peerJob) {
 		return
 	}
 	objects := map[*hostObject]bool{}
+	var ordered []*hostObject
 	for _, member := range members {
 		if member.hostObject == nil {
 			panic("host transfer lacks a reserved immutable object")
 		}
-		objects[member.hostObject] = true
+		if !objects[member.hostObject] {
+			ordered = append(ordered, member.hostObject)
+			objects[member.hostObject] = true
+		}
 	}
 	group.units = int64(len(objects)) * f.hostChunks.blocks
 	group.record.EffectiveBytes = int64(len(members)) * f.bytes
@@ -424,6 +461,35 @@ func (f *PeerFabric) accountHostTransfer(group *peerJob, members []*peerJob) {
 		group.record.HostObjects = append(group.record.HostObjects, object.key)
 	}
 	sort.Strings(group.record.HostObjects)
+	if f.hostChunks.segmentBytes > 0 {
+		group.record.NativeObjects = nil
+		for _, object := range ordered {
+			bytes := f.hostChunks.blocks * f.bytes
+			view := sim.NativeTransferObject{Key: object.key, Pool: object.pool, HostOffset: object.slot * bytes, StagingBytes: bytes}
+			first := len(object.entries)
+			for _, member := range members {
+				if member.hostObject == object {
+					view.KernelBytes += f.bytes
+					view.HBMBlocks = append(view.HBMBlocks, member.record.HBMBlocks...)
+					for i, entry := range object.entries {
+						if entry.hash == member.record.Hash {
+							first = min(first, i)
+						}
+					}
+				}
+			}
+			if group.record.Destination == "hbm" {
+				view.SkipTokens = int64(first) * f.stores[0].BlockSizeTokens
+			}
+			for at, left := view.HostOffset, bytes; left > 0; {
+				size := min(left, f.hostChunks.segmentBytes-at%f.hostChunks.segmentBytes)
+				view.Segments = append(view.Segments, sim.NativeCopySegment{HostOffset: at, Bytes: size})
+				at += size
+				left -= size
+			}
+			group.record.NativeObjects = append(group.record.NativeObjects, view)
+		}
+	}
 }
 
 // hostEntryForInput matches the complete host chunk. Matching a GPU-block

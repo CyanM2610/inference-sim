@@ -53,7 +53,7 @@ func (s *PeerCache) ReserveNativeRange(req *sim.Request, start, end int64, cache
 	}
 	// Native APC registers finalized token hashes at allocate_slots(), before
 	// device completion. Later uses are ordered on the same worker stream; host
-	// STORE still waits for captured DeviceComplete. Unknown placeholders are
+	// A physical STORE waits for the captured producer fence. Unknown placeholders are
 	// not indexed. This differs from the legacy completion-only APC mode.
 	known := min(end, req.InputLen()+req.EmittedTokens())
 	if known < req.InputLen() {
@@ -214,6 +214,37 @@ func (b *nativeCapturedBatch) PostForward(now int64, producer *sim.NativeFence) 
 		s.fabric.emit(j.record)
 		f := s.fabric
 		f.nativeInFlight++
+		if s.nativeExecutor.HasTransferModel() {
+			if len(j.record.NativeObjects) == 0 {
+				panic("native staged transfer requires explicit host geometry")
+			}
+			direction := "store"
+			if j.record.Destination == "hbm" {
+				direction = "load"
+			}
+			objects := append([]sim.NativeTransferObject(nil), j.record.NativeObjects...)
+			for i := range objects {
+				objects[i].HBMBlocks = append([]int64(nil), objects[i].HBMBlocks...)
+				objects[i].Segments = append([]sim.NativeCopySegment(nil), objects[i].Segments...)
+			}
+			started := int64(-1)
+			s.nativeExecutor.SubmitTransfer(now, j.record.Transaction, sim.NativeTransferShape{Direction: direction, Objects: objects}, producer,
+				func(at int64) { started = at; j.record.Time, j.record.Name = at, "transfer_start"; f.emit(j.record) },
+				func(at int64) {
+					record := j.record
+					record.Time, record.Name, record.Duration = at, "transfer_cuda_complete", at-started
+					f.emit(record)
+				},
+				func(at int64) {
+					f.nativeInFlight--
+					j.record.Time, j.record.Name, j.record.Duration = at, "transfer_end", at-started
+					f.emit(j.record)
+					j.done(at)
+					f.notifyDecisionTransfer(at, j)
+					f.wakeStores(at)
+				})
+			continue
+		}
 		duration := f.durationBytes(j.path, max(1, j.units)*f.bytes)
 		s.nativeExecutor.SubmitService(now, fmt.Sprintf("kv_copy_%d", j.record.Transaction), s.nativeCopyResource, "native-kv-stream", duration, producer,
 			func(at int64) {

@@ -2,7 +2,7 @@ package sim
 
 import "fmt"
 
-// NativeStage describes measured service on one exclusive resource. Stream
+// NativeStage describes predicted service on one exclusive resource. Stream
 // ordering is separate from shared-resource arbitration. After names must refer
 // to earlier stages in the same program; no native absolute timestamps enter it.
 type NativeStage struct {
@@ -11,6 +11,7 @@ type NativeStage struct {
 	Stream     string   `json:"stream,omitempty"`
 	DurationUS int64    `json:"duration_us"`
 	After      []string `json:"after,omitempty"`
+	Delay      bool     `json:"delay,omitempty"`
 }
 
 // NativeExecutionPlan is supplied by the trusted execution model, not a policy.
@@ -53,6 +54,8 @@ type NativeFence struct {
 	ready   bool
 	at      int64
 	waiters []func(int64)
+	batch   int64
+	phase   string
 }
 
 func (f *NativeFence) Ready() bool { return f.ready }
@@ -105,16 +108,16 @@ func newNativeExecutor(n *nativeAsyncRuntime, resources []string) (*NativeExecut
 	return e, nil
 }
 
-func validateNativePlan(p NativeExecutionPlan, resources map[string]bool) error {
+func validateNativeStages(stages []NativeStage, resources map[string]bool) (map[string]map[string]bool, error) {
 	ancestors := map[string]map[string]bool{}
 	streams := map[string]string{}
-	for _, s := range p.Stages {
-		if s.Name == "" || ancestors[s.Name] != nil || s.DurationUS < 0 || s.Resource == "" && s.DurationUS != 0 {
-			return fmt.Errorf("invalid native execution stage %q", s.Name)
+	for _, s := range stages {
+		if s.Name == "" || ancestors[s.Name] != nil || s.DurationUS < 0 || s.Resource == "" && s.DurationUS != 0 && !s.Delay || s.Delay && s.Resource != "" {
+			return nil, fmt.Errorf("invalid native execution stage %q", s.Name)
 		}
 		if s.Resource != "" {
 			if _, ok := resources[s.Resource]; !ok {
-				return fmt.Errorf("unknown native resource %q", s.Resource)
+				return nil, fmt.Errorf("unknown native resource %q", s.Resource)
 			}
 		}
 		parents := append([]string(nil), s.After...)
@@ -124,7 +127,7 @@ func validateNativePlan(p NativeExecutionPlan, resources map[string]bool) error 
 		ancestors[s.Name] = map[string]bool{s.Name: true}
 		for _, dep := range parents {
 			if dep == s.Name || ancestors[dep] == nil {
-				return fmt.Errorf("native stages must be topologically ordered: %s -> %s", dep, s.Name)
+				return nil, fmt.Errorf("native stages must be topologically ordered: %s -> %s", dep, s.Name)
 			}
 			for name := range ancestors[dep] {
 				ancestors[s.Name][name] = true
@@ -133,6 +136,14 @@ func validateNativePlan(p NativeExecutionPlan, resources map[string]bool) error 
 		if s.Stream != "" {
 			streams[s.Stream] = s.Name
 		}
+	}
+	return ancestors, nil
+}
+
+func validateNativePlan(p NativeExecutionPlan, resources map[string]bool) error {
+	ancestors, err := validateNativeStages(p.Stages, resources)
+	if err != nil {
+		return err
 	}
 	for _, name := range []string{p.Computed, p.ProducerReady, p.PostForward, p.Poll, p.HostReturned, p.OutputReady} {
 		if ancestors[name] == nil {
@@ -147,6 +158,71 @@ func validateNativePlan(p NativeExecutionPlan, resources map[string]bool) error 
 	return nil
 }
 
+func (e *NativeExecutor) HasTransferModel() bool { _, ok := e.n.cost.(NativeTransferCost); return ok }
+
+// SubmitTransfer keeps modeled service parallel to physical CUDA work. Stream
+// queues are shared with compute/output programs; a model delay holds no GPU.
+func (e *NativeExecutor) SubmitTransfer(now, transaction int64, shape NativeTransferShape, producer *NativeFence, begin, gpuDone, done func(int64)) {
+	model, ok := e.n.cost.(NativeTransferCost)
+	if !ok || producer == nil || len(shape.Objects) == 0 {
+		panic("native transfer geometry/model missing")
+	}
+	p := model.TransferPlan(shape)
+	ancestors, err := validateNativeStages(p.Stages, e.busy)
+	if err != nil {
+		panic(err)
+	}
+	for _, name := range []string{p.ProducerWait, p.GPUComplete, p.ModelComplete, p.Published} {
+		if ancestors[name] == nil {
+			panic("missing native transfer milestone")
+		}
+	}
+	if !ancestors[p.GPUComplete][p.ProducerWait] || !ancestors[p.Published][p.GPUComplete] || !ancestors[p.Published][p.ModelComplete] {
+		panic("native transfer publication must join CUDA and model")
+	}
+	prefix := fmt.Sprintf("kv_%d/", transaction)
+	fences := map[string]*NativeFence{}
+	for _, spec := range p.Stages {
+		fences[spec.Name] = &NativeFence{}
+	}
+	for _, spec := range p.Stages {
+		j := &nativeStageRun{spec: spec, fence: fences[spec.Name]}
+		j.spec.Name = prefix + spec.Name
+		for _, dep := range spec.After {
+			j.dependencies = append(j.dependencies, fences[dep])
+		}
+		if spec.Name == p.ProducerWait {
+			j.dependencies = append(j.dependencies, producer)
+			j.begin = begin
+		}
+		if spec.Name == p.GPUComplete {
+			j.end = gpuDone
+		}
+		if spec.Name == p.Published {
+			previous := j.end
+			j.end = func(at int64) {
+				if previous != nil {
+					previous(at)
+				}
+				done(at)
+			}
+		}
+		if spec.Stream != "" {
+			if previous := e.streams[spec.Stream]; previous != nil {
+				j.dependencies = append(j.dependencies, previous)
+			}
+			e.streams[spec.Stream] = j.fence
+		}
+		e.jobs = append(e.jobs, j)
+	}
+	record := e.n.event(now, "native_transfer_plan", nil, nil)
+	record.Transaction = transaction
+	record.Transfer = &p
+	record.TransferShape = &shape
+	record.ProducerBatch, record.ProducerPhase = producer.batch, producer.phase
+	e.pump(now)
+}
+
 func (e *NativeExecutor) submit(now int64, b *nativeQueuedBatch, p NativeExecutionPlan, callbacks map[string]func(int64), fences map[string]*NativeFence) {
 	if err := validateNativePlan(p, e.busy); err != nil {
 		panic(err)
@@ -155,6 +231,7 @@ func (e *NativeExecutor) submit(now int64, b *nativeQueuedBatch, p NativeExecuti
 		if fences[spec.Name] == nil {
 			fences[spec.Name] = &NativeFence{}
 		}
+		fences[spec.Name].batch, fences[spec.Name].phase = b.id, spec.Name
 	}
 	for _, spec := range p.Stages {
 		j := &nativeStageRun{spec: spec, batch: b, fence: fences[spec.Name], end: callbacks[spec.Name]}
