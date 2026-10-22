@@ -15,6 +15,9 @@ type DeploymentConfig struct {
 	sim.SimConfig // Embeds all instance-level config (horizon, seed, KV, batch, latency, policy)
 
 	NumInstances int
+	// InstanceFactory injects an experimental KV implementation while retaining
+	// the cluster's routing, shared clock, and native instance simulator.
+	InstanceFactory func(InstanceID, sim.SimConfig) *InstanceSimulator `json:"-" yaml:"-"`
 
 	// Online routing pipeline configuration (PR4+)
 	AdmissionPolicy       string  // "always-admit" (default) or "token-bucket"
