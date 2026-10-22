@@ -285,7 +285,7 @@ func (s *PeerCache) store(b *KVBlock, pool, req string) bool {
 		s.emit("store_join", req, h, "hbm", pool, "deduplicated")
 		return true
 	}
-	s.fabric.submit(s.clock, &peerJob{nativeSource: func() string { return s.fabric.native.hbmID(b.ID) }, nativeDestination: func() string { return e.nativeBuffer }, record: PeerRecord{Instance: s.id, Request: req, Source: "hbm", Destination: pool, Hash: h, Reason: "store"}, path: path, schedule: s.schedule, blockedRequests: func() []string {
+	s.fabric.submit(s.clock, &peerJob{nativeSource: func() string { return s.fabric.hbmBuffer(b.ID) }, nativeDestination: func() string { return e.nativeBuffer }, record: PeerRecord{Instance: s.id, Request: req, Source: "hbm", Destination: pool, Hash: h, Reason: "store"}, path: path, schedule: s.schedule, blockedRequests: func() []string {
 		var ids []string
 		for _, b := range e.blockers {
 			if b.active() {
@@ -398,7 +398,7 @@ func (s *PeerCache) fetch(h, req string, e *peerEntry, a *PeerAccess, protect ma
 			s.emit("promotion_cancelled", req, h, a.Pool, "hbm", "foreground_arrival")
 		}
 	}
-	s.fabric.submit(s.clock, &peerJob{nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.native.hbmID(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
+	s.fabric.submit(s.clock, &peerJob{nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.hbmBuffer(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
 		s.clock = now
 		delete(s.pendingTargets, b.ID)
 		b.Hash = h

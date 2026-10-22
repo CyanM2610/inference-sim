@@ -72,6 +72,7 @@ type peerJob struct {
 	cancel            func(int64)
 }
 type PeerFabric struct {
+	external      *externalPeerRuntime
 	native        *NativePeerRuntime
 	resources     map[string]PeerResource
 	busy          map[string]bool
@@ -213,6 +214,10 @@ func (f *PeerFabric) dispatch(now int64) {
 		}
 		j.record.Time = now
 		j.record.Duration = d
+		if f.external != nil {
+			j.record.Duration = 0
+			j.record.Counters = map[string]int64{"estimated_duration_us": d}
+		}
 		j.record.Name = "transfer_start"
 		if f.mechanisms.TransferPolicy == "dependency_edf" && j.blockedRequests != nil {
 			j.record.Requests = j.blockedRequests()
@@ -229,6 +234,8 @@ func (f *PeerFabric) dispatch(now int64) {
 		f.emit(j.record)
 		if f.native != nil {
 			f.native.submit(now, j)
+		} else if f.external != nil {
+			f.external.submit(j)
 		} else {
 			j.schedule(&peerTransferEvent{at: now + d, fabric: f, job: j})
 		}
@@ -249,6 +256,9 @@ func (e *peerTransferEvent) Execute(_ *sim.Simulator) {
 		f.busy[id] = false
 	}
 	f.active--
+	if f.external != nil {
+		j.record.Duration = e.at - j.record.Time
+	}
 	j.record.Time = e.at
 	j.record.Name = "transfer_end"
 	f.emit(j.record)
@@ -277,6 +287,8 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 		}
 		if f.native != nil {
 			f.native.releaseEntry(victim)
+		} else if f.external != nil {
+			f.external.release(victim.nativeBuffer)
 		}
 		delete(p.entries, victim.hash)
 		f.emit(PeerRecord{Time: now, Name: "l2_evict", Source: pool, Hash: victim.hash, Bytes: f.bytes})
@@ -284,6 +296,8 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 	e := &peerEntry{hash: hash, tokens: append([]sim.TokenID(nil), tokens...), last: now}
 	if f.native != nil {
 		e.nativeBuffer = f.native.reserveEntry(pool)
+	} else if f.external != nil {
+		e.nativeBuffer = f.external.reserve()
 	}
 	p.entries[hash] = e
 	f.emit(PeerRecord{Time: now, Name: "l2_reserve", Destination: pool, Hash: hash, Bytes: f.bytes})
