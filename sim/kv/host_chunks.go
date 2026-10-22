@@ -406,8 +406,12 @@ func (s *PeerCache) storeHostChunksFrom(req *sim.Request, ids []int64, startToke
 				h.pending[req.ID]--
 				if h.pending[req.ID] == 0 {
 					delete(h.pending, req.ID)
-					for _, id := range h.requestHolds[req.ID] {
-						s.unpin(s.Blocks[id])
+					if s.nativeAsync {
+						s.releaseNativeReferences(h.requestHolds[req.ID])
+					} else {
+						for _, id := range h.requestHolds[req.ID] {
+							s.unpin(s.Blocks[id])
+						}
 					}
 					delete(h.requestHolds, req.ID)
 					s.emit("host_store_request_release", req.ID, "", "hbm", "", "all_store_completions")

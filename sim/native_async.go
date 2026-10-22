@@ -15,11 +15,12 @@ type nativeRequestProgress struct {
 }
 
 type nativeQueuedBatch struct {
-	id    int64
-	work  []NativeWork
-	shape []NativeBatchShape
-	kv    NativeBatchKV
-	ready bool
+	id       int64
+	finished []string
+	work     []NativeWork
+	shape    []NativeBatchShape
+	kv       NativeBatchKV
+	ready    bool
 }
 
 type nativeAsyncRuntime struct {
@@ -34,30 +35,32 @@ type nativeAsyncRuntime struct {
 	busy, waiting          bool
 	workerFree, outputFree int64
 	serial                 int64
+	finished               []string
 	accountedAt            int64
 }
 
 // NativeAsyncEvent exposes actual runtime transitions, never trace-forced times.
 // Shape is a submission snapshot, so later formation cannot rewrite past work.
 type NativeAsyncEvent struct {
-	At            int64                `json:"time_us"`
-	Name          string               `json:"name"`
-	BatchID       int64                `json:"batch_id"`
-	Shape         []NativeBatchShape   `json:"shape,omitempty"`
-	QueueDepth    int                  `json:"queue_depth"`
-	Phase         string               `json:"phase,omitempty"`
-	Resource      string               `json:"resource,omitempty"`
-	DurationUS    int64                `json:"duration_us,omitempty"`
-	Execution     *NativeExecutionPlan `json:"execution,omitempty"`
-	Transaction   int64                `json:"transaction,omitempty"`
-	Transfer      *NativeTransferPlan  `json:"transfer,omitempty"`
-	TransferShape *NativeTransferShape `json:"transfer_shape,omitempty"`
-	ProducerBatch int64                `json:"producer_batch,omitempty"`
-	ProducerPhase string               `json:"producer_phase,omitempty"`
-	Request       string               `json:"request,omitempty"`
-	CoverageGap   string               `json:"coverage_gap,omitempty"`
-	Generation    uint64               `json:"generation,omitempty"`
-	run           func()
+	At               int64                `json:"time_us"`
+	Name             string               `json:"name"`
+	BatchID          int64                `json:"batch_id"`
+	Shape            []NativeBatchShape   `json:"shape,omitempty"`
+	QueueDepth       int                  `json:"queue_depth"`
+	Phase            string               `json:"phase,omitempty"`
+	Resource         string               `json:"resource,omitempty"`
+	DurationUS       int64                `json:"duration_us,omitempty"`
+	Execution        *NativeExecutionPlan `json:"execution,omitempty"`
+	Transaction      int64                `json:"transaction,omitempty"`
+	Transfer         *NativeTransferPlan  `json:"transfer,omitempty"`
+	TransferShape    *NativeTransferShape `json:"transfer_shape,omitempty"`
+	ProducerBatch    int64                `json:"producer_batch,omitempty"`
+	ProducerPhase    string               `json:"producer_phase,omitempty"`
+	Request          string               `json:"request,omitempty"`
+	CoverageGap      string               `json:"coverage_gap,omitempty"`
+	Generation       uint64               `json:"generation,omitempty"`
+	FinishedRequests []string             `json:"finished_requests,omitempty"`
+	run              func()
 }
 
 func (e *NativeAsyncEvent) Timestamp() int64 { return e.At }
@@ -118,6 +121,7 @@ func (n *nativeAsyncRuntime) account(now int64) {
 }
 
 func (n *nativeAsyncRuntime) cancelled(r *Request) {
+	n.finished = append(n.finished, r.ID)
 	if p := n.requests[r.ID]; p != nil && p.pending == 0 {
 		delete(n.requests, r.ID)
 	}
@@ -140,6 +144,7 @@ func (n *nativeAsyncRuntime) event(at int64, name string, b *nativeQueuedBatch, 
 	}
 	if b != nil {
 		e.BatchID = b.id
+		e.FinishedRequests = append([]string(nil), b.finished...)
 		e.Shape = append([]NativeBatchShape(nil), b.shape...)
 	}
 	n.s.Schedule(e)
@@ -147,7 +152,7 @@ func (n *nativeAsyncRuntime) event(at int64, name string, b *nativeQueuedBatch, 
 }
 
 func (n *nativeAsyncRuntime) hasRequests() bool {
-	return n.s.WaitQ.Len() > 0 || n.s.RunningBatch != nil && len(n.s.RunningBatch.Requests) > 0
+	return len(n.finished) > 0 || n.s.WaitQ.Len() > 0 || n.s.RunningBatch != nil && len(n.s.RunningBatch.Requests) > 0
 }
 
 func (n *nativeAsyncRuntime) progress(r *Request) *nativeRequestProgress {
@@ -276,6 +281,7 @@ func (n *nativeAsyncRuntime) tryConsume(now int64) {
 	end := nativeAfter(now, n.cost.ConsumeUS(len(b.work)), true)
 	n.s.stepEvent = n.event(end, "native_async_consumed", b, func() {
 		n.s.KVCache.SetClock(end)
+		b.kv.BeforeConsume(end)
 		for _, w := range b.work {
 			n.consumeWork(w, end, b)
 		}
@@ -289,8 +295,8 @@ func (n *nativeAsyncRuntime) tryConsume(now int64) {
 
 func (n *nativeAsyncRuntime) preempt(r *Request) {
 	p := n.progress(r)
-	// Preserve only observed output. In-flight stale output is delivered later,
-	// and waiting admission is gated until all older generations have drained.
+	// Preserve observed output; the connector contract decides whether stale
+	// output is dropped and whether its drain limits waiting admission.
 	r.preserveOutputForRecompute()
 	n.s.KVCache.ReleaseKVBlocks(r) // StateRunning preserves consumed host session.
 	p.generation++
@@ -310,7 +316,11 @@ func (n *nativeAsyncRuntime) form(now int64) *nativeQueuedBatch {
 		s.RunningBatch = &Batch{}
 	}
 	n.serial++
-	b := &nativeQueuedBatch{id: n.serial}
+	// Native Scheduler.has_finished_requests keeps one metadata iteration alive
+	// after final output. Snapshot IDs here; later completions belong to the
+	// next iteration even if this batch has not reached the worker yet.
+	b := &nativeQueuedBatch{id: n.serial, finished: n.finished}
+	n.finished = nil
 	budget := s.maxNumBatchedTokens
 	preempted := false
 	for index := 0; index < len(s.RunningBatch.Requests) && budget > 0; index++ {
@@ -331,17 +341,6 @@ func (n *nativeAsyncRuntime) form(now int64) *nativeQueuedBatch {
 		for len(s.RunningBatch.Requests) > 0 {
 			if n.store.ReserveNativeRange(r, p.scheduled, p.scheduled+grant, nil) {
 				ok = true
-				break
-			}
-			if n.store.NativeRetirementPending() {
-				// This adapter still holds retired physical pages until capture
-				// drain. Preempting every remaining live request cannot reclaim
-				// those holds and would repeatedly discard all useful output.
-				// Record the missing native queued-page-reuse behavior explicitly;
-				// this wait must not be passed off as calibrated native scheduling.
-				event := n.event(now, "native_async_retirement_wait", nil, nil)
-				event.Request = r.ID
-				event.CoverageGap = "retired_physical_page_reuse_waits_for_capture_drain"
 				break
 			}
 			last := len(s.RunningBatch.Requests) - 1
@@ -386,7 +385,7 @@ func (n *nativeAsyncRuntime) form(now int64) *nativeQueuedBatch {
 	for scan := 0; !preempted && budget > 0 && len(s.RunningBatch.Requests) < int(s.maxNumSeqs) && scan < s.WaitQ.Len(); {
 		r := s.WaitQ.PeekAt(scan)
 		p := n.progress(r)
-		if blocked[r.ID] || p.pending > 0 {
+		if blocked[r.ID] || p.pending > 0 && !n.store.NativeRequiresKVDelivery() {
 			skipped = append(skipped, r.ID)
 			scan++
 			continue
@@ -510,6 +509,7 @@ func (n *nativeAsyncRuntime) consumeWork(w NativeWork, now int64, batch *nativeQ
 		return
 	}
 	r.State = StateCompleted
+	n.finished = append(n.finished, r.ID)
 	// Metrics count actual emitted output, not speculative scheduled positions.
 	r.ProgressIndex = r.InputLen() + r.preservedOutputTokens - 1
 	n.s.KVCache.ReleaseKVBlocks(r)

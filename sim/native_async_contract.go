@@ -11,10 +11,13 @@ type NativeWork struct {
 }
 
 // NativeBatchKV owns captured physical IDs independently of the request's
-// current allocation. DeviceComplete may submit STORE; Consumed releases the
-// batch's pins after FIFO host consumption. Both are exactly-once operations.
+// current allocation. BeforeConsume advances the global completed-step fence,
+// drops capture references and drains retirement ownership before outputs are
+// handled; Consumed finalizes publication/bookkeeping without freeing pages.
+// Each boundary is exactly once, including empty connector-only iterations.
 type NativeBatchKV interface {
 	DeviceComplete(now int64)
+	BeforeConsume(now int64)
 	Consumed(now int64)
 }
 
@@ -42,9 +45,6 @@ type NativeAsyncKVStore interface {
 	// Mirrors the connector contract used by native preemption. Producer
 	// hand-offs discard stale samples; best-effort caches can deliver them.
 	NativeRequiresKVDelivery() bool
-	// Reports allocation holds from an already retired request generation. The
-	// current adapter cannot recycle these physical IDs before capture drain.
-	NativeRetirementPending() bool
 	ReserveNativeRange(req *Request, start, end int64, cached []int64) bool
 	CaptureNativeBatch(work []NativeWork) NativeBatchKV
 }

@@ -11,7 +11,41 @@ import (
 // This native hybrid path uses kv_both, whose is_kv_producer is true.
 func (s *PeerCache) NativeRequiresKVDelivery() bool { return true }
 
-func (s *PeerCache) NativeRetirementPending() bool { return len(s.nativeDeferred) != 0 }
+// Native BlockPool.free_blocks preserves reusable cached pages at the tail,
+// but prepends unhashed pages for immediate reuse. ids are in allocation order;
+// native request frees traverse them in reverse, preserving each partition's
+// order within this one release call. Legacy paths retain their prior FIFO.
+func (s *PeerCache) releaseNativeReferences(ids []int64) {
+	var uncached []*KVBlock
+	for i := len(ids) - 1; i >= 0; i-- {
+		b := s.Blocks[ids[i]]
+		if b.RefCount <= 0 {
+			panic("native release of an unowned page")
+		}
+		b.RefCount--
+		if b.RefCount != 0 {
+			continue
+		}
+		b.InUse = false
+		if b.Hash == "" {
+			uncached = append(uncached, b)
+		} else {
+			s.appendToFreeList(b)
+		}
+	}
+	// Prepend the whole ordered partition, not each member in forward order.
+	for i := len(uncached) - 1; i >= 0; i-- {
+		b := uncached[i]
+		b.PrevFree, b.NextFree = nil, s.FreeHead
+		if s.FreeHead != nil {
+			s.FreeHead.PrevFree = b
+		} else {
+			s.FreeTail = b
+		}
+		s.FreeHead = b
+		s.FreeBlockCnt++
+	}
+}
 
 func (s *PeerCache) EnableNativeAsyncKV() error {
 	if s.nativeAsync || s.fabric.hostChunks == nil || s.fabric.phases != nil || s.batchPrefixes != nil || len(s.RequestMap) != 0 || s.fabric.Pending() != 0 {
@@ -19,7 +53,7 @@ func (s *PeerCache) EnableNativeAsyncKV() error {
 	}
 	s.nativeAsync = true
 	s.nativePending = map[string]int{}
-	s.nativeDeferred = map[string][]int64{}
+	s.nativeLastStep = map[string]int64{}
 	s.nativeLoadPending = map[string]bool{}
 	s.nativeLoadTargets = map[string][]int64{}
 	s.nativeStored = map[string]nativeStorePosition{}
@@ -80,10 +114,52 @@ type nativeStorePosition struct {
 	tokens     int64
 }
 
+type nativeRetiredAllocation struct {
+	request string
+	ids     []int64
+	fence   int64
+}
+
+// Pinned vLLM fences an in-flight request free by the most recent GLOBAL
+// scheduled computing step, which may be newer than that request's last step.
+// Every detached allocation owns a distinct reference, including shared APC
+// pages and later allocations with the same request ID.
+func (s *PeerCache) retireNativeAllocation(req *sim.Request) {
+	ids := s.RequestMap[req.ID]
+	if len(ids) == 0 || s.nativeLastStep[req.ID] <= s.nativeProcessedStep {
+		return
+	}
+	retired := nativeRetiredAllocation{request: req.ID, ids: append([]int64(nil), ids...), fence: s.nativeScheduledStep}
+	for _, id := range retired.ids {
+		s.pin(s.Blocks[id])
+	}
+	s.nativeDeferred = append(s.nativeDeferred, retired)
+	s.fabric.emit(PeerRecord{Time: s.clock, Name: "native_allocation_retired", Instance: s.id, Request: req.ID,
+		HBMBlocks: append([]int64(nil), retired.ids...), Counters: map[string]int64{
+			"fence_step": retired.fence, "last_request_step": s.nativeLastStep[req.ID], "processed_step": s.nativeProcessedStep}})
+}
+
+func (s *PeerCache) drainNativeRetirements() {
+	for len(s.nativeDeferred) > 0 && s.nativeDeferred[0].fence <= s.nativeProcessedStep {
+		retired := s.nativeDeferred[0]
+		s.releaseNativeReferences(retired.ids)
+		s.nativeDeferred[0] = nativeRetiredAllocation{}
+		s.nativeDeferred = s.nativeDeferred[1:]
+		s.fabric.emit(PeerRecord{Time: s.clock, Name: "native_allocation_retirement_released", Instance: s.id, Request: retired.request,
+			HBMBlocks: append([]int64(nil), retired.ids...), Counters: map[string]int64{
+				"fence_step": retired.fence, "processed_step": s.nativeProcessedStep}})
+	}
+	if len(s.nativeDeferred) == 0 {
+		s.nativeDeferred = nil
+	}
+}
+
 type nativeCapturedBatch struct {
 	store                *PeerCache
 	works                []nativeCapturedWork
 	deviceDone, consumed bool
+	consumeStarted       bool
+	step                 int64
 	posted, polled       bool
 	loads                []*peerJob
 	receives             []string
@@ -95,7 +171,12 @@ func (s *PeerCache) CaptureNativeBatch(work []sim.NativeWork) sim.NativeBatchKV 
 	}
 	b := &nativeCapturedBatch{store: s, loads: s.nativePrepared}
 	s.nativePrepared = nil
+	if len(work) > 0 {
+		s.nativeScheduledStep++
+		b.step = s.nativeScheduledStep
+	}
 	for _, w := range work {
+		s.nativeLastStep[w.Request.ID] = b.step
 		n := (w.End + s.BlockSizeTokens - 1) / s.BlockSizeTokens
 		ids := s.RequestMap[w.Request.ID]
 		if n <= 0 || n > int64(len(ids)) {
@@ -307,9 +388,37 @@ func (s *PeerCache) holdCapturedHostStore(request string, ids []int64) {
 	}
 }
 
+func (b *nativeCapturedBatch) BeforeConsume(now int64) {
+	if !b.deviceDone || !b.polled || b.consumeStarted || b.consumed {
+		panic("invalid native consumption boundary")
+	}
+	b.consumeStarted = true
+	s := b.store
+	s.SetClock(now)
+	if b.step > 0 {
+		if b.step != s.nativeProcessedStep+1 {
+			panic("native computing outputs consumed out of order")
+		}
+		s.nativeProcessedStep = b.step
+	}
+	s.fabric.emit(PeerRecord{Time: now, Name: "native_output_consumption_begin", Instance: s.id,
+		Counters: map[string]int64{"computing_step": b.step, "processed_step": s.nativeProcessedStep, "scheduled_step": s.nativeScheduledStep}})
+	// Captures are a simulator safety reference, not an extra native block-pool
+	// owner. Remove them BEFORE native retirement references so that the physical
+	// free queue follows retirement order rather than captured-work iteration.
+	// Live allocations and pending transfer holds still own their own references.
+	for _, captured := range b.works {
+		s.releaseNativeReferences(captured.ids)
+		s.nativeBatchPins -= int64(len(captured.ids))
+	}
+	if b.step > 0 {
+		s.drainNativeRetirements()
+	}
+}
+
 func (b *nativeCapturedBatch) Consumed(now int64) {
-	if !b.deviceDone || !b.polled || b.consumed {
-		panic("native batch consumed before device completion or twice")
+	if !b.consumeStarted || b.consumed {
+		panic("native batch consumed without its fence boundary or twice")
 	}
 	b.consumed = true
 	s := b.store
@@ -333,19 +442,12 @@ func (b *nativeCapturedBatch) Consumed(now int64) {
 		// finalized, including a cancelled batch's unobserved generated suffix.
 		end := min(w.End, w.Request.InputLen()+w.Request.EmittedTokens())
 		s.nativeHashAndPublish(w.Request, captured.ids, end, true)
-		for i := len(captured.ids) - 1; i >= 0; i-- {
-			s.unpin(s.Blocks[captured.ids[i]])
-			s.nativeBatchPins--
-		}
 		s.nativePending[w.Request.ID]--
 		if s.nativePending[w.Request.ID] == 0 {
 			delete(s.nativePending, w.Request.ID)
-			for i := len(s.nativeDeferred[w.Request.ID]) - 1; i >= 0; i-- {
-				s.unpin(s.Blocks[s.nativeDeferred[w.Request.ID][i]])
-			}
-			delete(s.nativeDeferred, w.Request.ID)
 			if w.Request.State == sim.StateCompleted || w.Request.State == sim.StateTimedOut {
 				delete(s.nativeStored, w.Request.ID)
+				delete(s.nativeLastStep, w.Request.ID)
 			}
 		}
 	}

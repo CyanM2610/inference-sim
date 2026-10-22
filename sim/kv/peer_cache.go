@@ -18,7 +18,10 @@ type PeerCache struct {
 	nativeReserving        bool
 	nativeBatchPins        int64
 	nativePending          map[string]int
-	nativeDeferred         map[string][]int64
+	nativeDeferred         []nativeRetiredAllocation
+	nativeScheduledStep    int64
+	nativeProcessedStep    int64
+	nativeLastStep         map[string]int64
 	nativeLoadPending      map[string]bool
 	nativeLoadTargets      map[string][]int64
 	nativeStored           map[string]nativeStorePosition
@@ -158,6 +161,10 @@ func (s *PeerCache) pin(b *KVBlock) {
 	b.RefCount++
 }
 func (s *PeerCache) unpin(b *KVBlock) {
+	if s.nativeAsync {
+		s.releaseNativeReferences([]int64{b.ID})
+		return
+	}
 	b.RefCount--
 	if b.RefCount == 0 {
 		b.InUse = false
@@ -858,18 +865,8 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 	}
 }
 func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
-	if s.nativeAsync && s.nativePending[req.ID] > 0 {
-		seen := map[int64]bool{}
-		for _, id := range s.nativeDeferred[req.ID] {
-			seen[id] = true
-		}
-		for _, id := range s.RequestMap[req.ID] {
-			if !seen[id] {
-				s.pin(s.Blocks[id])
-				s.nativeDeferred[req.ID] = append(s.nativeDeferred[req.ID], id)
-				seen[id] = true
-			}
-		}
+	if s.nativeAsync {
+		s.retireNativeAllocation(req)
 	}
 	if s.hotprefix != nil {
 		if r := s.hotprefix.requests[req.ID]; r != nil {
@@ -894,7 +891,13 @@ func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
 	if s.fabric.hostChunks != nil {
 		delete(s.fabric.hostChunks.inputs, req.ID)
 	}
-	s.KVCacheState.ReleaseKVBlocks(req)
+	if s.nativeAsync {
+		ids := s.RequestMap[req.ID]
+		delete(s.RequestMap, req.ID)
+		s.releaseNativeReferences(ids)
+	} else {
+		s.KVCacheState.ReleaseKVBlocks(req)
+	}
 	if s.fabric.mechanisms.ReserveAtDispatch {
 		s.fabric.dispatch(s.clock)
 	}
@@ -1050,8 +1053,10 @@ func (s *PeerCache) PeerSnapshot() map[string]int64 {
 	if s.nativeAsync {
 		m["native_batch_pins"] = s.nativeBatchPins
 		m["native_receives_unadopted"] = int64(len(s.nativeLoadPending))
-		for _, ids := range s.nativeDeferred {
-			m["native_deferred_free_refs"] += int64(len(ids))
+		m["native_scheduled_step"] = s.nativeScheduledStep
+		m["native_processed_step"] = s.nativeProcessedStep
+		for _, retired := range s.nativeDeferred {
+			m["native_deferred_free_refs"] += int64(len(retired.ids))
 		}
 	}
 	if s.decodeTargets != nil {
