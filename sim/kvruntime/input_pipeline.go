@@ -83,7 +83,7 @@ func NewRequestInputs(r *Runtime, p InputPipelineProfile, gpuPool, hostPool stri
 		if err := r.Memory.Allocate(id); err != nil {
 			return err
 		}
-		return r.Memory.Fill(id, 0)
+		return nil // torch.empty index storage and allocator padding are undefined.
 	}
 	if err := allocate(i.indexGPU, gpuPool, "warm_input_index_gpu", p.GPUIndexBytes); err != nil {
 		return nil, err
@@ -102,15 +102,22 @@ func NewRequestInputs(r *Runtime, p InputPipelineProfile, gpuPool, hostPool stri
 		if err := allocate(x.buffer, gpuPool, "warm_request_input_and_output_budget", bytes); err != nil {
 			return nil, err
 		}
-		// Give every token cell offset zero, just like the scalar producer.
-		for n := int64(0); n < bytes/8; n++ {
+		if err := r.Memory.BeginWrite(x.buffer); err != nil {
+			return nil, err
+		}
+		// Initialize the logical prompt/budget only. The rounded allocator tail
+		// is reserved physical storage, not a tensor containing known zero tokens.
+		for n := int64(0); n < int64(len(req.Prompt)+len(req.Output)); n++ {
 			value := uint64(0)
 			if n < int64(len(req.Prompt)) {
 				value = req.Prompt[n]
 			}
-			if err := r.Memory.SeedRange(x.buffer, n*8, 8, value, 0); err != nil {
+			if err := r.Memory.ComputeRange(x.buffer, n*8, 8, value, 0); err != nil {
 				return nil, err
 			}
+		}
+		if err := r.Memory.Publish(x.buffer); err != nil {
+			return nil, err
 		}
 		r.Engine.Emit(Record{Name: "request_input_initialized", Request: req.ID, Destination: x.buffer, PrefixTokens: int64(len(req.Prompt)), QueryTokens: int64(len(req.Output)), Bytes: bytes, Reason: "warm_gpu_prompt_and_zero_output_budget; generation_readiness_is_separate"})
 	}

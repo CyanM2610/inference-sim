@@ -14,6 +14,15 @@ func (f *PeerFabric) EnableInputPipeline(requests []kvruntime.InputRequest) erro
 		return fmt.Errorf("input pipeline requires output copies and measured input profile")
 	}
 	p := n.profile.InputPipeline
+	known := map[int64]bool{}
+	for _, x := range p.Index {
+		known[x.Count] = true
+	}
+	for count := int64(1); count <= f.stores[0].TotalBlocks; count++ {
+		if !known[count] {
+			return fmt.Errorf("unmeasured possible input index count %d", count)
+		}
+	}
 	m := n.Runtime.Memory
 	context := m.Buffers["native/model_context"]
 	if context == nil || context.Bytes <= p.ReplacedGPUInputBytes {

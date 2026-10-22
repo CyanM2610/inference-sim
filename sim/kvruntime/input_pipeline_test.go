@@ -24,6 +24,21 @@ func inputFixture(t *testing.T) (*Runtime, *RequestInputs) {
 func TestInputPipelineWaitsForIndexAndTokenCopies(t *testing.T) {
 	r, i := inputFixture(t)
 	e, m := r.Engine, r.Memory
+	for _, id := range []string{i.indexGPU, i.indexHost} {
+		if m.Buffers[id].State != "allocated" {
+			t.Fatal("empty index tensor advertised as initialized")
+		}
+		for _, cell := range m.Buffers[id].Cells {
+			if cell.Valid {
+				t.Fatal("invented index contents before binding")
+			}
+		}
+	}
+	for _, cell := range m.Buffers[i.requests["req"].buffer].Cells[3:] {
+		if cell.Valid {
+			t.Fatal("allocator padding advertised as known input tokens")
+		}
+	}
 	e.MustAdd(Task{Name: "index_copy_backlog", Resource: "copy_h2d", DurationNS: 1000})
 	b, _, err := i.Bind("first", "req", 0, 1, []string{"page"}, nil)
 	if err != nil {
@@ -102,5 +117,48 @@ func TestInputPipelineRejectsUnproducedOrCorruptDecodeInput(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), wanted) {
 			t.Fatalf("corrupt=%v, got %v", corrupt, err)
 		}
+	}
+}
+
+func TestPagedInputReleasesOutputAfterD2DBeforeScatter(t *testing.T) {
+	r, i := inputFixture(t)
+	e, m := r.Engine, r.Memory
+	m.Capacity["hbm"] = 917504
+	m.Reserve("page", "hbm", "kv", 917504)
+	m.Allocate("page")
+	m.ReserveGranular("host_output", "host", "scalar", 8, 8)
+	m.Allocate("host_output")
+	p := PagedForwardPoint{Prefix: 0, Query: 1, BeforeAllocatedBytes: 15 << 30, ReservedBytes: 16 << 30, Evidence: "test", Stages: map[string]BridgeStage{"forward": {WallNS: 30}, "observe_token": {WallNS: 2}, "scatter_delta": {WallNS: 57, SubmitNS: 1, ServiceNS: 1}, "hf_release": {WallNS: 1}}, PhasePeakDelta: map[string]int64{}, PhaseEndDelta: map[string]int64{}, Output: &OutputCopyPoint{GPUStorageBytes: 512, HostStorageBytes: 8, HostReservedBytes: 8, Cost: TransferCost{SubmitNS: 1, DMANS: 1, HoldCPUUntilDMA: true}, Evidence: "test"}}
+	for name := range p.Stages {
+		p.PhasePeakDelta[name] = 57344 + 512
+		p.PhaseEndDelta[name] = 57344
+	}
+	p.PhaseEndDelta["forward"] = 57344 + 512
+	p.PhaseEndDelta["hf_release"] = 0
+	weights := make([]float64, 30)
+	for n := range weights {
+		weights[n] = 1.0 / 30
+	}
+	sawScatter := false
+	e.Sink = func(record Record) {
+		if record.Name == "task_start" && record.Operation == "full/scatter_delta" {
+			sawScatter = true
+			if m.Buffers["full/output_token"] != nil {
+				t.Error("GPU argmax tensor survived into scatter")
+			}
+			if m.Buffers[i.requests["req"].buffer].Cells[1] != (Cell{12345, 0, true}) {
+				t.Error("scatter started before next input D2D publication")
+			}
+		}
+	}
+	_, err := r.PagedStep(PagedStepSpec{Inputs: i, Request: "req", ID: "full", Slots: []string{"page"}, Query: 1, TokenOrigins: []uint64{1}, Weights: weights, Point: p, WorkspacePool: "gpu", HostOutputBuffer: "host_output", OutputCopyResource: "copy_d2h", OutputValue: 12345, OutputReferenceKind: "request_reference"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !sawScatter || i.requests["req"].produced != 1 {
+		t.Fatal("input pipeline did not complete")
 	}
 }

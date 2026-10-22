@@ -359,7 +359,7 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 			e.Emit(Record{Name: "paged_output_observed", Request: s.Request, Operation: s.ID, Source: outputID, Destination: s.HostOutputBuffer, Origin: s.OutputValue, Bytes: tx.Bytes, Reason: s.OutputReferenceKind})
 			if binding != nil {
 				return nil
-			} // GPU token is still a D2D source until cleanup.
+			} // The downstream input write/release still owns the GPU token.
 			return m.Free(outputID)
 		})
 		if binding != nil {
@@ -379,6 +379,7 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 					parents = []int64{tail}
 				}
 			}
+			parents = []int64{e.MustAdd(Task{Name: "gpu_output_tensor_release", Operation: s.ID, Resource: "cpu", Parents: parents, Finish: func() error { return m.Free(outputID) }})}
 		}
 	}
 	scatter, ok := s.Point.Stages["scatter_delta"]
@@ -478,9 +479,6 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 			}
 		}
 		if binding != nil {
-			if err := m.Free(outputID); err != nil {
-				return err
-			}
 			return binding.ReleaseIndices()
 		}
 		return nil
