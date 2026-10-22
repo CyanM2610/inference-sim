@@ -295,12 +295,23 @@ func (e *peerTransferEvent) Execute(_ *sim.Simulator) {
 		f.dispatch(e.at)
 		return
 	}
-	finish := func(now int64) { j.done(now); f.dispatch(now); f.wakeStores(now) }
+	finish := func(now int64) { j.done(now); f.notifyDecisionTransfer(now, j); f.dispatch(now); f.wakeStores(now) }
 	if f.mechanisms.CompletionUS > 0 {
 		f.controlSubmit(e.at, &peerControlJob{record: PeerRecord{Instance: j.record.Instance, Request: j.record.Request, Transaction: j.record.Transaction, Reason: "completion"}, service: f.mechanisms.CompletionUS, schedule: j.schedule, done: finish})
 		f.dispatch(e.at)
 	} else {
 		finish(e.at)
+	}
+}
+
+// One notification per completed job (a group calls all member callbacks
+// before this point). No physical block identity or predicted time is exposed.
+func (f *PeerFabric) notifyDecisionTransfer(now int64, j *peerJob) {
+	for _, s := range f.stores {
+		if s.id == j.record.Instance && s.decisionEvents != nil {
+			s.decisionEvents(sim.DecisionEvent{Kind: "transfer_adopted", OccurredUS: now, Request: j.record.Request,
+				Transfer: &sim.DecisionTransfer{ID: j.record.Transaction, Request: j.record.Request, Source: j.record.Source, Destination: j.record.Destination, Bytes: j.record.Bytes}})
+		}
 	}
 }
 func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64) (*peerEntry, bool) {

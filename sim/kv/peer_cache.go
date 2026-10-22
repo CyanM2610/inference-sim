@@ -18,6 +18,7 @@ type PeerCache struct {
 	clock             int64
 	schedule          func(sim.Event)
 	wake              func(int64)
+	decisionEvents    func(sim.DecisionEvent)
 	ready             map[int64]string
 	lookup            map[string]int64
 	frequency         map[string]int64
@@ -73,7 +74,9 @@ func (s *PeerCache) BindEvents(schedule func(sim.Event), wake func(int64)) {
 	s.schedule = schedule
 	s.wake = wake
 }
-func (s *PeerCache) SetClock(t int64) { s.clock = t }
+
+func (s *PeerCache) BindDecisionEvents(notify func(sim.DecisionEvent)) { s.decisionEvents = notify }
+func (s *PeerCache) SetClock(t int64)                                  { s.clock = t }
 func (s *PeerCache) emit(name, req, h, src, dst, reason string) {
 	s.fabric.emit(PeerRecord{Time: s.clock, Name: name, Instance: s.id, Request: req, Hash: h, Source: src, Destination: dst, Reason: reason})
 	if s.fabric.mechanisms != (PeerMechanisms{}) {
