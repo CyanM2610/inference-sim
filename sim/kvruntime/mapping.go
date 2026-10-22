@@ -1,6 +1,9 @@
 package kvruntime
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // MappingKernel is one GPU transformation launch with many logical byte spans.
 // It distinguishes an index/scatter kernel from hundreds of memcpy API calls.
@@ -8,6 +11,11 @@ type MappingKernel struct {
 	Name                string
 	Source, Destination string
 	Spans               []Span
+	Endpoints           []CopyEndpoints
+	// Nonempty WriteOwner uses an already-open compound destination writer.
+	// The caller publishes that writer after all owned kernels complete.
+	WriteOwner          string
+	AllowUndefined      bool
 	Parents             []int64
 	StreamParent        int64
 	SubmitNS, ServiceNS int64
@@ -20,50 +28,122 @@ type MappingKernel struct {
 // predecessors. Contents change only at completion; publication is independent
 // of CPU launch return. CUDA internal instructions are not numerically executed.
 func (r *Runtime) MapKernel(operation, cpu, gpu string, k MappingKernel) (submit, complete int64, err error) {
-	if operation == "" || cpu == "" || gpu == "" || k.SubmitNS < 0 || k.ServiceNS <= 0 || len(k.Spans) == 0 || k.Source == k.Destination {
+	if operation == "" || cpu == "" || gpu == "" || k.SubmitNS < 0 || k.ServiceNS <= 0 || len(k.Spans) == 0 {
 		return 0, 0, fmt.Errorf("invalid mapping kernel")
 	}
 	e, m := r.Engine, r.Memory
+	if k.StreamParent != 0 && e.tasks[k.StreamParent] == nil {
+		return 0, 0, fmt.Errorf("unknown mapping stream predecessor")
+	}
+	endpoints := append([]CopyEndpoints(nil), k.Endpoints...)
+	if len(endpoints) == 0 {
+		for range k.Spans {
+			endpoints = append(endpoints, CopyEndpoints{k.Source, k.Destination})
+		}
+	}
+	if len(endpoints) != len(k.Spans) {
+		return 0, 0, fmt.Errorf("mapping endpoint count mismatch")
+	}
+	srcSet, dstSet := map[string]bool{}, map[string]bool{}
+	for _, p := range endpoints {
+		if p.Source == "" || p.Destination == "" || p.Source == p.Destination {
+			return 0, 0, fmt.Errorf("mapping endpoint invalid")
+		}
+		srcSet[p.Source] = true
+		dstSet[p.Destination] = true
+	}
+	var sources, targets []string
+	for id := range srcSet {
+		if dstSet[id] {
+			return 0, 0, fmt.Errorf("mapping source/target alias")
+		}
+		sources = append(sources, id)
+	}
+	for id := range dstSet {
+		targets = append(targets, id)
+	}
+	sort.Strings(sources)
+	sort.Strings(targets)
 	submit = e.MustAdd(Task{Name: k.Name + "_submit", Operation: operation, Resource: cpu, DurationNS: k.SubmitNS, Parents: k.Parents, Start: func() error {
 		if k.Prepare != nil {
 			if err := k.Prepare(); err != nil {
 				return err
 			}
 		}
-		a, b := m.Buffers[k.Source], m.Buffers[k.Destination]
-		if a == nil || b == nil || a.Opaque || b.Opaque || a.State == "reserved" || b.State == "reserved" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
-			return fmt.Errorf("mapping buffers unavailable")
+		for _, id := range sources {
+			a := m.Buffers[id]
+			if a == nil || a.Opaque || a.State == "reserved" {
+				return fmt.Errorf("mapping source unavailable")
+			}
 		}
-		for _, p := range k.Spans {
+		for _, id := range targets {
+			b := m.Buffers[id]
+			if b == nil || b.Opaque || b.State == "reserved" || b.Pins > 0 {
+				return fmt.Errorf("mapping target unavailable")
+			}
+			if k.WriteOwner != "" {
+				if b.Writers != 1 || b.WriterOwner != k.WriteOwner {
+					return fmt.Errorf("mapping destination writer ownership mismatch")
+				}
+			} else if b.Writers > 0 || b.Holds > 0 {
+				return fmt.Errorf("mapping target busy")
+			}
+		}
+		for i, p := range k.Spans {
+			a, b := m.Buffers[endpoints[i].Source], m.Buffers[endpoints[i].Destination]
 			if p.Bytes <= 0 || p.SourceOffset < 0 || p.DestinationOffset < 0 || p.SourceOffset > a.Bytes-p.Bytes || p.DestinationOffset > b.Bytes-p.Bytes || p.SourceOffset%m.Unit != 0 || p.DestinationOffset%m.Unit != 0 || p.Bytes%m.Unit != 0 {
 				return fmt.Errorf("mapping span out of bounds")
 			}
 		}
-		if err := m.Hold(k.Source); err != nil {
-			return err
+		for _, id := range sources {
+			if err := m.Hold(id); err != nil {
+				return err
+			}
 		}
-		return m.BeginWrite(k.Destination)
+		if k.WriteOwner == "" {
+			for _, id := range targets {
+				if err := m.BeginWrite(id); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	}})
 	parents := []int64{submit}
 	if k.StreamParent != 0 {
 		parents = append(parents, k.StreamParent)
 	}
 	complete = e.MustAdd(Task{Name: k.Name, Operation: operation, Resource: gpu, DurationNS: k.ServiceNS, Parents: parents, Start: func() error {
-		if err := m.Pin(k.Source); err != nil {
-			return err
-		}
-		return m.Unhold(k.Source)
-	}, Finish: func() error {
-		for _, p := range k.Spans {
-			if err := m.Copy(k.Source, k.Destination, p.SourceOffset, p.DestinationOffset, p.Bytes); err != nil {
+		for _, id := range sources {
+			if err := m.Pin(id); err != nil {
+				return err
+			}
+			if err := m.Unhold(id); err != nil {
 				return err
 			}
 		}
-		if err := m.Publish(k.Destination); err != nil {
-			return err
+		return nil
+	}, Finish: func() error {
+		for i, p := range k.Spans {
+			copy := m.Copy
+			if k.AllowUndefined {
+				copy = m.CopyPadding
+			}
+			if err := copy(endpoints[i].Source, endpoints[i].Destination, p.SourceOffset, p.DestinationOffset, p.Bytes); err != nil {
+				return err
+			}
 		}
-		if err := m.Unpin(k.Source); err != nil {
-			return err
+		if k.WriteOwner == "" {
+			for _, id := range targets {
+				if err := m.Publish(id); err != nil {
+					return err
+				}
+			}
+		}
+		for _, id := range sources {
+			if err := m.Unpin(id); err != nil {
+				return err
+			}
 		}
 		if k.Complete != nil {
 			return k.Complete()

@@ -123,9 +123,9 @@ type Simulator struct {
 	// map of request IDs to total num computed tokens (including cached tokens)
 	reqNumComputedTokens map[string]int64
 	batchFormation       BatchFormation
-	model       string
-	gpu         string
-	maxModelLen int64 // max total sequence length (0 = unlimited)
+	model                string
+	gpu                  string
+	maxModelLen          int64 // max total sequence length (0 = unlimited)
 	// Speculative decoding / MTP (#1528). specEnabled gates ALL spec-decode behavior;
 	// when false every decode path is byte-identical to a pre-feature build (INV-6).
 	// specTokensPerStep is the mean accepted tokens/step (1+α·K) consumed by the
@@ -838,6 +838,9 @@ func (sim *Simulator) Step(now int64) {
 		if len(sim.RunningBatch.Requests) == 0 {
 			// A KV completion or a new arrival will wake the engine.
 			sim.stepEvent = nil
+			return
+		}
+		if sim.beginAsyncBatch(now) {
 			return
 		}
 		duration := sim.batchStepDuration()

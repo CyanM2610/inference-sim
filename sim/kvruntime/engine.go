@@ -1,6 +1,7 @@
 // Package kvruntime models native KV operations with nanosecond events and
 // explicit resource/dependency state. Native fidelity experiments use this
-// runtime; BLIS cache integration is pending. Profiles supply costs, not outcomes.
+// runtime, including the BLIS cache and asynchronous batch adapters. Profiles
+// supply costs, not outcomes.
 package kvruntime
 
 import (
@@ -10,26 +11,29 @@ import (
 )
 
 type Record struct {
-	TimeNS              int64   `json:"time_ns"`
-	Name                string  `json:"name"`
-	Task                int64   `json:"task,omitempty"`
-	Operation           string  `json:"operation,omitempty"`
-	Resource            string  `json:"resource,omitempty"`
-	DurationNS          int64   `json:"duration_ns,omitempty"`
-	Bytes               int64   `json:"bytes,omitempty"`
-	Source              string  `json:"source,omitempty"`
-	Destination         string  `json:"destination,omitempty"`
-	SourceOffset        int64   `json:"source_offset,omitempty"`
-	DestinationOffset   int64   `json:"destination_offset,omitempty"`
-	Reason              string  `json:"reason,omitempty"`
-	Parents             []int64 `json:"parents,omitempty"`
-	Origin              uint64  `json:"origin,omitempty"`
-	OriginOffset        int64   `json:"origin_offset,omitempty"`
-	ContentSHA256       string  `json:"content_sha256,omitempty"`
-	PhysicalLayerStride int64   `json:"physical_layer_stride_bytes,omitempty"`
-	PrefixTokens        int64   `json:"prefix_tokens,omitempty"`
-	QueryTokens         int64   `json:"query_tokens,omitempty"`
-	PayloadKey          string  `json:"payload_key,omitempty"`
+	TimeNS              int64    `json:"time_ns"`
+	Name                string   `json:"name"`
+	Task                int64    `json:"task,omitempty"`
+	Operation           string   `json:"operation,omitempty"`
+	Resource            string   `json:"resource,omitempty"`
+	DurationNS          int64    `json:"duration_ns,omitempty"`
+	Bytes               int64    `json:"bytes,omitempty"`
+	Source              string   `json:"source,omitempty"`
+	Destination         string   `json:"destination,omitempty"`
+	SourceOffset        int64    `json:"source_offset,omitempty"`
+	DestinationOffset   int64    `json:"destination_offset,omitempty"`
+	Reason              string   `json:"reason,omitempty"`
+	Parents             []int64  `json:"parents,omitempty"`
+	Origin              uint64   `json:"origin,omitempty"`
+	OriginOffset        int64    `json:"origin_offset,omitempty"`
+	ContentSHA256       string   `json:"content_sha256,omitempty"`
+	PhysicalLayerStride int64    `json:"physical_layer_stride_bytes,omitempty"`
+	PrefixTokens        int64    `json:"prefix_tokens,omitempty"`
+	QueryTokens         int64    `json:"query_tokens,omitempty"`
+	PayloadKey          string   `json:"payload_key,omitempty"`
+	AllowUndefined      bool     `json:"allow_undefined_padding,omitempty"`
+	Request             string   `json:"request,omitempty"`
+	PageSlots           []string `json:"page_slots,omitempty"`
 }
 type Task struct {
 	ID                        int64
@@ -72,6 +76,7 @@ func (q *events) Push(x any)   { *q = append(*q, x.(event)) }
 func (q *events) Pop() any     { old := *q; x := old[len(old)-1]; *q = old[:len(old)-1]; return x }
 
 type Engine struct {
+	actionTask         *Task
 	NowNS              int64
 	queue              events
 	serial, taskSerial int64
@@ -89,6 +94,15 @@ func NewEngine(sink func(Record)) *Engine {
 }
 func (e *Engine) Emit(r Record) {
 	r.TimeNS = e.NowNS
+	if r.Task == 0 && e.actionTask != nil {
+		r.Task = e.actionTask.ID
+		if r.Operation == "" {
+			r.Operation = e.actionTask.Operation
+		}
+		if r.Resource == "" {
+			r.Resource = e.actionTask.Resource
+		}
+	}
 	if e.Sink != nil {
 		e.Sink(r)
 	}
@@ -187,7 +201,11 @@ func (e *Engine) Kick() {
 		r.busy = true
 		t.state = "running"
 		if t.Start != nil {
-			if err := t.Start(); err != nil {
+			previous := e.actionTask
+			e.actionTask = t
+			err := t.Start()
+			e.actionTask = previous
+			if err != nil {
 				e.Fail(fmt.Errorf("%s start: %w", t.Name, err))
 				return
 			}
@@ -202,7 +220,11 @@ func (e *Engine) Kick() {
 		e.Emit(Record{Name: "task_start", Task: t.ID, Operation: t.Operation, Resource: name, DurationNS: t.DurationNS, Reason: t.Name, Parents: t.Parents})
 		err := e.At(e.NowNS+t.DurationNS, func() {
 			if t.Finish != nil {
-				if err := t.Finish(); err != nil {
+				previous := e.actionTask
+				e.actionTask = t
+				err := t.Finish()
+				e.actionTask = previous
+				if err != nil {
 					e.Fail(fmt.Errorf("%s finish: %w", t.Name, err))
 					return
 				}

@@ -21,15 +21,18 @@ type Buffer struct {
 	Touched, Registered bool
 	Pins, Writers       int
 	Holds               int
+	WriterOwner         string
 	Cells               []Cell
 	Opaque              bool
 }
 type Memory struct {
-	Unit           int64
-	Capacity, Used map[string]int64
-	Peak           map[string]int64
-	Buffers        map[string]*Buffer
-	e              *Engine
+	Unit                   int64
+	Capacity, Used         map[string]int64
+	Peak                   map[string]int64
+	Retained, PhysicalPeak map[string]int64
+	FixedAllocator         map[string]bool
+	Buffers                map[string]*Buffer
+	e                      *Engine
 }
 
 func NewMemory(e *Engine, unit int64, capacity map[string]int64) (*Memory, error) {
@@ -43,7 +46,7 @@ func NewMemory(e *Engine, unit int64, capacity map[string]int64) (*Memory, error
 		}
 		c[k] = v
 	}
-	return &Memory{Unit: unit, Capacity: c, Used: map[string]int64{}, Peak: map[string]int64{}, Buffers: map[string]*Buffer{}, e: e}, nil
+	return &Memory{Unit: unit, Capacity: c, Used: map[string]int64{}, Peak: map[string]int64{}, Retained: map[string]int64{}, PhysicalPeak: map[string]int64{}, FixedAllocator: map[string]bool{}, Buffers: map[string]*Buffer{}, e: e}, nil
 }
 func (m *Memory) Reserve(id, pool, kind string, bytes int64) (*Buffer, error) {
 	return m.reserve(id, pool, kind, bytes, false)
@@ -61,6 +64,9 @@ func (m *Memory) reserve(id, pool, kind string, bytes int64, opaque bool) (*Buff
 	if m.Capacity[pool]-m.Used[pool] < bytes {
 		return nil, fmt.Errorf("capacity exhausted in %s", pool)
 	}
+	if m.FixedAllocator[pool] && m.Used[pool]+bytes > m.Retained[pool] {
+		return nil, fmt.Errorf("unprofiled allocator growth in %s", pool)
+	}
 	b := &Buffer{ID: id, Pool: pool, Kind: kind, Bytes: bytes, State: "reserved", Opaque: opaque}
 	if !opaque {
 		b.Cells = make([]Cell, bytes/m.Unit)
@@ -68,6 +74,7 @@ func (m *Memory) reserve(id, pool, kind string, bytes int64, opaque bool) (*Buff
 	m.Buffers[id] = b
 	m.Used[pool] += bytes
 	m.Peak[pool] = max(m.Peak[pool], m.Used[pool])
+	m.PhysicalPeak[pool] = max(m.PhysicalPeak[pool], m.PhysicalUsed(pool))
 	m.e.Emit(Record{Name: "memory_reserve", Destination: id, Resource: pool, Bytes: bytes, Reason: kind})
 	return b, nil
 }
@@ -130,27 +137,47 @@ func (m *Memory) Unpin(id string) error {
 	return nil
 }
 func (m *Memory) BeginWrite(id string) error {
+	return m.BeginWriteOwned(id, "")
+}
+
+// BeginWriteOwned allows one compound operation to own several disjoint
+// kernel writes and publish their destination only after the whole DAG ends.
+func (m *Memory) BeginWriteOwned(id, owner string) error {
 	b := m.Buffers[id]
 	if b == nil || b.State == "reserved" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
 		return fmt.Errorf("target unavailable: %s", id)
 	}
 	b.Writers++
+	b.WriterOwner = owner
 	b.State = "writing"
 	m.e.Emit(Record{Name: "memory_write_pending", Destination: id, Bytes: b.Bytes})
 	return nil
 }
 func (m *Memory) Publish(id string) error {
+	return m.PublishOwned(id, "")
+}
+func (m *Memory) PublishOwned(id, owner string) error {
 	b := m.Buffers[id]
-	if b == nil || b.Writers != 1 {
+	if b == nil || b.Writers != 1 || b.WriterOwner != owner {
 		return fmt.Errorf("publication without writer: %s", id)
 	}
 	b.Writers = 0
+	b.WriterOwner = ""
 	b.State = "ready"
 	b.Touched = true
 	m.e.Emit(Record{Name: "memory_publish", Destination: id, Bytes: b.Bytes, Reason: "completion_adopted", ContentSHA256: m.Digest(id)})
 	return nil
 }
 func (m *Memory) Copy(src, dst string, so, do, n int64) error {
+	return m.copy(src, dst, so, do, n, false)
+}
+
+// CopyPadding preserves undefined cells when a physical gather copies an
+// entire last page. Consumers must still use strict Copy for meaningful KV.
+func (m *Memory) CopyPadding(src, dst string, so, do, n int64) error {
+	return m.copy(src, dst, so, do, n, true)
+}
+func (m *Memory) copy(src, dst string, so, do, n int64, padding bool) error {
 	a, b := m.Buffers[src], m.Buffers[dst]
 	if a == nil || b == nil || a.Opaque || b.Opaque || a.Pins <= 0 || a.State != "ready" || b.Writers != 1 {
 		return fmt.Errorf("copy without live pin/writer")
@@ -159,12 +186,12 @@ func (m *Memory) Copy(src, dst string, so, do, n int64) error {
 		return fmt.Errorf("copy range out of bounds/unaligned")
 	}
 	for _, c := range a.Cells[so/m.Unit : (so+n)/m.Unit] {
-		if !c.Valid {
+		if !c.Valid && !padding {
 			return fmt.Errorf("copy of uninitialized source")
 		}
 	}
 	copy(b.Cells[do/m.Unit:(do+n)/m.Unit], a.Cells[so/m.Unit:(so+n)/m.Unit])
-	m.e.Emit(Record{Name: "memory_copy", Source: src, Destination: dst, SourceOffset: so, DestinationOffset: do, Bytes: n})
+	m.e.Emit(Record{Name: "memory_copy", Source: src, Destination: dst, SourceOffset: so, DestinationOffset: do, Bytes: n, AllowUndefined: padding})
 	return nil
 }
 
@@ -204,8 +231,28 @@ func (m *Memory) Check() error {
 			return fmt.Errorf("physical accounting mismatch %s", p)
 		}
 	}
+	for p, n := range m.Retained {
+		if n < 0 || n > m.Capacity[p] || (m.FixedAllocator[p] && m.Used[p] > n) {
+			return fmt.Errorf("allocator reservation mismatch %s", p)
+		}
+	}
 	return nil
 }
+
+// RetainAllocator models a caching allocator's reserved backing separately
+// from its live tensor leases. Physical occupancy is max(reserved, active),
+// never their sum. Fixed warm pools reject uncalibrated growth.
+func (m *Memory) RetainAllocator(pool string, bytes int64, fixed bool) error {
+	if pool == "" || m.Capacity[pool] <= 0 || bytes < 0 || bytes > m.Capacity[pool] || (fixed && bytes < m.Used[pool]) {
+		return fmt.Errorf("invalid allocator reservation")
+	}
+	m.Retained[pool] = bytes
+	m.FixedAllocator[pool] = fixed
+	m.PhysicalPeak[pool] = max(m.PhysicalPeak[pool], m.PhysicalUsed(pool))
+	m.e.Emit(Record{Name: "memory_allocator_reserve", Resource: pool, Bytes: bytes, Reason: "cached_backing; overlaps_live_allocations_not_additive"})
+	return nil
+}
+func (m *Memory) PhysicalUsed(pool string) int64 { return max(m.Used[pool], m.Retained[pool]) }
 
 func (m *Memory) SeedRange(id string, start, bytes int64, origin uint64, offset int64) error {
 	b := m.Buffers[id]
@@ -243,6 +290,19 @@ func (m *Memory) Hold(id string) error {
 	}
 	b.Holds++
 	m.e.Emit(Record{Name: "memory_hold", Source: id, Bytes: b.Bytes})
+	return nil
+}
+
+// Invalidate changes logical ownership of a physical arena slot; it does not
+// zero GPU bytes or allocate/free storage. Stale payload must not become a hit.
+func (m *Memory) Invalidate(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.Opaque || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
+		return fmt.Errorf("invalidate referenced storage %s", id)
+	}
+	clear(b.Cells)
+	b.State = "allocated"
+	m.e.Emit(Record{Name: "memory_invalidate", Destination: id, Bytes: b.Bytes, Reason: "physical_slot_reused; old_contents_undefined"})
 	return nil
 }
 func (m *Memory) Unhold(id string) error {

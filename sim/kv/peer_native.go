@@ -12,17 +12,19 @@ import (
 // Arenas are already allocated at admission (steady state). Slot reuse changes
 // contents, never allocated byte count. Only single-instance pinned DRAM works.
 type NativePeerRuntime struct {
-	origins       map[string]uint64
-	forwardSerial int64
-	Runtime       *kvruntime.Runtime
-	fabric        *PeerFabric
-	profile       *kvruntime.Profile
-	points        map[string]kvruntime.TransferPoint
-	hostFree      []string
-	hostLeased    map[string]bool
-	scheduled     map[int64]bool
-	completed     []func()
-	sink          func(kvruntime.Record)
+	pagedEnabled, forwardActive bool
+	pagedContents               map[string][]kvruntime.Cell
+	origins                     map[string]uint64
+	forwardSerial               int64
+	Runtime                     *kvruntime.Runtime
+	fabric                      *PeerFabric
+	profile                     *kvruntime.Profile
+	points                      map[string]kvruntime.TransferPoint
+	hostFree                    []string
+	hostLeased                  map[string]bool
+	scheduled                   map[int64]bool
+	completed                   []func()
+	sink                        func(kvruntime.Record)
 }
 
 // NativeForward schedules the measured batch-one envelope as a dependent
@@ -151,7 +153,7 @@ func (n *NativePeerRuntime) reserveEntry(pool string) string {
 func (n *NativePeerRuntime) releaseEntry(entry *peerEntry) {
 	id := entry.nativeBuffer
 	b := n.Runtime.Memory.Buffers[id]
-	if !n.hostLeased[id] || b == nil || b.Pins != 0 || b.Writers != 0 {
+	if !n.hostLeased[id] || b == nil || b.Pins != 0 || b.Writers != 0 || b.Holds != 0 {
 		panic("native L2 slot recycled while active")
 	}
 	delete(n.hostLeased, id)
@@ -172,6 +174,12 @@ func (n *NativePeerRuntime) advance(now int64) {
 }
 func (n *NativePeerRuntime) computed(now, id int64, hash string) {
 	n.advance(now)
+	if n.pagedEnabled {
+		if err := n.checkPagedContents(hash, n.hbmID(id)); err != nil {
+			panic(err)
+		}
+		return
+	}
 	m := n.Runtime.Memory
 	buffer := n.hbmID(id)
 	if err := m.BeginWrite(buffer); err != nil {
@@ -266,7 +274,7 @@ func (f *PeerFabric) NativeCheck() error {
 	if err := m.Check(); err != nil {
 		return err
 	}
-	if n.Runtime.Engine.Pending() != 0 || len(n.completed) != 0 || len(n.scheduled) != 0 {
+	if n.Runtime.Engine.Pending() != 0 || len(n.completed) != 0 || len(n.scheduled) != 0 || n.forwardActive {
 		return fmt.Errorf("native event pipeline not drained")
 	}
 	for _, b := range m.Buffers {
@@ -278,6 +286,12 @@ func (f *PeerFabric) NativeCheck() error {
 		return fmt.Errorf("L2 physical leases disagree with directory")
 	}
 	for id, hash := range f.stores[0].ready {
+		if n.pagedEnabled {
+			if err := n.checkPagedContents(hash, n.hbmID(id)); err != nil {
+				return err
+			}
+			continue
+		}
 		origin := n.origins[hash]
 		if origin == 0 {
 			return fmt.Errorf("unknown HBM payload identity")
@@ -292,6 +306,12 @@ func (f *PeerFabric) NativeCheck() error {
 	for hash, entry := range f.pools["dram"].entries {
 		if !entry.ready {
 			return fmt.Errorf("unpublished entry %s", hash)
+		}
+		if n.pagedEnabled {
+			if err := n.checkPagedContents(hash, entry.nativeBuffer); err != nil {
+				return err
+			}
+			continue
 		}
 		origin := n.origins[hash]
 		if origin == 0 {

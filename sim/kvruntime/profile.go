@@ -65,17 +65,39 @@ type BridgePoint struct {
 	Evidence            string                  `json:"evidence"`
 }
 type Profile struct {
-	ComputeGrid        []ComputeShape    `json:"compute_grid,omitempty"`
-	Version            int               `json:"schema_version"`
-	Condition          string            `json:"condition"`
-	QueueDepth         int               `json:"queue_depth"`
-	QueueDepthEvidence string            `json:"queue_depth_evidence"`
-	Train              []int             `json:"train_processes"`
-	HeldOut            []int             `json:"held_out_processes"`
-	SourceSHA256       map[string]string `json:"source_sha256"`
-	Transfers          []TransferPoint   `json:"transfers"`
-	Allocations        []AllocationPoint `json:"allocations"`
-	Compute            []ComputePoint    `json:"compute"`
+	TorchCopies        *TorchCopyProfile   `json:"torch_copies,omitempty"`
+	PagedForward       []PagedForwardPoint `json:"paged_forward,omitempty"`
+	ComputeGrid        []ComputeShape      `json:"compute_grid,omitempty"`
+	Version            int                 `json:"schema_version"`
+	Condition          string              `json:"condition"`
+	QueueDepth         int                 `json:"queue_depth"`
+	QueueDepthEvidence string              `json:"queue_depth_evidence"`
+	Train              []int               `json:"train_processes"`
+	HeldOut            []int               `json:"held_out_processes"`
+	SourceSHA256       map[string]string   `json:"source_sha256"`
+	Transfers          []TransferPoint     `json:"transfers"`
+	Allocations        []AllocationPoint   `json:"allocations"`
+	Compute            []ComputePoint      `json:"compute"`
+}
+type TorchCopyProfile struct {
+	GPUSlots               int64            `json:"gpu_slots"`
+	HostSlots              int64            `json:"host_slots"`
+	BaselineAllocatedBytes int64            `json:"baseline_allocated_bytes"`
+	ReservedBytes          int64            `json:"reserved_bytes"`
+	WarmSetupNS            map[string]int64 `json:"warm_setup_ns"`
+	Points                 []TransferPoint  `json:"points"`
+	Evidence               string           `json:"evidence"`
+}
+type PagedForwardPoint struct {
+	Prefix               int64                  `json:"prefix"`
+	Query                int64                  `json:"query"`
+	Stages               map[string]BridgeStage `json:"stages"`
+	ResidualNS           int64                  `json:"residual_ns"`
+	BeforeAllocatedBytes int64                  `json:"before_allocated_bytes"`
+	ReservedBytes        int64                  `json:"reserved_bytes"`
+	PhasePeakDelta       map[string]int64       `json:"phase_peak_delta_bytes"`
+	PhaseEndDelta        map[string]int64       `json:"phase_end_delta_bytes"`
+	Evidence             string                 `json:"evidence"`
 }
 type ComputeShape struct {
 	Prefix              int64 `json:"prefix"`
@@ -101,6 +123,26 @@ func LoadProfile(path string) (*Profile, error) {
 func (p *Profile) Validate() error {
 	if p.Version != 1 || p.QueueDepth <= 0 || len(p.SourceSHA256) == 0 {
 		return fmt.Errorf("invalid profile version, queue depth or provenance")
+	}
+	if c := p.TorchCopies; c != nil {
+		if c.GPUSlots != 40 || c.HostSlots != 64 || c.Evidence == "" || len(c.Points) != 6 || c.BaselineAllocatedBytes <= 40*917504 || c.ReservedBytes < c.BaselineAllocatedBytes || c.ReservedBytes > 40<<30 {
+			return fmt.Errorf("invalid in-process Torch transfer profile")
+		}
+		seen := map[string]bool{}
+		for _, x := range c.Points {
+			if seen[x.Key()] || x.NUMA != 0 || x.Layout != "paged" || x.HostMemory != "pinned" || (x.Blocks != 1 && x.Blocks != 16 && x.Blocks != 32) || (x.Direction != "d2h" && x.Direction != "h2d") || x.Copies != int(x.Blocks)*56 || x.Evidence == "" {
+				return fmt.Errorf("invalid/duplicate in-process transfer point")
+			}
+			seen[x.Key()] = true
+			if err := x.Cost.Validate(); err != nil {
+				return err
+			}
+		}
+		for _, ns := range c.WarmSetupNS {
+			if ns < 0 {
+				return fmt.Errorf("negative in-process setup cost")
+			}
+		}
 	}
 	for _, a := range p.Train {
 		for _, b := range p.HeldOut {
@@ -140,6 +182,17 @@ func (p *Profile) Validate() error {
 		}
 	}
 	shapes := map[[2]int64]bool{}
+	pagedShapes := map[[2]int64]bool{}
+	for _, x := range p.PagedForward {
+		key := [2]int64{x.Prefix, x.Query}
+		if pagedShapes[key] {
+			return fmt.Errorf("duplicate paged forward shape %v", key)
+		}
+		pagedShapes[key] = true
+		if err := x.Validate(); err != nil {
+			return err
+		}
+	}
 	for _, x := range p.ComputeGrid {
 		key := [2]int64{x.Prefix, x.Query}
 		if x.Prefix < 0 || x.Query <= 0 || x.WallNS <= 0 || x.PeakAdditionalBytes < 0 || shapes[key] {
@@ -147,6 +200,7 @@ func (p *Profile) Validate() error {
 		}
 		shapes[key] = true
 	}
+	pagedStructure := false
 	for _, c := range p.Compute {
 		if c.InputCopyNS < 0 || c.PrefillNS <= 0 || c.CleanupNS < 0 || len(c.DecodeNS) != 8 || len(c.ReferenceTokens) != 8 {
 			return fmt.Errorf("invalid model compute profile")
@@ -175,6 +229,43 @@ func (p *Profile) Validate() error {
 					return fmt.Errorf("structural fractions must sum to one")
 				}
 			}
+			if c.Length == 256 && c.Mode == "resident" {
+				pagedStructure = true
+			}
+		}
+	}
+	if len(p.PagedForward) > 0 && !pagedStructure {
+		return fmt.Errorf("paged pipeline requires measured resident forward structure")
+	}
+	return nil
+}
+
+// Validate fails before graph construction: missing costs or memory envelopes
+// must never silently become zero-cost operations in the paged pipeline.
+func (x PagedForwardPoint) Validate() error {
+	const arena = int64(40 * 917504)
+	if x.Prefix < 0 || x.Prefix >= 640 || x.Query <= 0 || x.Query > 640-x.Prefix || x.ResidualNS < 0 || x.Evidence == "" {
+		return fmt.Errorf("invalid paged forward shape or provenance")
+	}
+	if x.BeforeAllocatedBytes <= arena || x.ReservedBytes < x.BeforeAllocatedBytes || x.ReservedBytes > 40<<30 {
+		return fmt.Errorf("invalid paged forward allocation envelope")
+	}
+	required := map[string]bool{"forward": false, "scatter_delta": true, "hf_release": false}
+	if x.Prefix > 0 {
+		required["gather_prefix"] = true
+	}
+	if len(x.Stages) != len(required) || len(x.PhasePeakDelta) != len(required) || len(x.PhaseEndDelta) != len(required) {
+		return fmt.Errorf("incomplete/unexpected paged forward phases")
+	}
+	for name, mapping := range required {
+		c, ok := x.Stages[name]
+		peak, peakOK := x.PhasePeakDelta[name]
+		end, endOK := x.PhaseEndDelta[name]
+		if !ok || c.WallNS <= 0 || c.SubmitNS < 0 || c.ServiceNS < 0 || c.ObserveNS < 0 || (mapping && (c.SubmitNS == 0 || c.ServiceNS == 0)) {
+			return fmt.Errorf("invalid paged forward phase cost %s", name)
+		}
+		if !peakOK || !endOK || end < 0 || peak < end || peak > x.ReservedBytes-x.BeforeAllocatedBytes {
+			return fmt.Errorf("invalid paged forward phase memory %s", name)
 		}
 	}
 	return nil

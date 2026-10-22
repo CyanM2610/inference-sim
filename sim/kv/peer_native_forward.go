@@ -1,0 +1,222 @@
+package kv
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+	"github.com/inference-sim/inference-sim/sim"
+	"github.com/inference-sim/inference-sim/sim/kvruntime"
+)
+
+// EnableTorchCopies opts into coefficients measured over live Torch-owned
+// pointers. Keeping this explicit preserves prior standalone-CUDA experiments.
+func (f *PeerFabric) EnableTorchCopies() error {
+	n := f.native
+	if n == nil || !n.pagedEnabled || n.profile.TorchCopies == nil {
+		return fmt.Errorf("live Torch copies require the paged backend and measured profile")
+	}
+	c := n.profile.TorchCopies
+	if f.stores[0].TotalBlocks != c.GPUSlots || f.pools["dram"].config.CapacityBlocks != c.HostSlots {
+		return fmt.Errorf("live Torch transfer arena shape mismatch")
+	}
+	points := map[string]kvruntime.TransferPoint{}
+	for _, p := range c.Points {
+		if p.Blocks == 1 {
+			points[p.Direction] = p
+		}
+	}
+	if len(points) != 2 {
+		return fmt.Errorf("missing live Torch single-block direction")
+	}
+	n.points = points
+	n.Runtime.Engine.Emit(kvruntime.Record{Name: "native_torch_copy_enabled", Reason: "56 native CUDA API copies per transaction over Torch-owned pointers; persistent stream/events; GPU 40 slots and pinned DRAM 64 slots; isolated service only, interference is not assumed free"})
+	return nil
+}
+
+func (f *PeerFabric) EnablePagedForward() error {
+	n := f.native
+	if n == nil || n.pagedEnabled || f.stores[0].TotalBlocks != 40 || len(n.profile.PagedForward) == 0 {
+		return fmt.Errorf("paged forward requires the measured 40-slot arena and pipeline profile")
+	}
+	var before, reserved int64
+	for _, p := range n.profile.PagedForward {
+		before = max(before, p.BeforeAllocatedBytes)
+		reserved = max(reserved, p.ReservedBytes)
+	}
+	arena := f.stores[0].TotalBlocks * f.bytes
+	if before <= arena || reserved < before {
+		return fmt.Errorf("invalid measured GPU allocation baseline")
+	}
+	m := n.Runtime.Memory
+	m.Capacity["hbm_workspace"] = (40 << 30) - arena
+	if err := m.RetainAllocator("hbm_workspace", reserved-arena, true); err != nil {
+		return err
+	}
+	if _, err := m.ReserveOpaque("native/model_context", "hbm_workspace", "opaque_model_context_and_gpu_resident_inputs", before-arena); err != nil {
+		return err
+	}
+	if err := m.Allocate("native/model_context"); err != nil {
+		return err
+	}
+	for _, b := range f.stores[0].Blocks {
+		if err := m.Invalidate(n.hbmID(b.ID)); err != nil {
+			return err
+		}
+	}
+	n.pagedContents = map[string][]kvruntime.Cell{}
+	n.pagedEnabled = true
+	n.Runtime.Engine.Emit(kvruntime.Record{Name: "native_paged_forward_enabled", Reason: "actual gather/forward/delta-scatter DAG; warm allocator reservation; transfer path remains native CUDA; concurrent slowdown uncalibrated"})
+	return nil
+}
+
+func (n *NativePeerRuntime) requestOrigins(req *sim.Request, count int64) ([]uint64, error) {
+	if count < 0 || count > int64(len(req.InputTokens)+len(req.OutputTokens)) {
+		return nil, fmt.Errorf("request lineage exceeds supplied token reference")
+	}
+	var previous [32]byte
+	origins := make([]uint64, count)
+	for i := int64(0); i < count; i++ {
+		token := sim.TokenID(0)
+		if i < int64(len(req.InputTokens)) {
+			token = req.InputTokens[i]
+		} else {
+			token = req.OutputTokens[i-int64(len(req.InputTokens))]
+		}
+		var input [36]byte
+		copy(input[:32], previous[:])
+		binary.LittleEndian.PutUint32(input[32:], uint32(token))
+		previous = sha256.Sum256(input[:])
+		key := fmt.Sprintf("token/%x", previous)
+		origin := n.origins[key]
+		if origin == 0 {
+			origin = uint64(len(n.origins)) + 1
+			n.origins[key] = origin
+			n.Runtime.Engine.Emit(kvruntime.Record{Name: "kv_token_identity", Source: req.ID, PrefixTokens: i, Origin: origin, PayloadKey: key, Reason: "causal_prefix_hash_over_supplied_input_and_output_reference"})
+		}
+		origins[i] = origin
+	}
+	return origins, nil
+}
+
+// BeginBatch implements sim.AsyncBatchExecutor. The simulator is woken only
+// after scatter publication and HF workspace release actually finish.
+func (s *PeerCache) AsyncBatchEnabled() bool {
+	return s.fabric.native != nil && s.fabric.native.pagedEnabled
+}
+func (s *PeerCache) BeginBatch(now int64, work []sim.BatchWork, done func(int64)) (bool, error) {
+	n := s.fabric.native
+	if n == nil || !n.pagedEnabled {
+		return false, nil
+	}
+	if len(work) != 1 || n.forwardActive {
+		return false, fmt.Errorf("native paged forward supports one active batch-one graph")
+	}
+	w := work[0]
+	var point *kvruntime.PagedForwardPoint
+	for i := range n.profile.PagedForward {
+		p := &n.profile.PagedForward[i]
+		if p.Prefix == w.PrefixTokens && p.Query == w.NewTokens {
+			point = p
+			break
+		}
+	}
+	if point == nil {
+		return false, fmt.Errorf("unmeasured paged pipeline prefix=%d query=%d", w.PrefixTokens, w.NewTokens)
+	}
+	n.advance(now)
+	origins, err := n.requestOrigins(w.Request, w.PrefixTokens+w.NewTokens)
+	if err != nil {
+		return false, err
+	}
+	ids := append([]int64(nil), s.RequestMap[w.Request.ID]...)
+	var slots []string
+	for _, id := range ids {
+		slots = append(slots, n.hbmID(id))
+	}
+	var weights []float64
+	for _, c := range n.profile.Compute {
+		if c.Length == 256 && c.Mode == "resident" {
+			index := 0
+			if w.NewTokens == 1 {
+				index = 1
+			}
+			weights = c.ForwardWeights[index]
+			break
+		}
+	}
+	n.forwardSerial++
+	name := fmt.Sprintf("request/%s/step/%d", w.Request.ID, n.forwardSerial)
+	n.forwardActive = true
+	_, err = n.Runtime.PagedStep(kvruntime.PagedStepSpec{Request: w.Request.ID, ID: name, Slots: slots, Prefix: w.PrefixTokens, Query: w.NewTokens, TokenOrigins: origins, Weights: weights, Point: *point, WorkspacePool: "hbm_workspace", Done: func(result *kvruntime.PagedStepResult) {
+		// Register complete reusable input blocks against the independent causal
+		// token reference, never against a copy of the observed destination bytes.
+		end := w.PrefixTokens + w.NewTokens
+		for page, id := range ids {
+			if int64((page+1)*16) > min(end, w.Request.InputLen()) {
+				break
+			}
+			hash := s.Blocks[id].Hash
+			if hash == "" {
+				n.Runtime.Engine.Fail(fmt.Errorf("full input block has no hash"))
+				return
+			}
+			expected := make([]kvruntime.Cell, 56*64)
+			for tensor := 0; tensor < 56; tensor++ {
+				for head := 0; head < 4; head++ {
+					for token := 0; token < 16; token++ {
+						expected[tensor*64+head*16+token] = kvruntime.Cell{Origin: origins[page*16+token], Offset: int64(tensor*4+head) * 256, Valid: true}
+					}
+				}
+			}
+			if old := n.pagedContents[hash]; old != nil {
+				for i := range old {
+					if old[i] != expected[i] {
+						n.Runtime.Engine.Fail(fmt.Errorf("prefix hash aliases different causal KV"))
+						return
+					}
+				}
+			} else {
+				n.pagedContents[hash] = expected
+			}
+			if err := n.checkPagedContents(hash, n.hbmID(id)); err != nil {
+				n.Runtime.Engine.Fail(err)
+				return
+			}
+		}
+		at := (result.CompleteNS + 999) / 1000
+		n.completed = append(n.completed, func() {
+			n.forwardActive = false
+			n.fabric.emit(PeerRecord{Time: at, Name: "native_forward_complete", Request: w.Request.ID, Value: at*1000 - result.CompleteNS, Duration: at - now, Counters: map[string]int64{"verified_cells": result.CellsVerified, "mapping_tasks": int64(result.MappingTasks), "workspace_peak_delta_bytes": result.AllocatedPeakDelta}})
+			done(at)
+		})
+	}})
+	if err != nil {
+		return false, err
+	}
+	n.arm(s.schedule)
+	return true, nil
+}
+func (n *NativePeerRuntime) checkPagedContents(hash, buffer string) error {
+	expected := n.pagedContents[hash]
+	b := n.Runtime.Memory.Buffers[buffer]
+	if expected == nil || b == nil || b.State != "ready" || len(b.Cells) != len(expected) {
+		return fmt.Errorf("unpublished or unknown paged payload %s", hash)
+	}
+	for i, c := range b.Cells {
+		if c != expected[i] {
+			return fmt.Errorf("paged payload mismatch hash=%s cell=%d", hash, i)
+		}
+	}
+	return nil
+}
+func (f *PeerFabric) NativeAllocationSnapshot() map[string]map[string]int64 {
+	if f.native == nil {
+		return nil
+	}
+	m := f.native.Runtime.Memory
+	out := map[string]map[string]int64{}
+	for p, active := range m.Used {
+		out[p] = map[string]int64{"active_bytes": active, "retained_bytes": m.Retained[p], "physical_bytes": m.PhysicalUsed(p), "peak_active_bytes": m.Peak[p], "peak_physical_bytes": m.PhysicalPeak[p]}
+	}
+	return out
+}

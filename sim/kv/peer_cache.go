@@ -121,6 +121,12 @@ func (s *PeerCache) unpin(b *KVBlock) {
 	}
 }
 func (s *PeerCache) invalidate(b *KVBlock) {
+	if n := s.fabric.native; n != nil && n.pagedEnabled {
+		n.advance(s.clock)
+		if err := n.Runtime.Memory.Invalidate(n.hbmID(b.ID)); err != nil {
+			panic(err)
+		}
+	}
 	if s.promoted[b.ID] {
 		s.emit("promotion_unused", "", b.Hash, "hbm", "", "evicted_before_use")
 		delete(s.promoted, b.ID)

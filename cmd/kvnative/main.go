@@ -31,7 +31,18 @@ func run() error {
 	out := flag.String("out", "", "new result directory")
 	key := flag.String("case", "", "single case key (default all measured shapes)")
 	model := flag.Bool("model", false, "execute measured real-model symbolic workflows")
+	paged := flag.Bool("paged-forward", false, "execute native partial-page forward grid")
+	torchCopy := flag.Bool("torch-copy", false, "execute native copies in the measured live Torch arena")
 	flag.Parse()
+	modes := 0
+	for _, enabled := range []bool{*model, *paged, *torchCopy} {
+		if enabled {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return fmt.Errorf("choose only one of -model, -paged-forward or -torch-copy")
+	}
 	if *path == "" || *out == "" {
 		return fmt.Errorf("usage: kvnative -profile profile.json -out new-directory [-case key]")
 	}
@@ -47,6 +58,12 @@ func run() error {
 	}
 	if err = writeJSON(filepath.Join(*out, "profile.json"), p); err != nil {
 		return err
+	}
+	if *paged {
+		return runPaged(p, *out, *key)
+	}
+	if *torchCopy {
+		return runTorchCopies(p, *out, *key)
 	}
 	if *model {
 		return runModels(p, *out, *key)
@@ -98,6 +115,76 @@ func run() error {
 		return fmt.Errorf("%d functional cases failed", len(failures))
 	}
 	return nil
+}
+func runTorchCopies(p *kvruntime.Profile, out, key string) error {
+	if p.TorchCopies == nil {
+		return fmt.Errorf("missing in-process copy profile")
+	}
+	var results []*kvruntime.TorchCopyResult
+	for _, point := range p.TorchCopies.Points {
+		if key != "" && key != point.Key() {
+			continue
+		}
+		file, err := os.Create(filepath.Join(out, strings.ReplaceAll(point.Key(), "/", "_")+".events.jsonl.gz"))
+		if err != nil {
+			return err
+		}
+		gz, _ := gzip.NewWriterLevel(file, gzip.BestSpeed)
+		encoder := json.NewEncoder(gz)
+		var encodeErr error
+		result, runErr := kvruntime.RunTorchCopyCase(p, point, func(e kvruntime.Record) {
+			if encodeErr == nil {
+				encodeErr = encoder.Encode(e)
+			}
+		})
+		gzErr := gz.Close()
+		fileErr := file.Close()
+		for _, err := range []error{runErr, encodeErr, gzErr, fileErr} {
+			if err != nil {
+				return err
+			}
+		}
+		results = append(results, result)
+		fmt.Printf("%s wall_ns=%d copies=%d verified_cells=%d\n", point.Key(), result.Transfer.CompleteNS-result.Transfer.StartNS, result.Transfer.Copies, result.CellsVerified)
+	}
+	if len(results) == 0 {
+		return fmt.Errorf("no matching in-process transfer shape")
+	}
+	return writeJSON(filepath.Join(out, "summary.json"), map[string]any{"cases": len(results), "completed": len(results), "results": results})
+}
+func runPaged(p *kvruntime.Profile, out, key string) error {
+	var results []*kvruntime.PagedFixtureResult
+	for _, point := range p.PagedForward {
+		name := fmt.Sprintf("paged/p%d/q%d", point.Prefix, point.Query)
+		if key != "" && name != key {
+			continue
+		}
+		file, err := os.Create(filepath.Join(out, strings.ReplaceAll(name, "/", "_")+".events.jsonl.gz"))
+		if err != nil {
+			return err
+		}
+		gz, _ := gzip.NewWriterLevel(file, gzip.BestSpeed)
+		encoder := json.NewEncoder(gz)
+		var encodeErr error
+		result, runErr := kvruntime.RunPagedFixture(p, point, func(e kvruntime.Record) {
+			if encodeErr == nil {
+				encodeErr = encoder.Encode(e)
+			}
+		})
+		gzErr := gz.Close()
+		fileErr := file.Close()
+		for _, err := range []error{runErr, encodeErr, gzErr, fileErr} {
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+		}
+		results = append(results, result)
+		fmt.Printf("%s wall_ns=%d mappings=%d verified_cells=%d\n", name, result.Step.CompleteNS-result.Step.StartNS, result.Step.MappingTasks, result.Step.CellsVerified)
+	}
+	if len(results) == 0 {
+		return fmt.Errorf("no matching paged forward shape")
+	}
+	return writeJSON(filepath.Join(out, "summary.json"), map[string]any{"cases": len(results), "completed": len(results), "results": results})
 }
 func runModels(p *kvruntime.Profile, out, key string) error {
 	var results []*kvruntime.ModelResult

@@ -61,31 +61,40 @@ type Config struct {
 	Mechanisms       *kv.PeerMechanisms  `json:"mechanisms,omitempty"`
 }
 type NativeConfig struct {
-	Profile     string `json:"profile"`
-	NUMA        int    `json:"numa"`
-	ComputeGrid bool   `json:"compute_grid,omitempty"`
+	TorchCopies  bool   `json:"torch_copies,omitempty"`
+	Profile      string `json:"profile"`
+	NUMA         int    `json:"numa"`
+	ComputeGrid  bool   `json:"compute_grid,omitempty"`
+	PagedForward bool   `json:"paged_forward,omitempty"`
 }
 type CPUProfile struct {
 	Count       int64 `json:"count"`
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
-	NativeEvents    []kvruntime.Record          `json:"-"`
-	NativeProfile   *kvruntime.Profile          `json:"native_profile,omitempty"`
-	NativeValidated bool                        `json:"native_validated,omitempty"`
-	Config          Config                      `json:"config"`
-	BlockBytes      int64                       `json:"block_bytes"`
-	Metrics         sim.MetricsOutput           `json:"metrics"`
-	Requests        []sim.RequestMetrics        `json:"requests"`
-	Events          []kv.PeerRecord             `json:"-"`
-	Pools           map[string]map[string]int64 `json:"pools"`
-	HBM             map[string]map[string]int64 `json:"hbm"`
-	Counts          map[string]int64            `json:"counts"`
-	CPU             map[string]CPUProfile       `json:"-"`
-	RoutingTrace    any                         `json:"-"`
+	NativeAllocations map[string]map[string]int64 `json:"native_allocations,omitempty"`
+	NativeEvents      []kvruntime.Record          `json:"-"`
+	NativeProfile     *kvruntime.Profile          `json:"native_profile,omitempty"`
+	NativeValidated   bool                        `json:"native_validated,omitempty"`
+	Config            Config                      `json:"config"`
+	BlockBytes        int64                       `json:"block_bytes"`
+	Metrics           sim.MetricsOutput           `json:"metrics"`
+	Requests          []sim.RequestMetrics        `json:"requests"`
+	Events            []kv.PeerRecord             `json:"-"`
+	Pools             map[string]map[string]int64 `json:"pools"`
+	HBM               map[string]map[string]int64 `json:"hbm"`
+	Counts            map[string]int64            `json:"counts"`
+	CPU               map[string]CPUProfile       `json:"-"`
+	RoutingTrace      any                         `json:"-"`
 }
 
 func (c Config) Validate() error {
+	if c.Native != nil && c.Native.TorchCopies && (!c.Native.PagedForward || len(c.Pools) != 1 || c.Pools[0].CapacityBlocks != 64) {
+		return fmt.Errorf("live Torch copy calibration requires paged_forward and the measured 64-slot DRAM pool")
+	}
+	if c.Native != nil && c.Native.PagedForward && (!c.Native.ComputeGrid || len(c.Instances) != 1 || c.Instances[0].HBMBlocks != 40 || c.Native.NUMA != 0) {
+		return fmt.Errorf("paged forward requires compute_grid, one 40-block arena and measured NUMA 0")
+	}
 	if c.Native != nil && c.Native.ComputeGrid && (c.MaxSequences != 1 || c.PrefillChunk != 128 || c.MaxBatchTokens < 128) {
 		return fmt.Errorf("native compute grid requires batch one and a 128-token prefill chunk")
 	}
@@ -194,6 +203,12 @@ func Run(c Config) (*Result, error) {
 			for _, shape := range p.ComputeGrid {
 				known[[2]int64{shape.Prefix, shape.Query}] = true
 			}
+			if c.Native.PagedForward {
+				known = map[[2]int64]bool{}
+				for _, shape := range p.PagedForward {
+					known[[2]int64{shape.Prefix, shape.Query}] = true
+				}
+			}
 			for _, req := range c.Requests {
 				length := int64(len(req.Input))
 				for prefix := int64(0); prefix < length; prefix += c.BlockTokens {
@@ -211,6 +226,16 @@ func Run(c Config) (*Result, error) {
 		}
 		if err = fabric.ConfigureNative(p, c.Native.NUMA, func(r kvruntime.Record) { out.NativeEvents = append(out.NativeEvents, r) }); err != nil {
 			return nil, err
+		}
+		if c.Native.PagedForward {
+			if err = fabric.EnablePagedForward(); err != nil {
+				return nil, err
+			}
+		}
+		if c.Native.TorchCopies {
+			if err = fabric.EnableTorchCopies(); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for _, r := range c.Requests {
@@ -303,6 +328,7 @@ func Run(c Config) (*Result, error) {
 		return out, err
 	}
 	out.NativeValidated = c.Native != nil
+	out.NativeAllocations = fabric.NativeAllocationSnapshot()
 	m := cs.AggregatedMetrics()
 	out.Metrics = m.BuildOutput("cluster")
 	out.Requests = m.CompletedRequestMetrics()
