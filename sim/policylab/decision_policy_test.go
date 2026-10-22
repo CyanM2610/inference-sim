@@ -180,3 +180,120 @@ func TestDecisionServiceConfigChargesPerDecisionOnRealRunner(t *testing.T) {
 		t.Fatal("incorrect service trace")
 	}
 }
+
+func TestDecisionEventTracePreservesFourBaselineBehaviors(t *testing.T) {
+	for _, top := range []string{"hbm", "dram"} {
+		for _, order := range []string{"fcfs", "sjf"} {
+			t.Run(top+"/"+order, func(t *testing.T) {
+				c := decisionLabConfig(top, order)
+				c.DecisionPolicy = &DecisionPolicyConfig{}
+				before, err := Run(c)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.DecisionPolicy.TraceEvents = true
+				after, err := Run(c)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(before.Events, after.Events) || !reflect.DeepEqual(before.FirstTokenUS, after.FirstTokenUS) || !reflect.DeepEqual(before.FinishedUS, after.FinishedUS) || !reflect.DeepEqual(before.BatchShapes, after.BatchShapes) || !reflect.DeepEqual(before.Requests, after.Requests) {
+					t.Fatal("event trace changed execution")
+				}
+				counts := map[string]int{}
+				for _, r := range after.PolicyEvents {
+					counts[r.Event.Kind]++
+					if r.CallbackWallNS != 0 || r.CostCoverage != sim.DecisionEventCostCoverage {
+						t.Fatal("trace-only path claimed callback/calibration")
+					}
+				}
+				for _, kind := range []string{"request_arrived", "first_output", "request_completed"} {
+					if counts[kind] != len(c.Requests) {
+						t.Fatalf("%s count=%d", kind, counts[kind])
+					}
+				}
+				if counts["batch_returned"] != len(after.BatchShapes) {
+					t.Fatal("batch notifications lost")
+				}
+				if top == "dram" && counts["transfer_adopted"] == 0 {
+					t.Fatal("transfer notifications lost")
+				}
+			})
+		}
+	}
+}
+
+type arrivalFeedbackPolicy struct{ arrivals int }
+
+func (p *arrivalFeedbackPolicy) Decide(v sim.DecisionView) sim.DecisionPlan {
+	cap := int64(1)
+	if p.arrivals > 1 {
+		cap = 4
+	}
+	base, _ := sim.NewQueueDecisionPolicy("fcfs", cap)
+	return base.Decide(v)
+}
+func (p *arrivalFeedbackPolicy) Observe(sim.DecisionFeedback) {}
+func (p *arrivalFeedbackPolicy) OnEvent(e sim.DecisionEvent) {
+	if e.Kind == "request_arrived" {
+		p.arrivals++
+	}
+}
+
+func TestDecisionEventListenerRunsThroughFactoryWithoutCoreChanges(t *testing.T) {
+	c := decisionLabConfig("hbm", "fcfs")
+	c.Requests = c.Requests[:2]
+	c.Requests[1].At = 5
+	c.DecisionPolicy = &DecisionPolicyConfig{ExtraCost: &sim.LinearDecisionCost{FixedUS: 10, Provenance: "synthetic callback fixture"}}
+	var p *arrivalFeedbackPolicy
+	r, err := RunWithDecisionPolicy(c, func(string) sim.DecisionPolicy { p = &arrivalFeedbackPolicy{}; return p })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.arrivals != 2 || r.PolicyDecisions[0].Plan.TokenCaps[0].Tokens != 1 || r.PolicyDecisions[1].Plan.TokenCaps[0].Tokens != 4 || len(r.PolicyEvents) == 0 || len(r.FirstTokenUS) != 2 {
+		t.Fatal("factory did not forward stateful lifecycle notifications")
+	}
+}
+
+func TestDecisionWaitConfigGatesActualAdmission(t *testing.T) {
+	c := decisionLabConfig("hbm", "fcfs")
+	c.Requests = c.Requests[:1]
+	c.Requests[0].Output = []sim.TokenID{9}
+	c.DecisionPolicy = &DecisionPolicyConfig{TraceEvents: true, AdmissionDelayUS: 1000}
+	r, err := Run(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.PolicyDecisions) != 2 || len(r.PolicyDecisions[0].Feedback.Grants) != 0 || r.PolicyDecisions[0].Feedback.Unselected[0].Reason != "policy_wait" || r.PolicyDecisions[1].Feedback.AtUS != 1000 || r.FirstTokenUS[c.Requests[0].ID] <= 1000 {
+		t.Fatal("JSON wait did not gate execution")
+	}
+	if r.Counts["sim.DecisionTimerEvent"] != 1 || r.PolicyDecisions[0].Feedback.WaitUpdates[0].UntilUS != 1000 {
+		t.Fatal("missing timer/action evidence")
+	}
+}
+
+type revisitPolicy struct{}
+
+func (*revisitPolicy) Decide(v sim.DecisionView) sim.DecisionPlan {
+	at := int64(1000000)
+	return sim.DecisionPlan{Version: v.Version, RevisitAtUS: &at}
+}
+func (*revisitPolicy) Observe(sim.DecisionFeedback) {}
+
+func TestDecisionRevisitDoesNotInflateClusterEndAfterCompletion(t *testing.T) {
+	c := decisionLabConfig("hbm", "fcfs")
+	c.Requests = c.Requests[:1]
+	c.Requests[0].Output = []sim.TokenID{9}
+	c.DecisionPolicy = &DecisionPolicyConfig{}
+	r, err := RunWithDecisionPolicy(c, func(string) sim.DecisionPolicy { return &revisitPolicy{} })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Counts["sim.DecisionTimerEvent"] != 0 {
+		t.Fatal("orphan timer executed after completion")
+	}
+	for _, e := range r.Events {
+		if e.Time >= 1000000 {
+			t.Fatal("orphan timer advanced cluster time")
+		}
+	}
+}

@@ -336,6 +336,7 @@ func (sim *Simulator) ProcessNextEvent() Event {
 		sim.EventObserver(ev, true)
 	}
 	ev.Execute(sim)
+	sim.refreshDecisionTimer(sim.Clock)
 	if sim.EventObserver != nil {
 		sim.EventObserver(ev, false)
 	}
@@ -627,6 +628,7 @@ func (sim *Simulator) EnqueueRequest(r *Request) {
 	if r.Deadline > 0 && r.Deadline <= sim.Clock {
 		r.State = StateTimedOut
 		sim.Metrics.TimedOutRequests++
+		sim.notifyDecisionEvent(DecisionEvent{Kind: "request_timed_out", OccurredUS: sim.Clock, Request: r.ID, Reason: "past_due_at_enqueue"})
 		if sim.OnRequestDone != nil {
 			for _, next := range sim.OnRequestDone(r, sim.Clock) {
 				sim.InjectArrival(next)
@@ -646,6 +648,7 @@ func (sim *Simulator) EnqueueRequest(r *Request) {
 	r.Priority = float64(sim.sloMap.InvertForVLLM(r.SLOClass))
 
 	sim.WaitQ.Enqueue(r)
+	sim.notifyDecisionEvent(DecisionEvent{Kind: "request_arrived", OccurredUS: sim.Clock, Request: r.ID})
 
 	// Schedule timeout event (after all guards + enqueue — BC-5)
 	// Skip scheduling when deadline > horizon (perf: avoids orphaned events)
@@ -673,6 +676,7 @@ func (sim *Simulator) EnqueueDecodeSubRequest(r *Request, clusterTime int64) {
 	r.Priority = float64(sim.sloMap.InvertForVLLM(r.SLOClass))
 
 	sim.WaitQ.Enqueue(r)
+	sim.notifyDecisionEvent(DecisionEvent{Kind: "request_arrived", OccurredUS: max(sim.Clock, clusterTime), Request: r.ID})
 	// Do NOT add len(r.InputTokens) to TotalInputTokens — already counted by prefill sub-request.
 
 	// Schedule timeout for decode sub-request (R23: parity with EnqueueRequest)
@@ -937,6 +941,9 @@ func (sim *Simulator) formScheduledBatch(now int64, tokenCaps map[string]int64, 
 		StepCount:             sim.stepCount,
 		ComputedTokens:        sim.reqNumComputedTokens,
 		TokenLimits:           tokenCaps,
+	}
+	if sim.decision != nil && len(sim.decision.waits) > 0 {
+		batchCtx.WaitingEligible = func(r *Request) bool { return sim.decisionWaitsUntil(r.ID) <= now }
 	}
 	if sim.residentAdapters != nil {
 		batchCtx.AdapterResident = sim.residentAdapters.IsResident
@@ -1256,6 +1263,7 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 
 			// Record completion metrics
 			sim.recordRequestCompletion(req)
+			sim.notifyDecisionEvent(DecisionEvent{Kind: "request_completed", OccurredUS: now + currStepAdvance, Request: req.ID})
 
 			// Invoke completion callback for session management
 			if sim.OnRequestDone != nil {
@@ -1297,6 +1305,7 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 				Request: req,
 			})
 			sim.recordRequestCompletion(req)
+			sim.notifyDecisionEvent(DecisionEvent{Kind: "request_completed", OccurredUS: now + currStepAdvance, Request: req.ID, Reason: "length_capped"})
 
 			// Invoke completion callback for session management (length-capped)
 			if sim.OnRequestDone != nil {

@@ -19,6 +19,7 @@ type DecisionRequest struct {
 	TTFTTargetUS      int64        `json:"ttft_target_us"`
 	DeadlineUS        int64        `json:"deadline_us"`
 	Priority          float64      `json:"priority"`
+	WaitUntilUS       int64        `json:"wait_until_us"`
 }
 
 type DecisionKVRequest struct {
@@ -68,8 +69,13 @@ type DecisionCapabilities struct {
 	Placement          bool `json:"placement"`
 	TransferPriority   bool `json:"transfer_priority"`
 	CostEstimates      bool `json:"cost_estimates"`
+	LifecycleEvents    bool `json:"lifecycle_events"`
+	TransferEvents     bool `json:"transfer_events"`
+	WaitUntil          bool `json:"wait_until"`
+	Revisit            bool `json:"revisit"`
 }
 type DecisionView struct {
+	RevisitAtUS       int64                `json:"revisit_at_us"`
 	Version           uint64               `json:"version"`
 	NowUS             int64                `json:"now_us"`
 	Waiting           []DecisionRequest    `json:"waiting"`
@@ -91,11 +97,23 @@ type DecisionTokenCap struct {
 
 // QueueOrder is nil for the runtime's current order, or a complete permutation
 // of Waiting. TokenCaps are positive upper bounds, not promised token grants.
-// Explicit waiting, preemption and restore/placement actions are not yet open.
+// Waits update waiting-request admission deadlines; RevisitAtUS schedules one
+// instance revisit. Omitted updates preserve state; explicit zero cancels it.
 type DecisionPlan struct {
-	Version    uint64             `json:"version"`
-	QueueOrder []string           `json:"queue_order,omitempty"`
-	TokenCaps  []DecisionTokenCap `json:"token_caps,omitempty"`
+	Version     uint64             `json:"version"`
+	QueueOrder  []string           `json:"queue_order,omitempty"`
+	TokenCaps   []DecisionTokenCap `json:"token_caps,omitempty"`
+	Waits       []DecisionWait     `json:"waits,omitempty"`
+	RevisitAtUS *int64             `json:"revisit_at_us,omitempty"`
+}
+type DecisionWait struct {
+	Request string `json:"request"`
+	UntilUS int64  `json:"until_us"`
+}
+type DecisionWaitOutcome struct {
+	Request string `json:"request,omitempty"`
+	UntilUS int64  `json:"until_us"`
+	Status  string `json:"status"`
 }
 type DecisionGrant struct {
 	Request string `json:"request"`
@@ -106,12 +124,14 @@ type DecisionUnselected struct {
 	Reason  string `json:"reason"`
 }
 type DecisionFeedback struct {
-	Version    uint64               `json:"version"`
-	AtUS       int64                `json:"at_us"`
-	Status     string               `json:"status"`
-	Reason     string               `json:"reason,omitempty"`
-	Grants     []DecisionGrant      `json:"grants,omitempty"`
-	Unselected []DecisionUnselected `json:"unselected,omitempty"`
+	Version     uint64                `json:"version"`
+	AtUS        int64                 `json:"at_us"`
+	Status      string                `json:"status"`
+	Reason      string                `json:"reason,omitempty"`
+	Grants      []DecisionGrant       `json:"grants,omitempty"`
+	Unselected  []DecisionUnselected  `json:"unselected,omitempty"`
+	WaitUpdates []DecisionWaitOutcome `json:"wait_updates,omitempty"`
+	Revisit     *DecisionWaitOutcome  `json:"revisit,omitempty"`
 }
 type DecisionRecord struct {
 	Instance       string           `json:"instance,omitempty"`
@@ -130,11 +150,16 @@ type DecisionPolicy interface {
 	Observe(DecisionFeedback)
 }
 type decisionRuntime struct {
-	policy  DecisionPolicy
-	observe func(DecisionRecord)
-	record  DecisionRecord
-	cost    DecisionCostModel
-	pending *DecisionCompleteEvent
+	policy    DecisionPolicy
+	observe   func(DecisionRecord)
+	record    DecisionRecord
+	cost      DecisionCostModel
+	pending   *DecisionCompleteEvent
+	events    *decisionEvents
+	applying  bool
+	waits     map[string]decisionWaitState
+	revisitAt int64
+	timer     *DecisionTimerEvent
 }
 
 func (s *Simulator) SetDecisionPolicy(policy DecisionPolicy, observe func(DecisionRecord)) error {
@@ -145,6 +170,13 @@ func (s *Simulator) SetDecisionPolicy(policy DecisionPolicy, observe func(Decisi
 		return fmt.Errorf("decision token caps require VLLMBatchFormation")
 	}
 	s.decision = &decisionRuntime{policy: policy, observe: observe}
+	if listener, ok := policy.(DecisionEventListener); ok {
+		if err := s.enableDecisionEvents(); err != nil {
+			s.decision = nil
+			return err
+		}
+		s.decision.events.listener = listener
+	}
 	return nil
 }
 
@@ -153,15 +185,27 @@ func (s *Simulator) decisionView(now int64) DecisionView {
 		BlockTokens: s.KVCache.BlockSize(), HBMCapacityBlocks: s.KVCache.TotalCapacity(), HBMFreeBlocks: s.KVCache.TotalCapacity() - s.KVCache.UsedBlocks(),
 		Capabilities: DecisionCapabilities{QueueOrder: true, TokenCaps: true}}
 	_, v.Capabilities.ReadyRestoresFirst = s.KVCache.(DeferredAdmissionStore)
+	v.Capabilities.WaitUntil, v.Capabilities.Revisit = s.batchCompletionEvents, s.batchCompletionEvents
+	if s.decision != nil {
+		v.RevisitAtUS = s.decision.revisitAt
+	}
+	if s.decision != nil && s.decision.events != nil {
+		v.Capabilities.LifecycleEvents = true
+		_, v.Capabilities.TransferEvents = s.KVCache.(DecisionEventSource)
+	}
 	var queries []DecisionKVQuery
 	view := func(r *Request) DecisionRequest {
+		waitUntil := int64(0)
+		if s.decision != nil {
+			waitUntil = s.decision.waits[r.ID].until
+		}
 		emitted := int64(0)
 		if r.TTFTSet {
 			emitted = max(0, r.ProgressIndex-r.InputLen()+1)
 		}
 		queries = append(queries, DecisionKVQuery{ID: r.ID, Input: append([]TokenID(nil), r.FullInputTokens()...)})
 		return DecisionRequest{ID: r.ID, State: r.State, ArrivalUS: r.ArrivalTime, InputTokens: r.InputLen(), ComputedTokens: r.ProgressIndex, EmittedTokens: emitted,
-			ClientOutputLimit: r.MaxOutputLen, TTFTTargetUS: r.SLOTargetUs, DeadlineUS: r.Deadline, Priority: r.Priority}
+			ClientOutputLimit: r.MaxOutputLen, TTFTTargetUS: r.SLOTargetUs, DeadlineUS: r.Deadline, Priority: r.Priority, WaitUntilUS: waitUntil}
 	}
 	for _, r := range s.WaitQ.Items() {
 		v.Waiting = append(v.Waiting, view(r))
@@ -189,11 +233,21 @@ func cloneDecisionPlan(p DecisionPlan) DecisionPlan {
 		p.QueueOrder = append([]string{}, p.QueueOrder...)
 	}
 	p.TokenCaps = append([]DecisionTokenCap(nil), p.TokenCaps...)
+	p.Waits = append([]DecisionWait(nil), p.Waits...)
+	if p.RevisitAtUS != nil {
+		at := *p.RevisitAtUS
+		p.RevisitAtUS = &at
+	}
 	return p
 }
 func cloneDecisionFeedback(f DecisionFeedback) DecisionFeedback {
 	f.Grants = append([]DecisionGrant(nil), f.Grants...)
 	f.Unselected = append([]DecisionUnselected(nil), f.Unselected...)
+	f.WaitUpdates = append([]DecisionWaitOutcome(nil), f.WaitUpdates...)
+	if f.Revisit != nil {
+		revisit := *f.Revisit
+		f.Revisit = &revisit
+	}
 	return f
 }
 
@@ -228,6 +282,16 @@ func ValidateDecision(v DecisionView, p DecisionPlan) error {
 			return fmt.Errorf("invalid token cap for %q", cap.Request)
 		}
 		seen[cap.Request] = true
+	}
+	seen = map[string]bool{}
+	for _, wait := range p.Waits {
+		if !v.Capabilities.WaitUntil || !waiting[wait.Request] || seen[wait.Request] || wait.UntilUS < 0 || (wait.UntilUS > 0 && wait.UntilUS <= v.NowUS) {
+			return fmt.Errorf("invalid wait deadline for %q", wait.Request)
+		}
+		seen[wait.Request] = true
+	}
+	if p.RevisitAtUS != nil && (!v.Capabilities.Revisit || *p.RevisitAtUS < 0 || (*p.RevisitAtUS > 0 && (*p.RevisitAtUS <= v.NowUS || len(visible) == 0))) {
+		return fmt.Errorf("invalid revisit deadline")
 	}
 	return nil
 }
@@ -282,6 +346,7 @@ func (s *Simulator) applyDecisionPlan() map[string]int64 {
 	d := s.decision
 	start := time.Now()
 	plan := d.record.Plan
+	s.applyDecisionWaits(s.decisionAppliedAt())
 	if plan.QueueOrder != nil {
 		rank := map[string]int{}
 		for i, id := range plan.QueueOrder {
@@ -304,7 +369,7 @@ func (s *Simulator) finishDecision(result BatchResult) {
 	}
 	d := s.decision
 	runtimeStart := time.Now()
-	f := DecisionFeedback{Version: d.record.View.Version, Status: "applied"}
+	f := DecisionFeedback{Version: d.record.View.Version, Status: "applied", WaitUpdates: d.record.Feedback.WaitUpdates, Revisit: d.record.Feedback.Revisit}
 	selected, preempted, pending := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, r := range result.RunningBatch.Requests {
 		if r.NumNewTokens > 0 {
@@ -325,6 +390,9 @@ func (s *Simulator) finishDecision(result BatchResult) {
 		reason := "runtime_not_selected" // no invented capacity/dependency cause
 		if pending[r.ID] {
 			reason = "kv_pending"
+		}
+		if s.decisionWaitsUntil(r.ID) > s.decisionAppliedAt() {
+			reason = "policy_wait"
 		}
 		if preempted[r.ID] {
 			reason = "preempted"
