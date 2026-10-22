@@ -66,6 +66,9 @@ type SimConfig struct {
 	// Simulation control (no sub-config — no factory uses only these)
 	Horizon int64
 	Seed    int64
+	// BatchCompletionEvents separates execution from completion for shared KV experiments.
+	// The default retains the original step model.
+	BatchCompletionEvents bool
 
 	// Module-scoped sub-configs (R16)
 	KVCacheConfig
@@ -106,8 +109,10 @@ type Simulator struct {
 	// In vLLM, running is a list (not queue) of requests, hence we don't call it RunningQ here.
 	// Requests are ordered by First-Come-First-Served in WaitQ, and the same order is maintained
 	// while adding requests to RunningBatch
-	RunningBatch *Batch
-	Metrics      *Metrics
+	RunningBatch          *Batch
+	Metrics               *Metrics
+	EventObserver         func(Event, bool) // before/after execution; observation only
+	batchCompletionEvents bool
 	// max number of requests RunningBatch can hold
 	maxNumSeqs int64
 	// max total number of new tokens across all requests in RunningBatch
@@ -118,9 +123,9 @@ type Simulator struct {
 	// map of request IDs to total num computed tokens (including cached tokens)
 	reqNumComputedTokens map[string]int64
 	batchFormation       BatchFormation
-	model       string
-	gpu         string
-	maxModelLen int64 // max total sequence length (0 = unlimited)
+	model                string
+	gpu                  string
+	maxModelLen          int64 // max total sequence length (0 = unlimited)
 	// Speculative decoding / MTP (#1528). specEnabled gates ALL spec-decode behavior;
 	// when false every decode path is byte-identical to a pre-feature build (INV-6).
 	// specTokensPerStep is the mean accepted tokens/step (1+α·K) consumed by the
@@ -194,6 +199,7 @@ func NewSimulator(cfg SimConfig, kvStore KVStore, latencyModel LatencyModel) (*S
 
 	s := &Simulator{
 		Clock:                     0,
+		batchCompletionEvents:     cfg.BatchCompletionEvents,
 		Horizon:                   cfg.Horizon,
 		eventQueue:                make(EventQueue, 0),
 		WaitQ:                     &WaitQueue{},
@@ -325,7 +331,13 @@ func (sim *Simulator) ProcessNextEvent() Event {
 
 	sim.Clock = ev.Timestamp()
 	logrus.Debugf("[tick %07d] Executing %T", sim.Clock, ev)
+	if sim.EventObserver != nil {
+		sim.EventObserver(ev, true)
+	}
 	ev.Execute(sim)
+	if sim.EventObserver != nil {
+		sim.EventObserver(ev, false)
+	}
 	return ev
 }
 
@@ -822,6 +834,26 @@ func (sim *Simulator) Step(now int64) {
 		return
 	}
 	sim.scheduleBatch(now)
+	if sim.batchCompletionEvents {
+		if len(sim.RunningBatch.Requests) == 0 {
+			// A KV completion or a new arrival will wake the engine.
+			sim.stepEvent = nil
+			return
+		}
+		if sim.beginAsyncBatch(now) {
+			return
+		}
+		duration := sim.batchStepDuration()
+		ev := &BatchCompleteEvent{At: now + duration, Start: now, Duration: duration}
+		for _, r := range sim.RunningBatch.Requests {
+			if r.NumNewTokens > 0 {
+				ev.Requests = append(ev.Requests, r.ID)
+			}
+		}
+		sim.Schedule(ev)
+		sim.stepEvent = ev
+		return
+	}
 	currStepAdvance := sim.executeBatchStep(now)
 	// Mirror in-use blocks to CPU tier (no-op for single-tier KVCacheState).
 	// Runs after execution (new full blocks exist) and before completions
@@ -1042,6 +1074,10 @@ func (sim *Simulator) commitDecodeTokens(req *Request) {
 // executeBatchStep handles Phase 2: model execution (prefill + decode) for all requests
 // in the running batch. Returns the step time advance in ticks.
 func (sim *Simulator) executeBatchStep(now int64) int64 {
+	return sim.executeBatchDuration(now, sim.batchStepDuration())
+}
+
+func (sim *Simulator) batchStepDuration() int64 {
 	// Match vLLM's scheduled_running_reqs: only requests that were allocated
 	// tokens by FormBatch participate in the forward pass latency computation.
 	// Requests with NumNewTokens=0 (past Phase 1 break point, token budget
@@ -1066,6 +1102,10 @@ func (sim *Simulator) executeBatchStep(now int64) int64 {
 	// All LatencyModel implementations must return >= 1 per interface contract;
 	// this floor catches violations that would cause infinite livelock.
 	currStepAdvance = max(1, currStepAdvance)
+	return currStepAdvance
+}
+
+func (sim *Simulator) executeBatchDuration(now, currStepAdvance int64) int64 {
 
 	// Subprocess: Model Execution - this could be prefill or decode depending on the request.
 	// similar to vLLM's execute_model()
@@ -1152,7 +1192,9 @@ func (sim *Simulator) processCompletions(now, currStepAdvance int64) []*Request 
 			// for the final token.
 			// ITL is NOT appended here — executeBatchStep already recorded it
 			// for this decode step (fix for #524 phantom ITL entry).
-			if len(req.OutputTokens) > 0 && req.ProgressIndex < req.InputLen()+util.Len64(req.OutputTokens) {
+			// In completion-event mode the final generated token has never been
+			// fed back through attention, so it has no KV to allocate or store.
+			if !sim.batchCompletionEvents && len(req.OutputTokens) > 0 && req.ProgressIndex < req.InputLen()+util.Len64(req.OutputTokens) {
 				ok := sim.KVCache.AllocateKVBlocks(req, req.ProgressIndex, req.ProgressIndex+1, []int64{})
 				if !ok {
 					logrus.Errorf("[tick %07d] KV allocation failed for completing request %s (request will still complete) — this indicates a cache accounting bug", now, req.ID)
