@@ -9,6 +9,7 @@ import (
 // TokenOrigins identify the full causal input prefix, including reference output
 // tokens already consumed by decode. They are not numerical model predictions.
 type PagedStepSpec struct {
+	Inputs              *RequestInputs
 	HostOutputBuffer    string
 	OutputCopyResource  string
 	OutputStreamGroup   string
@@ -121,6 +122,20 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 		return id
 	}
 	inputs, outputs := make([]string, 56), make([]string, 56)
+	var binding *InputBinding
+	if s.Inputs != nil {
+		if s.Point.Output == nil {
+			return nil, fmt.Errorf("physical request inputs require output observation")
+		}
+		begin := beginPhase("index_bind")
+		var tail int64
+		var err error
+		binding, tail, err = s.Inputs.Bind(s.ID, s.Request, s.Prefix, s.Query, s.Slots, []int64{begin})
+		if err != nil {
+			return nil, err
+		}
+		endPhase("index_bind", []int64{tail}, 0, nil)
+	}
 	for i := range inputs {
 		inputs[i] = fmt.Sprintf("%s/input/%d", s.ID, i)
 		outputs[i] = fmt.Sprintf("%s/output/%d", s.ID, i)
@@ -209,6 +224,9 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 	}
 	forwardBegin := beginPhase("forward")
 	tailID := forwardBegin
+	if binding != nil {
+		tailID = e.MustAdd(Task{Name: "request_query_acquire", Operation: s.ID + "/forward", Resource: "cpu", Parents: []int64{tailID}, Finish: binding.AcquireQuery})
+	}
 	// A measured phase peak supplies a conservative, explicitly opaque
 	// activation envelope. KV and logits remain separately accounted objects.
 	knownKVPeak := n*56*1024 + 2*s.Prefix*1024
@@ -300,6 +318,11 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 		}})
 	}
 	endPhase("forward", []int64{tailID}, 0, func() error {
+		if binding != nil {
+			if err := binding.ReleaseQuery(); err != nil {
+				return err
+			}
+		}
 		if logitsBytes > 0 {
 			if err := alloc(logitsID, "opaque_logits_and_retained_forward_output", logitsBytes, true); err != nil {
 				return err
@@ -334,8 +357,29 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 			result.OutputObservedNS = e.NowNS
 			result.OutputBytes = tx.Bytes
 			e.Emit(Record{Name: "paged_output_observed", Request: s.Request, Operation: s.ID, Source: outputID, Destination: s.HostOutputBuffer, Origin: s.OutputValue, Bytes: tx.Bytes, Reason: s.OutputReferenceKind})
+			if binding != nil {
+				return nil
+			} // GPU token is still a D2D source until cleanup.
 			return m.Free(outputID)
 		})
+		if binding != nil {
+			if binding.NeedsNextInput() {
+				begin := beginPhase("next_input_d2d")
+				tail, err := binding.ObserveOutput(outputID, s.OutputValue, []int64{begin})
+				if err != nil {
+					return nil, err
+				}
+				endPhase("next_input_d2d", []int64{tail}, 0, nil)
+			} else {
+				tail, err := binding.ObserveOutput(outputID, s.OutputValue, parents)
+				if err != nil {
+					return nil, err
+				}
+				if tail != 0 {
+					parents = []int64{tail}
+				}
+			}
+		}
 	}
 	scatter, ok := s.Point.Stages["scatter_delta"]
 	if !ok || scatter.SubmitNS <= 0 || scatter.ServiceNS <= 0 {
@@ -429,7 +473,15 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 			}
 		}
 		if logitsBytes > 0 {
-			return m.Free(logitsID)
+			if err := m.Free(logitsID); err != nil {
+				return err
+			}
+		}
+		if binding != nil {
+			if err := m.Free(outputID); err != nil {
+				return err
+			}
+			return binding.ReleaseIndices()
 		}
 		return nil
 	})

@@ -61,6 +61,7 @@ type Config struct {
 	Mechanisms       *kv.PeerMechanisms  `json:"mechanisms,omitempty"`
 }
 type NativeConfig struct {
+	InputCopies      bool   `json:"input_copies,omitempty"`
 	OutputCopies     bool   `json:"output_copies,omitempty"`
 	CopyEnginePolicy string `json:"copy_engine_policy,omitempty"`
 	TorchCopies      bool   `json:"torch_copies,omitempty"`
@@ -92,6 +93,9 @@ type Result struct {
 
 func (c Config) Validate() error {
 	if c.Native != nil {
+		if c.Native.InputCopies && !c.Native.OutputCopies {
+			return fmt.Errorf("input copies require output_copies")
+		}
 		if c.Native.OutputCopies && (!c.Native.TorchCopies || !c.Native.PagedForward) {
 			return fmt.Errorf("output copies require paged_forward and torch_copies")
 		}
@@ -253,6 +257,22 @@ func Run(c Config) (*Result, error) {
 				policy = "fifo"
 			}
 			if err = fabric.EnableOutputCopies(policy); err != nil {
+				return nil, err
+			}
+		}
+		if c.Native.InputCopies {
+			var inputRequests []kvruntime.InputRequest
+			for _, r := range c.Requests {
+				x := kvruntime.InputRequest{ID: r.ID}
+				for _, token := range r.Input {
+					x.Prompt = append(x.Prompt, uint64(uint32(token)))
+				}
+				for _, token := range r.Output {
+					x.Output = append(x.Output, uint64(uint32(token)))
+				}
+				inputRequests = append(inputRequests, x)
+			}
+			if err = fabric.EnableInputPipeline(inputRequests); err != nil {
 				return nil, err
 			}
 		}

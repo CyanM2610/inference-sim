@@ -12,6 +12,7 @@ import (
 // Arenas are already allocated at admission (steady state). Slot reuse changes
 // contents, never allocated byte count. Only single-instance pinned DRAM works.
 type NativePeerRuntime struct {
+	inputs                      *kvruntime.RequestInputs
 	outputEnabled               bool
 	pagedEnabled, forwardActive bool
 	pagedContents               map[string][]kvruntime.Cell

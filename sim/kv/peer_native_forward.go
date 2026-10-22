@@ -8,6 +8,41 @@ import (
 	"github.com/inference-sim/inference-sim/sim/kvruntime"
 )
 
+func (f *PeerFabric) EnableInputPipeline(requests []kvruntime.InputRequest) error {
+	n := f.native
+	if n == nil || !n.outputEnabled || n.inputs != nil || n.profile.InputPipeline == nil {
+		return fmt.Errorf("input pipeline requires output copies and measured input profile")
+	}
+	p := n.profile.InputPipeline
+	m := n.Runtime.Memory
+	context := m.Buffers["native/model_context"]
+	if context == nil || context.Bytes <= p.ReplacedGPUInputBytes {
+		return fmt.Errorf("input baseline replacement exceeds context")
+	}
+	remaining := context.Bytes - p.ReplacedGPUInputBytes
+	if err := m.Free(context.ID); err != nil {
+		return err
+	}
+	if _, err := m.ReserveOpaque("native/model_context", "hbm_workspace", "opaque_model_context_excluding_explicit_request_inputs", remaining); err != nil {
+		return err
+	}
+	if err := m.Allocate("native/model_context"); err != nil {
+		return err
+	}
+	m.Capacity["host_input"] = 2 * p.HostIndexBytes
+	var pages []string
+	for id := int64(0); id < f.stores[0].TotalBlocks; id++ {
+		pages = append(pages, n.hbmID(id))
+	}
+	inputs, err := kvruntime.NewRequestInputs(n.Runtime, *p, "hbm_workspace", "host_input", pages, requests)
+	if err != nil {
+		return err
+	}
+	n.inputs = inputs
+	n.Runtime.Engine.Emit(kvruntime.Record{Name: "native_input_pipeline_enabled", Bytes: p.ReplacedGPUInputBytes, Reason: "replace opaque warm input footprint with physical request buffers, index H2D, next-token D2D and generation-readiness checks"})
+	return nil
+}
+
 func (f *PeerFabric) EnableOutputCopies(policy string) error {
 	n := f.native
 	if n == nil || !n.pagedEnabled || n.outputEnabled {
@@ -184,7 +219,7 @@ func (s *PeerCache) BeginBatch(now int64, work []sim.BatchWork, done func(int64)
 	n.forwardSerial++
 	name := fmt.Sprintf("request/%s/step/%d", w.Request.ID, n.forwardSerial)
 	n.forwardActive = true
-	spec := kvruntime.PagedStepSpec{Request: w.Request.ID, ID: name, Slots: slots, Prefix: w.PrefixTokens, Query: w.NewTokens, TokenOrigins: origins, Weights: weights, Point: *point, WorkspacePool: "hbm_workspace"}
+	spec := kvruntime.PagedStepSpec{Inputs: n.inputs, Request: w.Request.ID, ID: name, Slots: slots, Prefix: w.PrefixTokens, Query: w.NewTokens, TokenOrigins: origins, Weights: weights, Point: *point, WorkspacePool: "hbm_workspace"}
 	if point.Output != nil {
 		if !n.outputEnabled {
 			return false, fmt.Errorf("output-aware profile requires output_copies configuration")

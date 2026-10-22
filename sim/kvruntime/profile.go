@@ -65,19 +65,20 @@ type BridgePoint struct {
 	Evidence            string                  `json:"evidence"`
 }
 type Profile struct {
-	TorchCopies        *TorchCopyProfile   `json:"torch_copies,omitempty"`
-	PagedForward       []PagedForwardPoint `json:"paged_forward,omitempty"`
-	ComputeGrid        []ComputeShape      `json:"compute_grid,omitempty"`
-	Version            int                 `json:"schema_version"`
-	Condition          string              `json:"condition"`
-	QueueDepth         int                 `json:"queue_depth"`
-	QueueDepthEvidence string              `json:"queue_depth_evidence"`
-	Train              []int               `json:"train_processes"`
-	HeldOut            []int               `json:"held_out_processes"`
-	SourceSHA256       map[string]string   `json:"source_sha256"`
-	Transfers          []TransferPoint     `json:"transfers"`
-	Allocations        []AllocationPoint   `json:"allocations"`
-	Compute            []ComputePoint      `json:"compute"`
+	InputPipeline      *InputPipelineProfile `json:"input_pipeline,omitempty"`
+	TorchCopies        *TorchCopyProfile     `json:"torch_copies,omitempty"`
+	PagedForward       []PagedForwardPoint   `json:"paged_forward,omitempty"`
+	ComputeGrid        []ComputeShape        `json:"compute_grid,omitempty"`
+	Version            int                   `json:"schema_version"`
+	Condition          string                `json:"condition"`
+	QueueDepth         int                   `json:"queue_depth"`
+	QueueDepthEvidence string                `json:"queue_depth_evidence"`
+	Train              []int                 `json:"train_processes"`
+	HeldOut            []int                 `json:"held_out_processes"`
+	SourceSHA256       map[string]string     `json:"source_sha256"`
+	Transfers          []TransferPoint       `json:"transfers"`
+	Allocations        []AllocationPoint     `json:"allocations"`
+	Compute            []ComputePoint        `json:"compute"`
 }
 type TorchCopyProfile struct {
 	GPUSlots               int64            `json:"gpu_slots"`
@@ -130,6 +131,11 @@ func LoadProfile(path string) (*Profile, error) {
 	return &p, nil
 }
 func (p *Profile) Validate() error {
+	if p.InputPipeline != nil {
+		if err := p.InputPipeline.Validate(); err != nil {
+			return err
+		}
+	}
 	if p.Version != 1 || p.QueueDepth <= 0 || len(p.SourceSHA256) == 0 {
 		return fmt.Errorf("invalid profile version, queue depth or provenance")
 	}
