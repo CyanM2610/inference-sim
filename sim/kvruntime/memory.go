@@ -15,6 +15,7 @@ type Cell struct {
 	Valid  bool
 }
 type Buffer struct {
+	CellBytes           int64
 	ID, Pool, Kind      string
 	Bytes               int64
 	State               string
@@ -49,16 +50,24 @@ func NewMemory(e *Engine, unit int64, capacity map[string]int64) (*Memory, error
 	return &Memory{Unit: unit, Capacity: c, Used: map[string]int64{}, Peak: map[string]int64{}, Retained: map[string]int64{}, PhysicalPeak: map[string]int64{}, FixedAllocator: map[string]bool{}, Buffers: map[string]*Buffer{}, e: e}, nil
 }
 func (m *Memory) Reserve(id, pool, kind string, bytes int64) (*Buffer, error) {
-	return m.reserve(id, pool, kind, bytes, false)
+	return m.reserve(id, pool, kind, bytes, m.Unit, false)
+}
+
+// ReserveGranular keeps tiny control payloads (such as an int64 output token)
+// in the same physical/reference ledger without inflating them to a KV granule.
+// Copy endpoints must use the same granularity; implicit reinterpretation is
+// rejected because it could lose byte-range identity.
+func (m *Memory) ReserveGranular(id, pool, kind string, bytes, cellBytes int64) (*Buffer, error) {
+	return m.reserve(id, pool, kind, bytes, cellBytes, false)
 }
 
 // ReserveOpaque accounts for measured non-KV resident allocations without
 // inventing their tensor contents. Opaque storage cannot enter a KV transfer.
 func (m *Memory) ReserveOpaque(id, pool, kind string, bytes int64) (*Buffer, error) {
-	return m.reserve(id, pool, kind, bytes, true)
+	return m.reserve(id, pool, kind, bytes, m.Unit, true)
 }
-func (m *Memory) reserve(id, pool, kind string, bytes int64, opaque bool) (*Buffer, error) {
-	if id == "" || m.Buffers[id] != nil || bytes <= 0 || bytes%m.Unit != 0 {
+func (m *Memory) reserve(id, pool, kind string, bytes, cellBytes int64, opaque bool) (*Buffer, error) {
+	if id == "" || m.Buffers[id] != nil || bytes <= 0 || cellBytes <= 0 || bytes%cellBytes != 0 {
 		return nil, fmt.Errorf("invalid/duplicate buffer or unaligned size %s", id)
 	}
 	if m.Capacity[pool]-m.Used[pool] < bytes {
@@ -67,15 +76,19 @@ func (m *Memory) reserve(id, pool, kind string, bytes int64, opaque bool) (*Buff
 	if m.FixedAllocator[pool] && m.Used[pool]+bytes > m.Retained[pool] {
 		return nil, fmt.Errorf("unprofiled allocator growth in %s", pool)
 	}
-	b := &Buffer{ID: id, Pool: pool, Kind: kind, Bytes: bytes, State: "reserved", Opaque: opaque}
+	b := &Buffer{ID: id, Pool: pool, Kind: kind, Bytes: bytes, State: "reserved", Opaque: opaque, CellBytes: cellBytes}
 	if !opaque {
-		b.Cells = make([]Cell, bytes/m.Unit)
+		b.Cells = make([]Cell, bytes/cellBytes)
 	}
 	m.Buffers[id] = b
 	m.Used[pool] += bytes
 	m.Peak[pool] = max(m.Peak[pool], m.Used[pool])
 	m.PhysicalPeak[pool] = max(m.PhysicalPeak[pool], m.PhysicalUsed(pool))
-	m.e.Emit(Record{Name: "memory_reserve", Destination: id, Resource: pool, Bytes: bytes, Reason: kind})
+	granule := int64(0)
+	if cellBytes != m.Unit {
+		granule = cellBytes
+	}
+	m.e.Emit(Record{Name: "memory_reserve", Destination: id, Resource: pool, Bytes: bytes, Reason: kind, CellBytes: granule})
 	return b, nil
 }
 func (m *Memory) Allocate(id string) error {
@@ -93,7 +106,7 @@ func (m *Memory) Fill(id string, origin uint64) error {
 		return fmt.Errorf("fill of unavailable buffer %s", id)
 	}
 	for i := range b.Cells {
-		b.Cells[i] = Cell{origin, int64(i) * m.Unit, true}
+		b.Cells[i] = Cell{origin, int64(i) * b.CellBytes, true}
 	}
 	b.Touched = true
 	b.State = "ready"
@@ -182,15 +195,15 @@ func (m *Memory) copy(src, dst string, so, do, n int64, padding bool) error {
 	if a == nil || b == nil || a.Opaque || b.Opaque || a.Pins <= 0 || a.State != "ready" || b.Writers != 1 {
 		return fmt.Errorf("copy without live pin/writer")
 	}
-	if n <= 0 || so < 0 || do < 0 || so%m.Unit != 0 || do%m.Unit != 0 || n%m.Unit != 0 || so > a.Bytes-n || do > b.Bytes-n {
+	if a.CellBytes != b.CellBytes || n <= 0 || so < 0 || do < 0 || so%a.CellBytes != 0 || do%b.CellBytes != 0 || n%a.CellBytes != 0 || so > a.Bytes-n || do > b.Bytes-n {
 		return fmt.Errorf("copy range out of bounds/unaligned")
 	}
-	for _, c := range a.Cells[so/m.Unit : (so+n)/m.Unit] {
+	for _, c := range a.Cells[so/a.CellBytes : (so+n)/a.CellBytes] {
 		if !c.Valid && !padding {
 			return fmt.Errorf("copy of uninitialized source")
 		}
 	}
-	copy(b.Cells[do/m.Unit:(do+n)/m.Unit], a.Cells[so/m.Unit:(so+n)/m.Unit])
+	copy(b.Cells[do/b.CellBytes:(do+n)/b.CellBytes], a.Cells[so/a.CellBytes:(so+n)/a.CellBytes])
 	m.e.Emit(Record{Name: "memory_copy", Source: src, Destination: dst, SourceOffset: so, DestinationOffset: do, Bytes: n, AllowUndefined: padding})
 	return nil
 }
@@ -199,11 +212,11 @@ func (m *Memory) copy(src, dst string, so, do, n int64, padding bool) error {
 // writer contract as DMA. Publication remains a separate dependent operation.
 func (m *Memory) ComputeRange(id string, start, bytes int64, origin uint64, offset int64) error {
 	b := m.Buffers[id]
-	if b == nil || b.Opaque || b.Writers != 1 || start < 0 || bytes <= 0 || start > b.Bytes-bytes || start%m.Unit != 0 || bytes%m.Unit != 0 || offset < 0 {
+	if b == nil || b.Opaque || b.Writers != 1 || start < 0 || bytes <= 0 || start > b.Bytes-bytes || start%b.CellBytes != 0 || bytes%b.CellBytes != 0 || offset < 0 {
 		return fmt.Errorf("invalid computed range")
 	}
-	for i := int64(0); i < bytes; i += m.Unit {
-		b.Cells[(start+i)/m.Unit] = Cell{origin, offset + i, true}
+	for i := int64(0); i < bytes; i += b.CellBytes {
+		b.Cells[(start+i)/b.CellBytes] = Cell{origin, offset + i, true}
 	}
 	m.e.Emit(Record{Name: "memory_compute_range", Destination: id, DestinationOffset: start, Bytes: bytes, Origin: origin, OriginOffset: offset})
 	return nil
@@ -221,6 +234,9 @@ func (m *Memory) Free(id string) error {
 func (m *Memory) Check() error {
 	used := map[string]int64{}
 	for _, b := range m.Buffers {
+		if b.CellBytes <= 0 || b.Bytes%b.CellBytes != 0 || (!b.Opaque && int64(len(b.Cells)) != b.Bytes/b.CellBytes) {
+			return fmt.Errorf("invalid content granularity %s", b.ID)
+		}
 		if b.Pins < 0 || b.Writers < 0 || b.Holds < 0 {
 			return fmt.Errorf("negative references")
 		}
@@ -256,11 +272,11 @@ func (m *Memory) PhysicalUsed(pool string) int64 { return max(m.Used[pool], m.Re
 
 func (m *Memory) SeedRange(id string, start, bytes int64, origin uint64, offset int64) error {
 	b := m.Buffers[id]
-	if b == nil || b.State != "ready" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 || start < 0 || bytes <= 0 || start > b.Bytes-bytes || start%m.Unit != 0 || bytes%m.Unit != 0 || offset < 0 {
+	if b == nil || b.State != "ready" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 || start < 0 || bytes <= 0 || start > b.Bytes-bytes || start%b.CellBytes != 0 || bytes%b.CellBytes != 0 || offset < 0 {
 		return fmt.Errorf("invalid input payload range")
 	}
-	for i := int64(0); i < bytes; i += m.Unit {
-		b.Cells[(start+i)/m.Unit] = Cell{origin, offset + i, true}
+	for i := int64(0); i < bytes; i += b.CellBytes {
+		b.Cells[(start+i)/b.CellBytes] = Cell{origin, offset + i, true}
 	}
 	m.e.Emit(Record{Name: "memory_initialize_range", Destination: id, DestinationOffset: start, Bytes: bytes, Origin: origin, OriginOffset: offset})
 	return nil

@@ -11,6 +11,12 @@ import (
 )
 
 type Record struct {
+	ResourceGroup       string   `json:"resource_group,omitempty"`
+	CellBytes           int64    `json:"cell_bytes,omitempty"`
+	ServiceClass        string   `json:"service_class,omitempty"`
+	ServiceRatePPM      int64    `json:"service_rate_ppm,omitempty"`
+	RemainingNS         int64    `json:"remaining_service_ns,omitempty"`
+	FractionPPM         int64    `json:"completed_fraction_ppm,omitempty"`
 	TimeNS              int64    `json:"time_ns"`
 	Name                string   `json:"name"`
 	Task                int64    `json:"task,omitempty"`
@@ -36,6 +42,12 @@ type Record struct {
 	PageSlots           []string `json:"page_slots,omitempty"`
 }
 type Task struct {
+	ResourceGroup string
+	// ServiceClass opts into progress-based repricing. DurationNS is then solo
+	// service work, not a promise of elapsed wall time. Empty preserves fixed
+	// duration semantics, including event-dependent host return waits.
+	ServiceClass              string
+	service                   *serviceProgress
 	ID                        int64
 	Name, Operation, Resource string
 	DurationNS                int64
@@ -54,13 +66,16 @@ type Task struct {
 	blocked  bool
 }
 type resource struct {
-	name  string
-	queue []*Task
-	busy  bool
+	policy, owner string
+	name          string
+	queue         []*Task
+	busy          bool
+	active        *Task
 }
 type event struct {
 	at, serial int64
 	run        func()
+	valid      func() bool
 }
 type events []event
 
@@ -76,6 +91,7 @@ func (q *events) Push(x any)   { *q = append(*q, x.(event)) }
 func (q *events) Pop() any     { old := *q; x := old[len(old)-1]; *q = old[:len(old)-1]; return x }
 
 type Engine struct {
+	serviceRates       map[string]int64
 	actionTask         *Task
 	NowNS              int64
 	queue              events
@@ -114,14 +130,18 @@ func (e *Engine) Fail(err error) {
 }
 func (e *Engine) Error() error { return e.err }
 func (e *Engine) At(at int64, run func()) error {
+	return e.atIf(at, run, nil)
+}
+func (e *Engine) atIf(at int64, run func(), valid func() bool) error {
 	if at < e.NowNS {
 		return fmt.Errorf("event in past: %d < %d", at, e.NowNS)
 	}
 	e.serial++
-	heap.Push(&e.queue, event{at, e.serial, run})
+	heap.Push(&e.queue, event{at: at, serial: e.serial, run: run, valid: valid})
 	return nil
 }
 func (e *Engine) NextNS() (int64, bool) {
+	e.pruneCancelled()
 	if len(e.queue) == 0 {
 		return 0, false
 	}
@@ -151,7 +171,7 @@ func (e *Engine) Add(t Task) (int64, error) {
 			p.children = append(p.children, t.ID)
 		}
 	}
-	e.Emit(Record{Name: "task_created", Task: t.ID, Operation: t.Operation, Resource: t.Resource, Reason: t.Name, Parents: t.Parents})
+	e.Emit(Record{Name: "task_created", Task: t.ID, Operation: t.Operation, Resource: t.Resource, Reason: t.Name, Parents: t.Parents, ServiceClass: t.ServiceClass, ResourceGroup: t.ResourceGroup})
 	if t.pending == 0 {
 		e.ready(&t)
 	}
@@ -189,7 +209,16 @@ func (e *Engine) Kick() {
 		if r.busy || len(r.queue) == 0 {
 			continue
 		}
-		t := r.queue[0]
+		selected := 0
+		if r.policy == "stream_drain" && r.owner != "" {
+			for i, t := range r.queue {
+				if t.ResourceGroup == r.owner {
+					selected = i
+					break
+				}
+			}
+		}
+		t := r.queue[selected]
 		if t.Ready != nil && !t.Ready() {
 			if !t.blocked {
 				e.Emit(Record{Name: "resource_blocked", Task: t.ID, Operation: t.Operation, Resource: name, Reason: t.Name})
@@ -197,8 +226,14 @@ func (e *Engine) Kick() {
 			}
 			continue
 		}
-		r.queue = r.queue[1:]
+		if selected == 0 {
+			r.queue = r.queue[1:]
+		} else {
+			r.queue = append(r.queue[:selected], r.queue[selected+1:]...)
+		}
 		r.busy = true
+		r.active = t
+		r.owner = t.ResourceGroup
 		t.state = "running"
 		if t.Start != nil {
 			previous := e.actionTask
@@ -217,45 +252,69 @@ func (e *Engine) Kick() {
 				return
 			}
 		}
-		e.Emit(Record{Name: "task_start", Task: t.ID, Operation: t.Operation, Resource: name, DurationNS: t.DurationNS, Reason: t.Name, Parents: t.Parents})
-		err := e.At(e.NowNS+t.DurationNS, func() {
-			if t.Finish != nil {
-				previous := e.actionTask
-				e.actionTask = t
-				err := t.Finish()
-				e.actionTask = previous
-				if err != nil {
-					e.Fail(fmt.Errorf("%s finish: %w", t.Name, err))
-					return
-				}
-			}
-			t.state = "complete"
-			r.busy = false
-			e.unfinished--
-			e.Emit(Record{Name: "task_end", Task: t.ID, Operation: t.Operation, Resource: name, Reason: t.Name})
-			for _, id := range t.children {
-				c := e.tasks[id]
-				c.pending--
-				if c.pending == 0 {
-					e.ready(c)
-				}
-			}
-			if t.After != nil {
-				t.After()
-			}
-			e.Kick()
-		})
+		e.Emit(Record{Name: "task_start", Task: t.ID, Operation: t.Operation, Resource: name, DurationNS: t.DurationNS, Reason: t.Name, Parents: t.Parents, ServiceClass: t.ServiceClass, ResourceGroup: t.ResourceGroup})
+		var err error
+		if t.ServiceClass != "" {
+			t.service = &serviceProgress{remainingNS: t.DurationNS, updatedAt: e.NowNS, ratePPM: e.ServiceRate(t.ServiceClass)}
+			err = e.scheduleService(t)
+		} else {
+			err = e.At(e.NowNS+t.DurationNS, func() { e.completeTask(t) })
+		}
 		if err != nil {
 			e.Fail(err)
 			return
 		}
 	}
 }
+func (e *Engine) completeTask(t *Task) {
+	if t.service != nil {
+		e.advanceService(t)
+		if t.service.remainingNS != 0 {
+			e.Fail(fmt.Errorf("premature service completion %s", t.Name))
+			return
+		}
+	}
+	if t.Finish != nil {
+		previous := e.actionTask
+		e.actionTask = t
+		err := t.Finish()
+		e.actionTask = previous
+		if err != nil {
+			e.Fail(fmt.Errorf("%s finish: %w", t.Name, err))
+			return
+		}
+	}
+	t.state = "complete"
+	e.resources[t.Resource].busy = false
+	e.resources[t.Resource].active = nil
+	e.unfinished--
+	e.Emit(Record{Name: "task_end", Task: t.ID, Operation: t.Operation, Resource: t.Resource, Reason: t.Name, ServiceClass: t.ServiceClass})
+	for _, id := range t.children {
+		c := e.tasks[id]
+		c.pending--
+		if c.pending == 0 {
+			e.ready(c)
+		}
+	}
+	if t.After != nil {
+		t.After()
+	}
+	e.Kick()
+}
+func (e *Engine) pruneCancelled() {
+	for len(e.queue) > 0 && e.queue[0].valid != nil && !e.queue[0].valid() {
+		heap.Pop(&e.queue)
+	}
+}
 func (e *Engine) RunUntil(until int64) error {
 	if until < e.NowNS {
 		return fmt.Errorf("cannot reverse time")
 	}
-	for len(e.queue) > 0 && e.queue[0].at <= until && e.err == nil {
+	for e.err == nil {
+		e.pruneCancelled()
+		if len(e.queue) == 0 || e.queue[0].at > until {
+			break
+		}
 		x := heap.Pop(&e.queue).(event)
 		e.NowNS = x.at
 		x.run()
@@ -263,7 +322,11 @@ func (e *Engine) RunUntil(until int64) error {
 	return e.err
 }
 func (e *Engine) Run() error {
-	for len(e.queue) > 0 && e.err == nil {
+	for e.err == nil {
+		e.pruneCancelled()
+		if len(e.queue) == 0 {
+			break
+		}
 		x := heap.Pop(&e.queue).(event)
 		e.NowNS = x.at
 		x.run()
@@ -276,4 +339,12 @@ func (e *Engine) Run() error {
 	}
 	return nil
 }
-func (e *Engine) Pending() int { return e.unfinished + len(e.queue) }
+func (e *Engine) Pending() int {
+	n := e.unfinished
+	for _, x := range e.queue {
+		if x.valid == nil || x.valid() {
+			n++
+		}
+	}
+	return n
+}

@@ -37,9 +37,11 @@ func (c TransferCost) Validate() error {
 }
 
 type TransferSpec struct {
-	ID, Source, Destination string
-	CPU, DMA                string
-	Spans                   []Span
+	StreamGroup                         string
+	SubmitServiceClass, DMAServiceClass string
+	ID, Source, Destination             string
+	CPU, DMA                            string
+	Spans                               []Span
 	// Endpoints overrides Source/Destination per span for real tensor lists.
 	// An empty list uses the single-buffer defaults.
 	Endpoints []CopyEndpoints
@@ -82,6 +84,9 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 	if err := s.Cost.Validate(); err != nil {
 		return nil, err
 	}
+	if s.DMAServiceClass != "" && s.Cost.WaitForDMA {
+		return nil, fmt.Errorf("progress-based DMA requires asynchronous or completion-dependent host return; predicted pageable return lead is not calibrated under contention")
+	}
 	endpoints := append([]CopyEndpoints(nil), s.Endpoints...)
 	if len(endpoints) == 0 {
 		for range s.Spans {
@@ -100,7 +105,7 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 		}
 		sourceSet[ep.Source] = true
 		targetSet[ep.Destination] = true
-		if p.Bytes <= 0 || p.SourceOffset < 0 || p.DestinationOffset < 0 || p.SourceOffset > a.Bytes-p.Bytes || p.DestinationOffset > b.Bytes-p.Bytes || p.Bytes%r.Memory.Unit != 0 || p.SourceOffset%r.Memory.Unit != 0 || p.DestinationOffset%r.Memory.Unit != 0 {
+		if a.CellBytes != b.CellBytes || p.Bytes <= 0 || p.SourceOffset < 0 || p.DestinationOffset < 0 || p.SourceOffset > a.Bytes-p.Bytes || p.DestinationOffset > b.Bytes-p.Bytes || p.Bytes%a.CellBytes != 0 || p.SourceOffset%a.CellBytes != 0 || p.DestinationOffset%b.CellBytes != 0 {
 			return nil, fmt.Errorf("invalid transfer span")
 		}
 	}
@@ -120,7 +125,13 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 	result := &TransferResult{ID: s.ID, Copies: len(s.Spans), FirstDMANS: -1}
 	r.operations[s.ID] = result
 	add := func(name, resource string, duration int64, parents []int64, start, finish func() error) int64 {
-		return e.MustAdd(Task{Name: name, Operation: s.ID, Resource: resource, DurationNS: duration, Parents: parents, Start: start, Finish: finish})
+		class := ""
+		group := ""
+		if name == "dma_copy" {
+			class = s.DMAServiceClass
+			group = s.StreamGroup
+		}
+		return e.MustAdd(Task{Name: name, Operation: s.ID, Resource: resource, DurationNS: duration, Parents: parents, Start: start, Finish: finish, ServiceClass: class, ResourceGroup: group})
 	}
 	planParents := append([]int64(nil), s.Parents...)
 	if tail := r.hostTail[s.CPU]; tail != 0 {
@@ -177,7 +188,7 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 			}
 			previous = add(name, s.CPU, s.Cost.PreparePerCopyNS, []int64{previous}, nil, nil)
 		}
-		api := e.MustAdd(Task{Name: "cuda_submit", Operation: s.ID, Resource: s.CPU, DurationNS: s.Cost.SubmitNS, Parents: []int64{previous}, Ready: func() bool { return r.outstanding < r.QueueDepth }, Start: func() error {
+		api := e.MustAdd(Task{Name: "cuda_submit", Operation: s.ID, Resource: s.CPU, ServiceClass: s.SubmitServiceClass, DurationNS: s.Cost.SubmitNS, Parents: []int64{previous}, Ready: func() bool { return r.outstanding < r.QueueDepth }, Start: func() error {
 			r.outstanding++
 			if r.outstanding > result.PeakOutstanding {
 				result.PeakOutstanding = r.outstanding

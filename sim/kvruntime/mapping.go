@@ -91,7 +91,7 @@ func (r *Runtime) MapKernel(operation, cpu, gpu string, k MappingKernel) (submit
 		}
 		for i, p := range k.Spans {
 			a, b := m.Buffers[endpoints[i].Source], m.Buffers[endpoints[i].Destination]
-			if p.Bytes <= 0 || p.SourceOffset < 0 || p.DestinationOffset < 0 || p.SourceOffset > a.Bytes-p.Bytes || p.DestinationOffset > b.Bytes-p.Bytes || p.SourceOffset%m.Unit != 0 || p.DestinationOffset%m.Unit != 0 || p.Bytes%m.Unit != 0 {
+			if a.CellBytes != b.CellBytes || p.Bytes <= 0 || p.SourceOffset < 0 || p.DestinationOffset < 0 || p.SourceOffset > a.Bytes-p.Bytes || p.DestinationOffset > b.Bytes-p.Bytes || p.SourceOffset%a.CellBytes != 0 || p.DestinationOffset%b.CellBytes != 0 || p.Bytes%a.CellBytes != 0 {
 				return fmt.Errorf("mapping span out of bounds")
 			}
 		}
