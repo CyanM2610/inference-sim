@@ -89,6 +89,7 @@ type TorchCopyProfile struct {
 	Evidence               string           `json:"evidence"`
 }
 type PagedForwardPoint struct {
+	Output               *OutputCopyPoint       `json:"output_copy,omitempty"`
 	Prefix               int64                  `json:"prefix"`
 	Query                int64                  `json:"query"`
 	Stages               map[string]BridgeStage `json:"stages"`
@@ -98,6 +99,14 @@ type PagedForwardPoint struct {
 	PhasePeakDelta       map[string]int64       `json:"phase_peak_delta_bytes"`
 	PhaseEndDelta        map[string]int64       `json:"phase_end_delta_bytes"`
 	Evidence             string                 `json:"evidence"`
+}
+type OutputCopyPoint struct {
+	Cost              TransferCost `json:"cost"`
+	GPUStorageBytes   int64        `json:"gpu_storage_bytes"`
+	HostStorageBytes  int64        `json:"host_storage_bytes"`
+	HostReservedBytes int64        `json:"host_reserved_bytes"`
+	ReferenceToken    uint64       `json:"reference_token"`
+	Evidence          string       `json:"evidence"`
 }
 type ComputeShape struct {
 	Prefix              int64 `json:"prefix"`
@@ -251,6 +260,18 @@ func (x PagedForwardPoint) Validate() error {
 		return fmt.Errorf("invalid paged forward allocation envelope")
 	}
 	required := map[string]bool{"forward": false, "scatter_delta": true, "hf_release": false}
+	if o := x.Output; o != nil {
+		if o.GPUStorageBytes < 8 || o.GPUStorageBytes%8 != 0 || o.HostStorageBytes < 8 || o.HostStorageBytes%8 != 0 || o.HostReservedBytes < o.HostStorageBytes || o.Evidence == "" {
+			return fmt.Errorf("invalid output storage calibration")
+		}
+		if err := o.Cost.Validate(); err != nil {
+			return err
+		}
+		if o.Cost.WaitForDMA || o.Cost.BlockingAPI {
+			return fmt.Errorf("native output copy uses async submission followed by completion observation")
+		}
+		required["observe_token"] = false
+	}
 	if x.Prefix > 0 {
 		required["gather_prefix"] = true
 	}

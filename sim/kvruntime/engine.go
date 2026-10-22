@@ -11,6 +11,7 @@ import (
 )
 
 type Record struct {
+	WaitFor             []int64  `json:"wait_for,omitempty"`
 	ResourceGroup       string   `json:"resource_group,omitempty"`
 	CellBytes           int64    `json:"cell_bytes,omitempty"`
 	ServiceClass        string   `json:"service_class,omitempty"`
@@ -42,7 +43,13 @@ type Record struct {
 	PageSlots           []string `json:"page_slots,omitempty"`
 }
 type Task struct {
-	ResourceGroup string
+	// WaitFor holds the resource until these tasks actually complete. Unlike
+	// Parents, it does not delay resource acquisition. Used for a host thread
+	// blocked in stream synchronization, including device queue wait time.
+	WaitFor          []int64
+	waiters          []int64
+	waitEndScheduled bool
+	ResourceGroup    string
 	// ServiceClass opts into progress-based repricing. DurationNS is then solo
 	// service work, not a promise of elapsed wall time. Empty preserves fixed
 	// duration semantics, including event-dependent host return waits.
@@ -151,6 +158,16 @@ func (e *Engine) Add(t Task) (int64, error) {
 	if t.DurationNS < 0 {
 		return 0, fmt.Errorf("negative duration for %s", t.Name)
 	}
+	if len(t.WaitFor) > 0 && (t.DurationNS != 0 || t.Duration != nil || t.ServiceClass != "") {
+		return 0, fmt.Errorf("completion wait cannot also have service duration")
+	}
+	waitSeen := map[int64]bool{}
+	for _, id := range t.WaitFor {
+		if waitSeen[id] || e.tasks[id] == nil {
+			return 0, fmt.Errorf("invalid/duplicate completion target")
+		}
+		waitSeen[id] = true
+	}
 	seen := map[int64]bool{}
 	for _, id := range t.Parents {
 		if seen[id] || e.tasks[id] == nil {
@@ -162,8 +179,12 @@ func (e *Engine) Add(t Task) (int64, error) {
 	t.ID = e.taskSerial
 	t.state = "waiting"
 	t.Parents = append([]int64(nil), t.Parents...)
+	t.WaitFor = append([]int64(nil), t.WaitFor...)
 	e.tasks[t.ID] = &t
 	e.unfinished++
+	for _, id := range t.WaitFor {
+		e.tasks[id].waiters = append(e.tasks[id].waiters, t.ID)
+	}
 	for _, id := range t.Parents {
 		p := e.tasks[id]
 		if p.state != "complete" {
@@ -171,7 +192,7 @@ func (e *Engine) Add(t Task) (int64, error) {
 			p.children = append(p.children, t.ID)
 		}
 	}
-	e.Emit(Record{Name: "task_created", Task: t.ID, Operation: t.Operation, Resource: t.Resource, Reason: t.Name, Parents: t.Parents, ServiceClass: t.ServiceClass, ResourceGroup: t.ResourceGroup})
+	e.Emit(Record{Name: "task_created", Task: t.ID, Operation: t.Operation, Resource: t.Resource, Reason: t.Name, Parents: t.Parents, ServiceClass: t.ServiceClass, ResourceGroup: t.ResourceGroup, WaitFor: t.WaitFor})
 	if t.pending == 0 {
 		e.ready(&t)
 	}
@@ -252,9 +273,11 @@ func (e *Engine) Kick() {
 				return
 			}
 		}
-		e.Emit(Record{Name: "task_start", Task: t.ID, Operation: t.Operation, Resource: name, DurationNS: t.DurationNS, Reason: t.Name, Parents: t.Parents, ServiceClass: t.ServiceClass, ResourceGroup: t.ResourceGroup})
+		e.Emit(Record{Name: "task_start", Task: t.ID, Operation: t.Operation, Resource: name, DurationNS: t.DurationNS, Reason: t.Name, Parents: t.Parents, ServiceClass: t.ServiceClass, ResourceGroup: t.ResourceGroup, WaitFor: t.WaitFor})
 		var err error
-		if t.ServiceClass != "" {
+		if len(t.WaitFor) > 0 {
+			e.finishWaitWhenReady(t)
+		} else if t.ServiceClass != "" {
 			t.service = &serviceProgress{remainingNS: t.DurationNS, updatedAt: e.NowNS, ratePPM: e.ServiceRate(t.ServiceClass)}
 			err = e.scheduleService(t)
 		} else {
@@ -289,6 +312,9 @@ func (e *Engine) completeTask(t *Task) {
 	e.resources[t.Resource].active = nil
 	e.unfinished--
 	e.Emit(Record{Name: "task_end", Task: t.ID, Operation: t.Operation, Resource: t.Resource, Reason: t.Name, ServiceClass: t.ServiceClass})
+	for _, id := range t.waiters {
+		e.finishWaitWhenReady(e.tasks[id])
+	}
 	for _, id := range t.children {
 		c := e.tasks[id]
 		c.pending--
@@ -300,6 +326,21 @@ func (e *Engine) completeTask(t *Task) {
 		t.After()
 	}
 	e.Kick()
+}
+
+func (e *Engine) finishWaitWhenReady(t *Task) {
+	if t.state != "running" || t.waitEndScheduled || len(t.WaitFor) == 0 {
+		return
+	}
+	for _, id := range t.WaitFor {
+		if e.tasks[id].state != "complete" {
+			return
+		}
+	}
+	t.waitEndScheduled = true
+	if err := e.At(e.NowNS, func() { e.completeTask(t) }); err != nil {
+		e.Fail(err)
+	}
 }
 func (e *Engine) pruneCancelled() {
 	for len(e.queue) > 0 && e.queue[0].valid != nil && !e.queue[0].valid() {

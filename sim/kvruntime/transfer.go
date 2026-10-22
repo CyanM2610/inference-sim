@@ -14,6 +14,9 @@ type Span struct {
 // TransferCost describes primitive service costs, not a synthetic completion
 // timestamp. CPU issue and DMA evolve independently under finite queue credits.
 type TransferCost struct {
+	// HoldCPUUntilDMA models a synchronous host wait on actual device completion,
+	// including queue delays and service-rate changes, after async submission.
+	HoldCPUUntilDMA  bool   `json:"hold_cpu_until_dma,omitempty"`
 	PrepareName      string `json:"prepare_stage_name,omitempty"`
 	PlanNS           int64  `json:"plan_ns"`
 	SubmitNS         int64  `json:"submit_per_copy_ns"`
@@ -30,6 +33,9 @@ type TransferCost struct {
 }
 
 func (c TransferCost) Validate() error {
+	if c.HoldCPUUntilDMA && (c.WaitForDMA || c.BlockingAPI || c.ReturnLeadNS != 0) {
+		return fmt.Errorf("actual host synchronization cannot be combined with predicted/blocking return modes")
+	}
 	if c.PlanNS < 0 || c.SubmitNS < 0 || c.DMANS <= 0 || c.SetupNS < 0 || c.ObserveNS < 0 || c.StageBeforeNS < 0 || c.StageAfterNS < 0 || c.PreparePerCopyNS < 0 || c.CopyAfterNS < 0 || c.ReturnLeadNS < 0 {
 		return fmt.Errorf("invalid transfer service costs")
 	}
@@ -157,7 +163,7 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 		}
 		for _, id := range targets {
 			b := r.Memory.Buffers[id]
-			if b == nil || b.State == "reserved" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
+			if b == nil || b.State == "reserved" || b.State == "declared" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
 				return fmt.Errorf("target unavailable: %s", id)
 			}
 		}
@@ -226,6 +232,9 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 		})
 		dmaIDs = append(dmaIDs, dma)
 		previous = api
+		if s.Cost.HoldCPUUntilDMA {
+			previous = e.MustAdd(Task{Name: "host_stream_synchronize", Operation: s.ID, Resource: s.CPU, Parents: []int64{api}, WaitFor: []int64{dma}, Finish: func() error { result.CPUFinishedNS = e.NowNS; return nil }})
+		}
 		if s.Cost.BlockingAPI {
 			previous = dma
 		}
@@ -268,7 +277,7 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 		}
 	}})
 	r.hostTail[s.CPU] = previous
-	if s.Cost.BlockingAPI {
+	if s.Cost.BlockingAPI || s.Cost.HoldCPUUntilDMA {
 		r.hostTail[s.CPU] = result.CompletionTask
 	}
 	if err := e.Error(); err != nil {

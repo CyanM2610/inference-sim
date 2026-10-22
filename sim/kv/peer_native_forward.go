@@ -8,6 +8,43 @@ import (
 	"github.com/inference-sim/inference-sim/sim/kvruntime"
 )
 
+func (f *PeerFabric) EnableOutputCopies(policy string) error {
+	n := f.native
+	if n == nil || !n.pagedEnabled || n.outputEnabled {
+		return fmt.Errorf("output copies require an idle paged runtime")
+	}
+	var storage, reserved int64
+	for _, p := range n.profile.PagedForward {
+		if p.Output == nil {
+			return fmt.Errorf("missing output calibration for a paged shape")
+		}
+		storage = max(storage, p.Output.HostStorageBytes)
+		reserved = max(reserved, p.Output.HostReservedBytes)
+	}
+	if storage <= 0 || reserved < storage {
+		return fmt.Errorf("invalid scalar host storage")
+	}
+	e, m := n.Runtime.Engine, n.Runtime.Memory
+	for _, resource := range []string{"copy_d2h", "copy_h2d"} {
+		if err := e.ConfigureResource(resource, policy); err != nil {
+			return err
+		}
+	}
+	m.Capacity["host_output"] = reserved
+	if err := m.RetainAllocator("host_output", reserved, true); err != nil {
+		return err
+	}
+	if _, err := m.ReserveGranular("native/host_output", "host_output", "pinned_output_scalar", storage, 8); err != nil {
+		return err
+	}
+	if err := m.Allocate("native/host_output"); err != nil {
+		return err
+	}
+	n.outputEnabled = true
+	e.Emit(kvruntime.Record{Name: "native_output_copy_enabled", Reason: "measured GPU-ready then native 8-byte D2H; directional copy resources; output observation precedes scatter and request completion"})
+	return nil
+}
+
 // EnableTorchCopies opts into coefficients measured over live Torch-owned
 // pointers. Keeping this explicit preserves prior standalone-CUDA experiments.
 func (f *PeerFabric) EnableTorchCopies() error {
@@ -147,7 +184,27 @@ func (s *PeerCache) BeginBatch(now int64, work []sim.BatchWork, done func(int64)
 	n.forwardSerial++
 	name := fmt.Sprintf("request/%s/step/%d", w.Request.ID, n.forwardSerial)
 	n.forwardActive = true
-	_, err = n.Runtime.PagedStep(kvruntime.PagedStepSpec{Request: w.Request.ID, ID: name, Slots: slots, Prefix: w.PrefixTokens, Query: w.NewTokens, TokenOrigins: origins, Weights: weights, Point: *point, WorkspacePool: "hbm_workspace", Done: func(result *kvruntime.PagedStepResult) {
+	spec := kvruntime.PagedStepSpec{Request: w.Request.ID, ID: name, Slots: slots, Prefix: w.PrefixTokens, Query: w.NewTokens, TokenOrigins: origins, Weights: weights, Point: *point, WorkspacePool: "hbm_workspace"}
+	if point.Output != nil {
+		if !n.outputEnabled {
+			return false, fmt.Errorf("output-aware profile requires output_copies configuration")
+		}
+		spec.HostOutputBuffer = "native/host_output"
+		spec.OutputCopyResource = "copy_d2h"
+		spec.OutputStreamGroup = "request_stream"
+		spec.OutputValue = point.Output.ReferenceToken
+		spec.OutputReferenceKind = "internal_profile_reference"
+		end := w.PrefixTokens + w.NewTokens
+		if end >= w.Request.InputLen() {
+			index := end - w.Request.InputLen()
+			if index >= int64(len(w.Request.OutputTokens)) {
+				return false, fmt.Errorf("output observation exceeds supplied reference")
+			}
+			spec.OutputValue = uint64(uint32(w.Request.OutputTokens[index]))
+			spec.OutputReferenceKind = "request_reference"
+		}
+	}
+	spec.Done = func(result *kvruntime.PagedStepResult) {
 		// Register complete reusable input blocks against the independent causal
 		// token reference, never against a copy of the observed destination bytes.
 		end := w.PrefixTokens + w.NewTokens
@@ -186,10 +243,11 @@ func (s *PeerCache) BeginBatch(now int64, work []sim.BatchWork, done func(int64)
 		at := (result.CompleteNS + 999) / 1000
 		n.completed = append(n.completed, func() {
 			n.forwardActive = false
-			n.fabric.emit(PeerRecord{Time: at, Name: "native_forward_complete", Request: w.Request.ID, Value: at*1000 - result.CompleteNS, Duration: at - now, Counters: map[string]int64{"verified_cells": result.CellsVerified, "mapping_tasks": int64(result.MappingTasks), "workspace_peak_delta_bytes": result.AllocatedPeakDelta}})
+			n.fabric.emit(PeerRecord{Time: at, Name: "native_forward_complete", Request: w.Request.ID, Value: at*1000 - result.CompleteNS, Duration: at - now, Counters: map[string]int64{"verified_cells": result.CellsVerified, "mapping_tasks": int64(result.MappingTasks), "workspace_peak_delta_bytes": result.AllocatedPeakDelta, "output_bytes": result.OutputBytes, "output_observed_ns": result.OutputObservedNS}})
 			done(at)
 		})
-	}})
+	}
+	_, err = n.Runtime.PagedStep(spec)
 	if err != nil {
 		return false, err
 	}

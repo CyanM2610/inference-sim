@@ -14,7 +14,11 @@ type PagedFixtureResult struct {
 func RunPagedFixture(p *Profile, point PagedForwardPoint, sink func(Record)) (*PagedFixtureResult, error) {
 	const arenaBytes = int64(40 * 917504)
 	e := NewEngine(sink)
-	m, err := NewMemory(e, 256, map[string]int64{"hbm": arenaBytes, "hbm_workspace": (40 << 30) - arenaBytes})
+	capacity := map[string]int64{"hbm": arenaBytes, "hbm_workspace": (40 << 30) - arenaBytes}
+	if point.Output != nil {
+		capacity["host_output"] = point.Output.HostReservedBytes
+	}
+	m, err := NewMemory(e, 256, capacity)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +83,24 @@ func RunPagedFixture(p *Profile, point PagedForwardPoint, sink func(Record)) (*P
 		}
 	}
 	key := fmt.Sprintf("paged/p%d/q%d", point.Prefix, point.Query)
-	step, err := r.PagedStep(PagedStepSpec{ID: key, Slots: slots, Prefix: point.Prefix, Query: point.Query, TokenOrigins: origins, Weights: weights, Point: point, WorkspacePool: "hbm_workspace"})
+	spec := PagedStepSpec{ID: key, Slots: slots, Prefix: point.Prefix, Query: point.Query, TokenOrigins: origins, Weights: weights, Point: point, WorkspacePool: "hbm_workspace"}
+	if o := point.Output; o != nil {
+		if err = m.RetainAllocator("host_output", o.HostReservedBytes, true); err != nil {
+			return nil, err
+		}
+		if _, err = m.ReserveGranular("host_output", "host_output", "pinned_output_scalar", o.HostStorageBytes, 8); err != nil {
+			return nil, err
+		}
+		if err = m.Allocate("host_output"); err != nil {
+			return nil, err
+		}
+		spec.HostOutputBuffer = "host_output"
+		spec.OutputCopyResource = "copy_d2h"
+		spec.OutputStreamGroup = "request_stream"
+		spec.OutputValue = o.ReferenceToken
+		spec.OutputReferenceKind = "calibration_reference"
+	}
+	step, err := r.PagedStep(spec)
 	if err != nil {
 		return nil, err
 	}

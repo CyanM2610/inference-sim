@@ -12,6 +12,7 @@ import (
 // Arenas are already allocated at admission (steady state). Slot reuse changes
 // contents, never allocated byte count. Only single-instance pinned DRAM works.
 type NativePeerRuntime struct {
+	outputEnabled               bool
 	pagedEnabled, forwardActive bool
 	pagedContents               map[string][]kvruntime.Cell
 	origins                     map[string]uint64
@@ -211,7 +212,12 @@ func (n *NativePeerRuntime) submit(now int64, j *peerJob) {
 	for i := range spans {
 		spans[i] = kvruntime.Span{SourceOffset: int64(i) * 16384, DestinationOffset: int64(i) * 16384, Bytes: 16384}
 	}
-	_, err := n.Runtime.Transfer(kvruntime.TransferSpec{ID: fmt.Sprintf("peer/%d/%s", j.record.Transaction, j.record.Reason), Source: j.nativeSource(), Destination: j.nativeDestination(), CPU: "copy_thread", DMA: "pcie_copy", Spans: spans, Cost: point.Cost, Done: func(tx *kvruntime.TransferResult) {
+	dma, group := "pcie_copy", ""
+	if n.outputEnabled {
+		dma = "copy_" + direction
+		group = "kv_stream"
+	}
+	_, err := n.Runtime.Transfer(kvruntime.TransferSpec{ID: fmt.Sprintf("peer/%d/%s", j.record.Transaction, j.record.Reason), Source: j.nativeSource(), Destination: j.nativeDestination(), CPU: "copy_thread", DMA: dma, StreamGroup: group, Spans: spans, Cost: point.Cost, Done: func(tx *kvruntime.TransferResult) {
 		at := (tx.CompleteNS + 999) / 1000
 		n.completed = append(n.completed, func() {
 			n.fabric.emit(PeerRecord{Time: at, Name: "native_handoff", Transaction: j.record.Transaction, Value: at*1000 - tx.CompleteNS, Bytes: tx.Bytes, Reason: "ns_to_us_rounding"})

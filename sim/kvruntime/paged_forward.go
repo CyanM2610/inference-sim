@@ -9,18 +9,25 @@ import (
 // TokenOrigins identify the full causal input prefix, including reference output
 // tokens already consumed by decode. They are not numerical model predictions.
 type PagedStepSpec struct {
-	Request       string
-	ID            string
-	Slots         []string
-	Prefix, Query int64
-	TokenOrigins  []uint64
-	Weights       []float64
-	Point         PagedForwardPoint
-	WorkspacePool string
-	Parents       []int64
-	Done          func(*PagedStepResult)
+	HostOutputBuffer    string
+	OutputCopyResource  string
+	OutputStreamGroup   string
+	OutputValue         uint64
+	OutputReferenceKind string
+	Request             string
+	ID                  string
+	Slots               []string
+	Prefix, Query       int64
+	TokenOrigins        []uint64
+	Weights             []float64
+	Point               PagedForwardPoint
+	WorkspacePool       string
+	Parents             []int64
+	Done                func(*PagedStepResult)
 }
 type PagedStepResult struct {
+	OutputObservedNS   int64            `json:"output_observed_ns,omitempty"`
+	OutputBytes        int64            `json:"output_bytes,omitempty"`
 	ID                 string           `json:"id"`
 	StartNS            int64            `json:"start_ns"`
 	CompleteNS         int64            `json:"complete_ns"`
@@ -58,9 +65,22 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 		return nil, fmt.Errorf("workspace pool required")
 	}
 	e, m := r.Engine, r.Memory
+	outputID := s.ID + "/output_token"
+	if o := s.Point.Output; o != nil {
+		b := m.Buffers[s.HostOutputBuffer]
+		if b == nil || b.Bytes < o.HostStorageBytes || b.CellBytes != 8 || s.OutputCopyResource == "" || s.OutputReferenceKind == "" {
+			return nil, fmt.Errorf("native output requires bound host storage, copy resource and reference kind")
+		}
+		if _, err := m.Declare(outputID, s.WorkspacePool, "gpu_output_token_storage", o.GPUStorageBytes, 8); err != nil {
+			return nil, err
+		}
+	}
 	before := m.Used[s.WorkspacePool]
 	result := &PagedStepResult{ID: s.ID, StartNS: e.NowNS, StagesNS: map[string]int64{}}
 	e.Emit(Record{Name: "paged_step_begin", Request: s.Request, Operation: s.ID, PrefixTokens: s.Prefix, QueryTokens: s.Query, PageSlots: append([]string(nil), s.Slots...)})
+	if s.Point.Output != nil {
+		e.Emit(Record{Name: "paged_output_expected", Request: s.Request, Operation: s.ID, Origin: s.OutputValue, PrefixTokens: n, Reason: s.OutputReferenceKind, Bytes: 8})
+	}
 	allocatedPeak := before
 	alloc := func(id, kind string, bytes int64, opaque bool) error {
 		var err error
@@ -197,6 +217,9 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 	workspaceID := s.ID + "/activation_envelope"
 	logitsID := s.ID + "/logits"
 	logitsBytes := max(0, s.Point.PhaseEndDelta["forward"]-n*56*1024)
+	if s.Point.Output != nil {
+		logitsBytes = max(0, logitsBytes-s.Point.Output.GPUStorageBytes)
+	}
 	if workspaceBytes > 0 {
 		tailID = e.MustAdd(Task{Name: "activation_envelope_acquire", Operation: s.ID + "/forward", Resource: "cpu", Parents: []int64{tailID}, Finish: func() error { return alloc(workspaceID, "opaque_unlocalized_forward_workspace", workspaceBytes, true) }})
 	}
@@ -278,10 +301,42 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 	}
 	endPhase("forward", []int64{tailID}, 0, func() error {
 		if logitsBytes > 0 {
-			return alloc(logitsID, "opaque_logits_and_retained_forward_output", logitsBytes, true)
+			if err := alloc(logitsID, "opaque_logits_and_retained_forward_output", logitsBytes, true); err != nil {
+				return err
+			}
+		}
+		if s.Point.Output != nil {
+			if err := m.Allocate(outputID); err != nil {
+				return err
+			}
+			allocatedPeak = max(allocatedPeak, m.Used[s.WorkspacePool])
+			if err := m.BeginWrite(outputID); err != nil {
+				return err
+			}
+			if err := m.ComputeRange(outputID, 0, 8, s.OutputValue, 0); err != nil {
+				return err
+			}
+			return m.Publish(outputID)
 		}
 		return nil
 	})
+	if o := s.Point.Output; o != nil {
+		observeBegin := beginPhase("observe_token")
+		tx, err := r.Transfer(TransferSpec{ID: s.ID + "/output", Source: outputID, Destination: s.HostOutputBuffer, CPU: "cpu", DMA: s.OutputCopyResource, StreamGroup: s.OutputStreamGroup, Parents: []int64{observeBegin}, Spans: []Span{{SourceOffset: 0, DestinationOffset: 0, Bytes: 8}}, Cost: o.Cost})
+		if err != nil {
+			return nil, err
+		}
+		endPhase("observe_token", []int64{tx.CompletionTask}, 0, func() error {
+			b := m.Buffers[s.HostOutputBuffer]
+			if b.State != "ready" || b.Cells[0] != (Cell{s.OutputValue, 0, true}) {
+				return fmt.Errorf("incorrect/unpublished output token")
+			}
+			result.OutputObservedNS = e.NowNS
+			result.OutputBytes = tx.Bytes
+			e.Emit(Record{Name: "paged_output_observed", Request: s.Request, Operation: s.ID, Source: outputID, Destination: s.HostOutputBuffer, Origin: s.OutputValue, Bytes: tx.Bytes, Reason: s.OutputReferenceKind})
+			return m.Free(outputID)
+		})
+	}
 	scatter, ok := s.Point.Stages["scatter_delta"]
 	if !ok || scatter.SubmitNS <= 0 || scatter.ServiceNS <= 0 {
 		return nil, fmt.Errorf("missing delta scatter calibration")

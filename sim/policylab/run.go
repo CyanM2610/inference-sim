@@ -61,11 +61,13 @@ type Config struct {
 	Mechanisms       *kv.PeerMechanisms  `json:"mechanisms,omitempty"`
 }
 type NativeConfig struct {
-	TorchCopies  bool   `json:"torch_copies,omitempty"`
-	Profile      string `json:"profile"`
-	NUMA         int    `json:"numa"`
-	ComputeGrid  bool   `json:"compute_grid,omitempty"`
-	PagedForward bool   `json:"paged_forward,omitempty"`
+	OutputCopies     bool   `json:"output_copies,omitempty"`
+	CopyEnginePolicy string `json:"copy_engine_policy,omitempty"`
+	TorchCopies      bool   `json:"torch_copies,omitempty"`
+	Profile          string `json:"profile"`
+	NUMA             int    `json:"numa"`
+	ComputeGrid      bool   `json:"compute_grid,omitempty"`
+	PagedForward     bool   `json:"paged_forward,omitempty"`
 }
 type CPUProfile struct {
 	Count       int64 `json:"count"`
@@ -89,6 +91,14 @@ type Result struct {
 }
 
 func (c Config) Validate() error {
+	if c.Native != nil {
+		if c.Native.OutputCopies && (!c.Native.TorchCopies || !c.Native.PagedForward) {
+			return fmt.Errorf("output copies require paged_forward and torch_copies")
+		}
+		if c.Native.CopyEnginePolicy != "" && (!c.Native.OutputCopies || (c.Native.CopyEnginePolicy != "fifo" && c.Native.CopyEnginePolicy != "stream_drain")) {
+			return fmt.Errorf("copy_engine_policy requires output_copies and fifo/stream_drain")
+		}
+	}
 	if c.Native != nil && c.Native.TorchCopies && (!c.Native.PagedForward || len(c.Pools) != 1 || c.Pools[0].CapacityBlocks != 64) {
 		return fmt.Errorf("live Torch copy calibration requires paged_forward and the measured 64-slot DRAM pool")
 	}
@@ -234,6 +244,15 @@ func Run(c Config) (*Result, error) {
 		}
 		if c.Native.TorchCopies {
 			if err = fabric.EnableTorchCopies(); err != nil {
+				return nil, err
+			}
+		}
+		if c.Native.OutputCopies {
+			policy := c.Native.CopyEnginePolicy
+			if policy == "" {
+				policy = "fifo"
+			}
+			if err = fabric.EnableOutputCopies(policy); err != nil {
 				return nil, err
 			}
 		}

@@ -61,6 +61,20 @@ func (m *Memory) ReserveGranular(id, pool, kind string, bytes, cellBytes int64) 
 	return m.reserve(id, pool, kind, bytes, cellBytes, false)
 }
 
+// Declare describes a future buffer endpoint while constructing an async DAG.
+// It consumes no physical capacity. Allocate commits the reservation at the
+// producer's actual execution time; use, publication and holds remain illegal
+// before that transition. This is not an overcommit permission.
+func (m *Memory) Declare(id, pool, kind string, bytes, cellBytes int64) (*Buffer, error) {
+	if id == "" || m.Buffers[id] != nil || bytes <= 0 || cellBytes <= 0 || bytes%cellBytes != 0 || m.Capacity[pool] < bytes {
+		return nil, fmt.Errorf("invalid future buffer %s", id)
+	}
+	b := &Buffer{ID: id, Pool: pool, Kind: kind, Bytes: bytes, CellBytes: cellBytes, State: "declared"}
+	m.Buffers[id] = b
+	m.e.Emit(Record{Name: "memory_declare", Destination: id, Resource: pool, Bytes: bytes, CellBytes: cellBytes, Reason: kind})
+	return b, nil
+}
+
 // ReserveOpaque accounts for measured non-KV resident allocations without
 // inventing their tensor contents. Opaque storage cannot enter a KV transfer.
 func (m *Memory) ReserveOpaque(id, pool, kind string, bytes int64) (*Buffer, error) {
@@ -70,29 +84,44 @@ func (m *Memory) reserve(id, pool, kind string, bytes, cellBytes int64, opaque b
 	if id == "" || m.Buffers[id] != nil || bytes <= 0 || cellBytes <= 0 || bytes%cellBytes != 0 {
 		return nil, fmt.Errorf("invalid/duplicate buffer or unaligned size %s", id)
 	}
+	b := &Buffer{ID: id, Pool: pool, Kind: kind, Bytes: bytes, State: "reserved", Opaque: opaque, CellBytes: cellBytes}
+	m.Buffers[id] = b
+	if err := m.commitReservation(b); err != nil {
+		delete(m.Buffers, id)
+		return nil, err
+	}
+	return b, nil
+}
+func (m *Memory) commitReservation(b *Buffer) error {
+	pool, bytes := b.Pool, b.Bytes
 	if m.Capacity[pool]-m.Used[pool] < bytes {
-		return nil, fmt.Errorf("capacity exhausted in %s", pool)
+		return fmt.Errorf("capacity exhausted in %s", pool)
 	}
 	if m.FixedAllocator[pool] && m.Used[pool]+bytes > m.Retained[pool] {
-		return nil, fmt.Errorf("unprofiled allocator growth in %s", pool)
+		return fmt.Errorf("unprofiled allocator growth in %s", pool)
 	}
-	b := &Buffer{ID: id, Pool: pool, Kind: kind, Bytes: bytes, State: "reserved", Opaque: opaque, CellBytes: cellBytes}
-	if !opaque {
-		b.Cells = make([]Cell, bytes/cellBytes)
+	if !b.Opaque {
+		b.Cells = make([]Cell, bytes/b.CellBytes)
 	}
-	m.Buffers[id] = b
+	b.State = "reserved"
 	m.Used[pool] += bytes
 	m.Peak[pool] = max(m.Peak[pool], m.Used[pool])
 	m.PhysicalPeak[pool] = max(m.PhysicalPeak[pool], m.PhysicalUsed(pool))
 	granule := int64(0)
-	if cellBytes != m.Unit {
-		granule = cellBytes
+	if b.CellBytes != m.Unit {
+		granule = b.CellBytes
 	}
-	m.e.Emit(Record{Name: "memory_reserve", Destination: id, Resource: pool, Bytes: bytes, Reason: kind, CellBytes: granule})
-	return b, nil
+	m.e.Emit(Record{Name: "memory_reserve", Destination: b.ID, Resource: pool, Bytes: bytes, Reason: b.Kind, CellBytes: granule})
+	return nil
 }
 func (m *Memory) Allocate(id string) error {
 	b := m.Buffers[id]
+	if b != nil && b.State == "declared" {
+		if err := m.commitReservation(b); err != nil {
+			return err
+		}
+		b.State = "reserved"
+	}
 	if b == nil || b.State != "reserved" {
 		return fmt.Errorf("allocation without reservation: %s", id)
 	}
@@ -115,7 +144,7 @@ func (m *Memory) Fill(id string, origin uint64) error {
 }
 func (m *Memory) Register(id string) error {
 	b := m.Buffers[id]
-	if b == nil || b.State == "reserved" || b.Pool != "dram" || b.Registered || !b.Touched {
+	if b == nil || b.State == "reserved" || b.State == "declared" || b.Pool != "dram" || b.Registered || !b.Touched {
 		return fmt.Errorf("invalid registration %s", id)
 	}
 	b.Registered = true
@@ -157,7 +186,7 @@ func (m *Memory) BeginWrite(id string) error {
 // kernel writes and publish their destination only after the whole DAG ends.
 func (m *Memory) BeginWriteOwned(id, owner string) error {
 	b := m.Buffers[id]
-	if b == nil || b.State == "reserved" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
+	if b == nil || b.State == "reserved" || b.State == "declared" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
 		return fmt.Errorf("target unavailable: %s", id)
 	}
 	b.Writers++
@@ -226,6 +255,11 @@ func (m *Memory) Free(id string) error {
 	if b == nil || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 || b.Registered {
 		return fmt.Errorf("free with live references/registration: %s", id)
 	}
+	if b.State == "declared" {
+		delete(m.Buffers, id)
+		m.e.Emit(Record{Name: "memory_undeclare", Source: id, Resource: b.Pool, Bytes: b.Bytes})
+		return nil
+	}
 	m.Used[b.Pool] -= b.Bytes
 	delete(m.Buffers, id)
 	m.e.Emit(Record{Name: "memory_free", Source: id, Resource: b.Pool, Bytes: b.Bytes})
@@ -234,6 +268,12 @@ func (m *Memory) Free(id string) error {
 func (m *Memory) Check() error {
 	used := map[string]int64{}
 	for _, b := range m.Buffers {
+		if b.State == "declared" {
+			if b.Pins != 0 || b.Holds != 0 || b.Writers != 0 || len(b.Cells) != 0 {
+				return fmt.Errorf("future buffer used before allocation")
+			}
+			continue
+		}
 		if b.CellBytes <= 0 || b.Bytes%b.CellBytes != 0 || (!b.Opaque && int64(len(b.Cells)) != b.Bytes/b.CellBytes) {
 			return fmt.Errorf("invalid content granularity %s", b.ID)
 		}
@@ -301,7 +341,7 @@ func (m *Memory) Digest(id string) string {
 // producer has published data. Pin still checks readiness at execution time.
 func (m *Memory) Hold(id string) error {
 	b := m.Buffers[id]
-	if b == nil || b.State == "reserved" {
+	if b == nil || b.State == "reserved" || b.State == "declared" {
 		return fmt.Errorf("hold of unavailable storage")
 	}
 	b.Holds++
@@ -313,7 +353,7 @@ func (m *Memory) Hold(id string) error {
 // zero GPU bytes or allocate/free storage. Stale payload must not become a hit.
 func (m *Memory) Invalidate(id string) error {
 	b := m.Buffers[id]
-	if b == nil || b.Opaque || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
+	if b == nil || b.State == "declared" || b.Opaque || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
 		return fmt.Errorf("invalidate referenced storage %s", id)
 	}
 	clear(b.Cells)
