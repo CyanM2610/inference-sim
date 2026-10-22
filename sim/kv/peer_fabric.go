@@ -18,6 +18,7 @@ type PeerResource struct {
 type PeerPoolConfig struct {
 	ID             string `json:"id"`
 	CapacityBlocks int64  `json:"capacity_blocks"`
+	EvictionPolicy string `json:"eviction_policy,omitempty"`
 }
 type PeerAccess struct {
 	Pool      string   `json:"pool"`
@@ -35,6 +36,7 @@ type PeerRecord struct {
 	Destination string           `json:"destination,omitempty"`
 	Hash        string           `json:"hash,omitempty"`
 	Hashes      []string         `json:"hashes,omitempty"`
+	HBMBlocks   []int64          `json:"hbm_blocks,omitempty"`
 	Bytes       int64            `json:"bytes,omitempty"`
 	Duration    int64            `json:"duration_us,omitempty"`
 	Reason      string           `json:"reason,omitempty"`
@@ -57,8 +59,10 @@ type peerEntry struct {
 	blockers     []peerBlocker
 }
 type peerPool struct {
-	config  PeerPoolConfig
-	entries map[string]*peerEntry
+	config      PeerPoolConfig
+	entries     map[string]*peerEntry
+	policy      PoolEvictionPolicy
+	trackAccess bool
 }
 type peerJob struct {
 	notBefore         int64
@@ -113,7 +117,11 @@ func NewPeerFabric(resources []PeerResource, pools []PeerPoolConfig, blockBytes 
 		if _, ok := f.pools[p.ID]; ok || p.ID == "" || p.CapacityBlocks <= 0 {
 			return nil, fmt.Errorf("invalid or duplicate pool %q", p.ID)
 		}
-		f.pools[p.ID] = &peerPool{config: p, entries: map[string]*peerEntry{}}
+		policy, err := NewPoolEvictionPolicy(p.EvictionPolicy)
+		if err != nil {
+			return nil, err
+		}
+		f.pools[p.ID] = &peerPool{config: p, entries: map[string]*peerEntry{}, policy: policy, trackAccess: p.EvictionPolicy != ""}
 	}
 	return f, nil
 }
@@ -301,12 +309,7 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 		return e, false
 	}
 	if int64(len(p.entries)) == p.config.CapacityBlocks {
-		var victim *peerEntry
-		for _, e := range p.entries {
-			if e.ready && e.readers == 0 && (victim == nil || e.last < victim.last || e.last == victim.last && e.hash < victim.hash) {
-				victim = e
-			}
-		}
+		victim := p.evictionVictim()
 		if victim == nil {
 			return nil, false
 		}
@@ -316,6 +319,7 @@ func (f *PeerFabric) reserve(pool, hash string, tokens []sim.TokenID, now int64)
 			f.external.release(victim.nativeBuffer)
 		}
 		delete(p.entries, victim.hash)
+		f.poolPolicyEvent(pool, "remove", "", []string{victim.hash}, now)
 		f.emit(PeerRecord{Time: now, Name: "l2_evict", Source: pool, Hash: victim.hash, Bytes: f.bytes})
 	}
 	e := &peerEntry{hash: hash, tokens: append([]sim.TokenID(nil), tokens...), last: now}
