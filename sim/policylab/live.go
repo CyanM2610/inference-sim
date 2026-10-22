@@ -22,6 +22,15 @@ type LiveController struct {
 	previous int64
 	finished map[string]LiveRequestResult
 }
+
+func (l *LiveController) AttachPhysicalMemory(memory kv.ExternalMemory) error {
+	if l.previous != -1 {
+		return fmt.Errorf("physical memory must attach before the first Poll")
+	}
+	return l.fabric.AttachExternalMemory(memory)
+}
+func (l *LiveController) ValidatePhysicalMemory() error { return l.fabric.ValidateExternalMemory() }
+
 type LiveBatch struct {
 	Tokens   []sim.TokenID `json:"tokens"`
 	ID       int64         `json:"id"`

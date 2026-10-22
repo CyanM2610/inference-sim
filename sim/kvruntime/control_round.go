@@ -82,10 +82,11 @@ func (p *ControlProfile) Predict(name string, features ControlFeatures) (int64, 
 // ControlCommand starts a physical DAG and returns its actual completion task.
 // Ready is a notification to an inbox, not permission to publish cache state.
 type ControlCommand struct {
-	ID    string
-	Kind  string // copy or batch: one command per worker in the current protocol.
-	Start func() (int64, error)
-	Ready func(int64)
+	ID     string
+	Kind   string // copy or batch: one command per worker in the current protocol.
+	Start  func() (int64, error)
+	Ready  func(int64)
+	Queued func(int64) // completion committed to the queue, before driver receive
 }
 type ControlDecision struct {
 	PolicyFeatures ControlFeatures
@@ -93,12 +94,13 @@ type ControlDecision struct {
 	Commands       []ControlCommand
 }
 type ControlRoundSpec struct {
-	ID            string
-	Profile       *ControlProfile
-	InputFeatures ControlFeatures
-	Parents       []int64
-	Decide        func() (*ControlDecision, error)
-	Released      func(int64) // driver finished enqueuing; hardware may still be active.
+	DriverProtocol bool // measured queue commit/put tail and dispatch-finish boundaries
+	ID             string
+	Profile        *ControlProfile
+	InputFeatures  ControlFeatures
+	Parents        []int64
+	Decide         func() (*ControlDecision, error)
+	Released       func(int64) // driver finished enqueuing; hardware may still be active.
 }
 type ControlRoundResult struct {
 	RequestAvailableTask, ReplyAvailableTask, DriverWaitTask int64
@@ -146,7 +148,7 @@ func (r *Runtime) ControlRound(s ControlRoundSpec) (*ControlRoundResult, error) 
 		seen := map[string]bool{}
 		ids := map[string]bool{}
 		for _, command := range decision.Commands {
-			if command.ID == "" || command.Start == nil || (command.Kind != "copy" && command.Kind != "batch") || seen[command.Kind] || ids[command.ID] {
+			if command.ID == "" || command.Start == nil || (command.Kind != "copy" && command.Kind != "batch") || seen[command.Kind] || ids[command.ID] || (command.Ready != nil && command.Queued != nil) || (s.DriverProtocol && command.Queued == nil) {
 				return fmt.Errorf("control round requires at most one command per native worker")
 			}
 			seen[command.Kind] = true
@@ -189,6 +191,15 @@ func (r *Runtime) ControlRound(s ControlRoundSpec) (*ControlRoundResult, error) 
 						return
 					}
 					exit := stage(command.Kind+"_exit", worker, []int64{body}, features, nil, nil, nil)
+					if s.DriverProtocol {
+						commit := stage(command.Kind+"_enqueue", worker, []int64{exit}, features, nil, func() error {
+							out.NotificationsNS[command.ID] = e.NowNS
+							command.Queued(e.NowNS)
+							return nil
+						}, nil)
+						stage(command.Kind+"_put_tail", worker, []int64{commit}, features, nil, nil, nil)
+						return
+					}
 					stage(command.Kind+"_notify", "completion_queue/"+command.ID, []int64{exit}, features, nil, nil, func() {
 						out.NotificationsNS[command.ID] = e.NowNS
 						if command.Ready != nil {
@@ -202,6 +213,9 @@ func (r *Runtime) ControlRound(s ControlRoundSpec) (*ControlRoundResult, error) 
 		var parents []int64
 		if previous != 0 {
 			parents = []int64{previous}
+		}
+		if s.DriverProtocol {
+			parents = []int64{stage("driver_dispatch_finish", "protocol_driver", parents, reply, nil, nil, nil)}
 		}
 		e.MustAdd(Task{Name: "driver_round_released", Operation: s.ID, Resource: "protocol_driver", Parents: parents, Finish: func() error { out.ReleasedNS = e.NowNS; return nil }, After: func() {
 			if s.Released != nil {
