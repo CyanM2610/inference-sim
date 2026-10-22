@@ -27,12 +27,11 @@ type PolicyConfig struct {
 	MaxStoreUS   int64  `json:"max_store_us"`
 }
 type RequestConfig struct {
-	ID              string        `json:"id"`
-	At              int64         `json:"at_us"`
-	Input           []sim.TokenID `json:"input_tokens"`
-	Output          []sim.TokenID `json:"output_tokens"`
-	TTFTSLOUS       int64         `json:"ttft_slo_us,omitempty"`
-	MaxOutputTokens int           `json:"max_output_tokens,omitempty"`
+	ID        string        `json:"id"`
+	At        int64         `json:"at_us"`
+	Input     []sim.TokenID `json:"input_tokens"`
+	Output    []sim.TokenID `json:"output_tokens"`
+	TTFTSLOUS int64         `json:"ttft_slo_us,omitempty"`
 }
 type PromotionConfig struct {
 	Instance int           `json:"instance"`
@@ -41,7 +40,6 @@ type PromotionConfig struct {
 	Budget   int           `json:"block_budget"`
 }
 type Config struct {
-	DecisionPolicy   *DecisionPolicyConfig  `json:"decision_policy,omitempty"`
 	EnginePhases     *EnginePhaseCostConfig `json:"engine_phases,omitempty"`
 	StoreSourceReuse bool                   `json:"store_source_reuse,omitempty"`
 	TraceBatchShapes bool                   `json:"trace_batch_shapes,omitempty"`
@@ -81,11 +79,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
-	PolicyDecisions           []sim.DecisionRecord      `json:"-"`
-	DecisionCostCoverage      string                    `json:"decision_cost_coverage,omitempty"`
-	PolicyEvents              []sim.DecisionEventRecord `json:"-"`
-	DecisionEventCostCoverage string                    `json:"decision_event_cost_coverage,omitempty"`
-	BatchShapes               []BatchCostObservation    `json:"batch_shapes,omitempty"`
+	BatchShapes []BatchCostObservation `json:"batch_shapes,omitempty"`
 	// Absolute first observation, captured once before any possible re-prefill
 	// overwrites legacy core TTFT fields. These are the ranking API timestamps.
 	FirstTokenUS      map[string]int64            `json:"first_token_us"`
@@ -107,31 +101,6 @@ type Result struct {
 }
 
 func (c Config) Validate() error {
-	if c.DecisionPolicy != nil {
-		if c.DecisionPolicy.AdmissionDelayUS < 0 {
-			return fmt.Errorf("negative admission delay")
-		}
-		for _, request := range c.Requests {
-			if request.At > math.MaxInt64-c.DecisionPolicy.AdmissionDelayUS {
-				return fmt.Errorf("admission delay deadline overflows for %q", request.ID)
-			}
-		}
-		if c.DecisionPolicy.ExtraCost != nil {
-			if err := c.DecisionPolicy.ExtraCost.Validate(); err != nil {
-				return err
-			}
-		}
-		if c.DecisionPolicy.PrefillTokenCap > c.MaxBatchTokens {
-			return fmt.Errorf("decision prefill cap exceeds batch token limit")
-		}
-		order := c.DecisionPolicy.QueueOrder
-		if order == "" {
-			order = c.RequestScheduler
-		}
-		if _, err := sim.NewQueueDecisionPolicy(order, c.DecisionPolicy.PrefillTokenCap); err != nil {
-			return err
-		}
-	}
 	if c.StoreSourceReuse && c.EnginePhases == nil {
 		return fmt.Errorf("store_source_reuse requires engine_phases")
 	}
@@ -220,14 +189,11 @@ func (c Config) Validate() error {
 		minHBM = min(minHBM, i.HBMBlocks)
 	}
 	for _, r := range c.Requests {
-		if r.ID == "" || ids[r.ID] || r.At < 0 || len(r.Input) == 0 || r.TTFTSLOUS < 0 || r.MaxOutputTokens < 0 {
+		if r.ID == "" || ids[r.ID] || r.At < 0 || len(r.Input) == 0 || r.TTFTSLOUS < 0 {
 			return fmt.Errorf("invalid/duplicate request %q", r.ID)
 		}
 		if r.TTFTSLOUS > math.MaxInt64-r.At {
 			return fmt.Errorf("request %s deadline overflows int64", r.ID)
-		}
-		if r.MaxOutputTokens > 0 && len(r.Output) > r.MaxOutputTokens {
-			return fmt.Errorf("request %s exceeds its declared output budget", r.ID)
 		}
 		ids[r.ID] = true
 		kvTokens := int64(len(r.Input) + max(len(r.Output)-1, 0))
@@ -243,21 +209,6 @@ func (c Config) Validate() error {
 	return nil
 }
 func Run(c Config) (*Result, error) {
-	return run(c, nil)
-}
-
-// RunWithDecisionPolicy lets experiments inject a fresh stateful policy per
-// instance without changing resource management or event/metric code. The
-// decision_policy config must be enabled; its built-in ordering/cap settings
-// are replaced by the factory's implementation.
-func RunWithDecisionPolicy(c Config, factory func(instance string) sim.DecisionPolicy) (*Result, error) {
-	if c.DecisionPolicy == nil || factory == nil {
-		return nil, fmt.Errorf("custom decision factory requires decision_policy and a nonnil factory")
-	}
-	return run(c, factory)
-}
-
-func run(c Config, decisionFactory func(string) sim.DecisionPolicy) (*Result, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
@@ -390,10 +341,6 @@ func run(c Config, decisionFactory func(string) sim.DecisionPolicy) (*Result, er
 	}
 	for _, r := range c.Requests {
 		requests = append(requests, &sim.Request{ID: r.ID, ArrivalTime: r.At, InputTokens: append([]sim.TokenID(nil), r.Input...), OutputTokens: append([]sim.TokenID(nil), r.Output...), State: sim.StateQueued})
-		if c.DecisionPolicy != nil {
-			requests[len(requests)-1].SLOTargetUs = r.TTFTSLOUS
-			requests[len(requests)-1].MaxOutputLen = r.MaxOutputTokens
-		}
 		sink(kv.PeerRecord{Time: r.At, Name: "external_arrival", Request: r.ID})
 	}
 	sort.SliceStable(requests, func(i, j int) bool { return requests[i].ArrivalTime < requests[j].ArrivalTime })
@@ -423,62 +370,7 @@ func run(c Config, decisionFactory func(string) sim.DecisionPolicy) (*Result, er
 		} else {
 			inst = cluster.NewInstanceSimulatorWithKVStore(id, sc, s)
 		}
-		if c.DecisionPolicy != nil {
-			order := c.DecisionPolicy.QueueOrder
-			if order == "" {
-				order = c.RequestScheduler
-			}
-			if order == "" {
-				order = "fcfs"
-			}
-			policy, e := sim.NewQueueDecisionPolicy(order, c.DecisionPolicy.PrefillTokenCap)
-			if policy != nil {
-				policy.AdmissionDelayUS = c.DecisionPolicy.AdmissionDelayUS
-			}
-			if e != nil {
-				panic(e)
-			}
-			var selected sim.DecisionPolicy = policy
-			if decisionFactory != nil {
-				selected = decisionFactory(string(id))
-				order = "custom_decision"
-			}
-			if selected == nil {
-				panic("decision factory returned nil policy")
-			}
-			adapter := &decisionAdapter{policy: selected, order: order, instance: string(id)}
-			if c.RequestScheduler != "" {
-				adapter.sink = sink
-			}
-			var installed sim.DecisionPolicy = adapter
-			listener, subscribed := selected.(sim.DecisionEventListener)
-			if subscribed {
-				installed = &eventDecisionAdapter{decisionAdapter: adapter, listener: listener}
-			}
-			if e := inst.SetDecisionPolicy(installed, func(r sim.DecisionRecord) {
-				r.Instance = string(id)
-				out.PolicyDecisions = append(out.PolicyDecisions, r)
-			}); e != nil {
-				panic(e)
-			}
-			out.DecisionCostCoverage = "host_measured_sim_time_uncalibrated"
-			if subscribed || c.DecisionPolicy.TraceEvents {
-				if e := inst.SetDecisionEventObserver(func(r sim.DecisionEventRecord) {
-					r.Instance = string(id)
-					out.PolicyEvents = append(out.PolicyEvents, r)
-				}); e != nil {
-					panic(e)
-				}
-				out.DecisionEventCostCoverage = sim.DecisionEventCostCoverage
-			}
-			if c.DecisionPolicy.ExtraCost != nil {
-				model := *c.DecisionPolicy.ExtraCost
-				if e := inst.SetDecisionCostModel(model); e != nil {
-					panic(e)
-				}
-				out.DecisionCostCoverage = sim.ExplicitDecisionCostCoverage
-			}
-		} else if c.RequestScheduler != "" {
+		if c.RequestScheduler != "" {
 			deadlines := make(map[string]int64)
 			for _, r := range c.Requests {
 				if r.TTFTSLOUS > 0 {
