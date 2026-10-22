@@ -19,6 +19,7 @@ type PagedServiceClasses struct {
 // TokenOrigins identify the full causal input prefix, including reference output
 // tokens already consumed by decode. They are not numerical model predictions.
 type PagedStepSpec struct {
+	PhaseObserver       func(string, bool) error
 	ServiceClasses      PagedServiceClasses
 	Inputs              *RequestInputs
 	HostOutputBuffer    string
@@ -76,6 +77,23 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 	if s.WorkspacePool == "" {
 		return nil, fmt.Errorf("workspace pool required")
 	}
+	// A location-specific cost is valid only when that phase actually executes.
+	// In particular, first-output next-input costs cannot silently disappear on
+	// an internal prefill or final-output step using the same numerical shape.
+	if s.Point.PhaseGapsNS != nil {
+		phases := map[string]bool{"forward": true, "scatter_delta": true, "hf_release": true, "complete": true, "gather_prefix": s.Prefix > 0, "observe_token": s.Point.Output != nil, "index_bind": s.Inputs != nil}
+		if s.Inputs != nil {
+			if req := s.Inputs.requests[s.Request]; req != nil {
+				binding := InputBinding{request: req, prefix: s.Prefix, query: s.Query}
+				phases["next_input_d2d"] = binding.NeedsNextInput()
+			}
+		}
+		for phase := range s.Point.PhaseGapsNS {
+			if !phases[phase] {
+				return nil, fmt.Errorf("profiled phase gap %s has no executing phase", phase)
+			}
+		}
+	}
 	e, m := r.Engine, r.Memory
 	outputID := s.ID + "/output_token"
 	if o := s.Point.Output; o != nil {
@@ -117,7 +135,16 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 	}
 	var parents = append([]int64(nil), s.Parents...)
 	beginPhase := func(name string) int64 {
-		return e.MustAdd(Task{Name: "phase_begin", Operation: s.ID + "/" + name, Resource: "phase_control", Parents: parents, Finish: func() error { result.StagesNS[name] = -e.NowNS; return nil }})
+		if gap := s.Point.PhaseGapsNS[name]; gap > 0 {
+			parents = []int64{e.MustAdd(Task{Name: "python_phase_gap", Operation: s.ID + "/" + name, Resource: "cpu", DurationNS: gap, Parents: parents})}
+		}
+		return e.MustAdd(Task{Name: "phase_begin", Operation: s.ID + "/" + name, Resource: "phase_control", Parents: parents, Finish: func() error {
+			result.StagesNS[name] = -e.NowNS
+			if s.PhaseObserver != nil {
+				return s.PhaseObserver(name, true)
+			}
+			return nil
+		}})
 	}
 	endPhase := func(name string, tail []int64, observe int64, action func() error) int64 {
 		id := e.MustAdd(Task{Name: "phase_complete", Operation: s.ID + "/" + name, Resource: "cpu", DurationNS: observe, Parents: tail, Finish: func() error {
@@ -127,6 +154,9 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 				}
 			}
 			result.StagesNS[name] += e.NowNS
+			if s.PhaseObserver != nil {
+				return s.PhaseObserver(name, false)
+			}
 			return nil
 		}})
 		parents = []int64{id}
@@ -496,7 +526,11 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 		}
 		return nil
 	})
-	result.CompletionTask = e.MustAdd(Task{Name: "python_and_measurement_bookkeeping", Operation: s.ID, Resource: "cpu", DurationNS: s.Point.ResidualNS, Parents: parents, Finish: func() error {
+	residual := s.Point.ResidualNS
+	if s.Point.PhaseGapsNS != nil {
+		residual = s.Point.PhaseGapsNS["complete"]
+	}
+	result.CompletionTask = e.MustAdd(Task{Name: "python_and_measurement_bookkeeping", Operation: s.ID, Resource: "cpu", DurationNS: residual, Parents: parents, Finish: func() error {
 		result.CompleteNS = e.NowNS
 		result.AllocatedPeakDelta = allocatedPeak - before
 		e.Emit(Record{Name: "paged_step_complete", Request: s.Request, Operation: s.ID, PrefixTokens: s.Prefix, QueryTokens: s.Query})

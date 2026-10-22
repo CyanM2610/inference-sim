@@ -14,6 +14,9 @@ type Span struct {
 // TransferCost describes primitive service costs, not a synthetic completion
 // timestamp. CPU issue and DMA evolve independently under finite queue credits.
 type TransferCost struct {
+	// HoldCPUUntilCompletion submits the entire transaction asynchronously,
+	// then holds the host thread on its last DMA (e.g. cudaEventSynchronize).
+	HoldCPUUntilCompletion bool `json:"hold_cpu_until_completion,omitempty"`
 	// HoldCPUUntilDMA models a synchronous host wait on actual device completion,
 	// including queue delays and service-rate changes, after async submission.
 	HoldCPUUntilDMA  bool   `json:"hold_cpu_until_dma,omitempty"`
@@ -33,7 +36,10 @@ type TransferCost struct {
 }
 
 func (c TransferCost) Validate() error {
-	if c.HoldCPUUntilDMA && (c.WaitForDMA || c.BlockingAPI || c.ReturnLeadNS != 0) {
+	if c.HoldCPUUntilDMA && c.HoldCPUUntilCompletion {
+		return fmt.Errorf("choose per-copy or transaction-end synchronization")
+	}
+	if (c.HoldCPUUntilDMA || c.HoldCPUUntilCompletion) && (c.WaitForDMA || c.BlockingAPI || c.ReturnLeadNS != 0) {
 		return fmt.Errorf("actual host synchronization cannot be combined with predicted/blocking return modes")
 	}
 	if c.PlanNS < 0 || c.SubmitNS < 0 || c.DMANS <= 0 || c.SetupNS < 0 || c.ObserveNS < 0 || c.StageBeforeNS < 0 || c.StageAfterNS < 0 || c.PreparePerCopyNS < 0 || c.CopyAfterNS < 0 || c.ReturnLeadNS < 0 {
@@ -43,6 +49,10 @@ func (c TransferCost) Validate() error {
 }
 
 type TransferSpec struct {
+	// HostServiceClass covers measured host work excluding actual device waits.
+	// SubmitServiceClass, when nonempty, overrides it for CUDA submissions.
+	HostServiceClass                    string
+	Activity                            func(bool) error // successful plan start / fully published completion
 	StreamGroup                         string
 	SubmitServiceClass, DMAServiceClass string
 	ID, Source, Destination             string
@@ -136,6 +146,8 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 		if name == "dma_copy" {
 			class = s.DMAServiceClass
 			group = s.StreamGroup
+		} else if resource == s.CPU {
+			class = s.HostServiceClass
 		}
 		return e.MustAdd(Task{Name: name, Operation: s.ID, Resource: resource, DurationNS: duration, Parents: parents, Start: start, Finish: finish, ServiceClass: class, ResourceGroup: group})
 	}
@@ -177,6 +189,9 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 				return err
 			}
 		}
+		if s.Activity != nil {
+			return s.Activity(true)
+		}
 		return nil
 	}, nil)
 	previous := begin
@@ -194,7 +209,11 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 			}
 			previous = add(name, s.CPU, s.Cost.PreparePerCopyNS, []int64{previous}, nil, nil)
 		}
-		api := e.MustAdd(Task{Name: "cuda_submit", Operation: s.ID, Resource: s.CPU, ServiceClass: s.SubmitServiceClass, DurationNS: s.Cost.SubmitNS, Parents: []int64{previous}, Ready: func() bool { return r.outstanding < r.QueueDepth }, Start: func() error {
+		submitClass := s.SubmitServiceClass
+		if submitClass == "" {
+			submitClass = s.HostServiceClass
+		}
+		api := e.MustAdd(Task{Name: "cuda_submit", Operation: s.ID, Resource: s.CPU, ServiceClass: submitClass, DurationNS: s.Cost.SubmitNS, Parents: []int64{previous}, Ready: func() bool { return r.outstanding < r.QueueDepth }, Start: func() error {
 			r.outstanding++
 			if r.outstanding > result.PeakOutstanding {
 				result.PeakOutstanding = r.outstanding
@@ -245,6 +264,9 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 			previous = add("pageable_copy_after_dma", s.CPU, s.Cost.CopyAfterNS, []int64{previous}, nil, func() error { result.CPUFinishedNS = e.NowNS; return nil })
 		}
 	}
+	if s.Cost.HoldCPUUntilCompletion {
+		previous = e.MustAdd(Task{Name: "host_transaction_synchronize", Operation: s.ID, Resource: s.CPU, Parents: []int64{previous}, WaitFor: []int64{dmaIDs[len(dmaIDs)-1]}, Finish: func() error { result.CPUFinishedNS = e.NowNS; return nil }})
+	}
 	parents := []int64{dmaIDs[len(dmaIDs)-1]}
 	if previous != parents[0] {
 		parents = append(parents, previous)
@@ -258,7 +280,7 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 		})
 		parents = []int64{stage}
 	}
-	result.CompletionTask = e.MustAdd(Task{Name: "completion_observe_publish", Operation: s.ID, Resource: s.CPU, DurationNS: s.Cost.ObserveNS, Parents: parents, Finish: func() error {
+	result.CompletionTask = e.MustAdd(Task{Name: "completion_observe_publish", Operation: s.ID, Resource: s.CPU, ServiceClass: s.HostServiceClass, DurationNS: s.Cost.ObserveNS, Parents: parents, Finish: func() error {
 		for _, id := range targets {
 			if err := r.Memory.Publish(id); err != nil {
 				return err
@@ -272,12 +294,18 @@ func (r *Runtime) Transfer(s TransferSpec) (*TransferResult, error) {
 		result.CompleteNS = e.NowNS
 		return nil
 	}, After: func() {
+		if s.Activity != nil {
+			if err := s.Activity(false); err != nil {
+				e.Fail(err)
+				return
+			}
+		}
 		if s.Done != nil {
 			s.Done(result)
 		}
 	}})
 	r.hostTail[s.CPU] = previous
-	if s.Cost.BlockingAPI || s.Cost.HoldCPUUntilDMA {
+	if s.Cost.BlockingAPI || s.Cost.HoldCPUUntilDMA || s.Cost.HoldCPUUntilCompletion {
 		r.hostTail[s.CPU] = result.CompletionTask
 	}
 	if err := e.Error(); err != nil {

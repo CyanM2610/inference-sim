@@ -13,6 +13,8 @@ import (
 // It shares the legacy native adapter's arena setup and paged implementation,
 // but owns no scheduler, policy clock, or synthetic completion acknowledgement.
 type PagedExecutor struct {
+	copyHostClass                               string
+	copyActivity                                func(bool) error
 	copySubmitClass, copyD2HClass, copyH2DClass string
 	Runtime                                     *kvruntime.Runtime
 	native                                      *NativePeerRuntime
@@ -28,6 +30,9 @@ type physicalTransferState struct {
 }
 
 type PagedExecutorConfig struct {
+	PhaseObserver                               func(string, bool) error
+	CopyActivity                                func(bool) error
+	IndexHostServiceClass, CopyHostServiceClass string
 	// Optional bindings for an external, calibrated rate model. Empty preserves
 	// the solo-cost path; setting names alone does not imply measured slowdown.
 	PagedServiceClasses                                              kvruntime.PagedServiceClasses
@@ -54,6 +59,8 @@ func NewPagedExecutor(c PagedExecutorConfig, sink func(kvruntime.Record)) (*Page
 	}
 	x := &PagedExecutor{Runtime: n.Runtime, native: n, requests: map[string]*sim.Request{}, hashes: map[string][]string{}, batches: map[int64]bool{}, transfers: map[int64]*physicalTransferState{}}
 	n.pagedServiceClasses = c.PagedServiceClasses
+	n.pagedPhaseObserver = c.PhaseObserver
+	x.copyHostClass, x.copyActivity = c.CopyHostServiceClass, c.CopyActivity
 	x.copySubmitClass, x.copyD2HClass, x.copyH2DClass = c.CopySubmitServiceClass, c.CopyD2HServiceClass, c.CopyH2DServiceClass
 	var inputs []kvruntime.InputRequest
 	for _, req := range c.Requests {
@@ -90,6 +97,7 @@ func NewPagedExecutor(c PagedExecutorConfig, sink func(kvruntime.Record)) (*Page
 	if err = n.enableInputPipeline(inputs); err != nil {
 		return nil, err
 	}
+	n.inputs.IndexHostServiceClass = c.IndexHostServiceClass
 	n.Runtime.Engine.Emit(kvruntime.Record{Name: "external_paged_executor_enabled", Reason: "shared physical primitives; policy acknowledgements remain caller-owned; supplied tokens are causal references, not numerical model predictions"})
 	return x, nil
 }
@@ -154,7 +162,7 @@ func (x *PagedExecutor) StartTransfer(c ExternalTransfer) (*kvruntime.TransferRe
 	if direction == "h2d" {
 		dmaClass = x.copyH2DClass
 	}
-	result, err := x.Runtime.Transfer(kvruntime.TransferSpec{ID: fmt.Sprintf("peer/%d/%s", c.ID, c.Reason), Source: c.Source, Destination: c.Destination, CPU: "copy_thread", DMA: "copy_" + direction, StreamGroup: "kv_stream", Spans: spans, Cost: x.native.points[direction].Cost, SubmitServiceClass: x.copySubmitClass, DMAServiceClass: dmaClass, Done: func(*kvruntime.TransferResult) {
+	result, err := x.Runtime.Transfer(kvruntime.TransferSpec{ID: fmt.Sprintf("peer/%d/%s", c.ID, c.Reason), Source: c.Source, Destination: c.Destination, CPU: "copy_thread", DMA: "copy_" + direction, StreamGroup: "kv_stream", Spans: spans, Cost: x.native.points[direction].Cost, SubmitServiceClass: x.copySubmitClass, DMAServiceClass: dmaClass, HostServiceClass: x.copyHostClass, Activity: x.copyActivity, Done: func(*kvruntime.TransferResult) {
 		if err := x.CheckContents(c.Hash, c.Destination); err != nil {
 			x.Runtime.Engine.Fail(err)
 			return

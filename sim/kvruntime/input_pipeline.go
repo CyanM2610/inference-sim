@@ -52,6 +52,9 @@ type inputRequestState struct {
 // RequestInputs owns persistent input tensors and the single worker's index
 // tensors. Output-budget zeros are physical data, not generated-token readiness.
 type RequestInputs struct {
+	// Optional class for index preparation and host-side H2D work; DMA waits
+	// remain dependent on actual device completion.
+	IndexHostServiceClass         string
 	r                             *Runtime
 	profile                       InputPipelineProfile
 	requests                      map[string]*inputRequestState
@@ -160,7 +163,7 @@ func (i *RequestInputs) Bind(operation, request string, prefix, query int64, pag
 	}
 	e, m := i.r.Engine, i.r.Memory
 	temporary := operation + "/index_list_cpu"
-	prepare := e.MustAdd(Task{Name: "input_index_prepare", Operation: operation + "/index_bind", Resource: "cpu", DurationNS: point.PrepareNS, Parents: parents, Start: func() error {
+	prepare := e.MustAdd(Task{Name: "input_index_prepare", Operation: operation + "/index_bind", Resource: "cpu", ServiceClass: i.IndexHostServiceClass, DurationNS: point.PrepareNS, Parents: parents, Start: func() error {
 		if _, err := m.ReserveGranular(temporary, i.hostPool, "temporary_cpu_index_list", int64(len(pages))*8, 8); err != nil {
 			return err
 		}
@@ -191,7 +194,7 @@ func (i *RequestInputs) Bind(operation, request string, prefix, query int64, pag
 		}
 		return m.Free(temporary)
 	}})
-	tx, err := i.r.Transfer(TransferSpec{ID: operation + "/index_h2d", Source: i.indexHost, Destination: i.indexGPU, CPU: "cpu", DMA: "copy_h2d", StreamGroup: "request_stream", Spans: []Span{{Bytes: int64(len(pages)) * 8}}, Cost: point.Cost, Parents: []int64{prepare}})
+	tx, err := i.r.Transfer(TransferSpec{ID: operation + "/index_h2d", Source: i.indexHost, Destination: i.indexGPU, CPU: "cpu", DMA: "copy_h2d", StreamGroup: "request_stream", Spans: []Span{{Bytes: int64(len(pages)) * 8}}, Cost: point.Cost, Parents: []int64{prepare}, HostServiceClass: i.IndexHostServiceClass})
 	if err != nil {
 		return nil, 0, err
 	}

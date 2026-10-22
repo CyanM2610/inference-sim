@@ -90,6 +90,9 @@ type TorchCopyProfile struct {
 	Evidence               string           `json:"evidence"`
 }
 type PagedForwardPoint struct {
+	// Optional measured CPU gaps before named phases and after cleanup
+	// ("complete"). When present these replace the lumped ResidualNS placement.
+	PhaseGapsNS          map[string]int64       `json:"phase_gaps_ns,omitempty"`
 	Output               *OutputCopyPoint       `json:"output_copy,omitempty"`
 	Prefix               int64                  `json:"prefix"`
 	Query                int64                  `json:"query"`
@@ -264,6 +267,19 @@ func (x PagedForwardPoint) Validate() error {
 	}
 	if x.BeforeAllocatedBytes <= arena || x.ReservedBytes < x.BeforeAllocatedBytes || x.ReservedBytes > 40<<30 {
 		return fmt.Errorf("invalid paged forward allocation envelope")
+	}
+	if x.PhaseGapsNS != nil {
+		allowed := map[string]bool{"index_bind": true, "gather_prefix": true, "forward": true, "observe_token": true, "next_input_d2d": true, "scatter_delta": true, "hf_release": true, "complete": true}
+		var sum int64
+		for name, ns := range x.PhaseGapsNS {
+			if !allowed[name] || ns < 0 || ns > math.MaxInt64-sum {
+				return fmt.Errorf("invalid paged phase gap")
+			}
+			sum += ns
+		}
+		if sum != x.ResidualNS {
+			return fmt.Errorf("paged phase gaps disagree with residual cost")
+		}
 	}
 	required := map[string]bool{"forward": false, "scatter_delta": true, "hf_release": false}
 	if o := x.Output; o != nil {

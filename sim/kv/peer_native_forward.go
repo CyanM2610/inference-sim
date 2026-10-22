@@ -328,6 +328,7 @@ func (n *NativePeerRuntime) beginPagedBatch(req *sim.Request, prefix, query int6
 	}
 	n.forwardActive = true
 	spec.ServiceClasses = n.pagedServiceClasses
+	spec.PhaseObserver = n.pagedPhaseObserver
 	result, err := n.Runtime.PagedStep(spec)
 	if err != nil {
 		n.Runtime.Engine.Fail(err)
