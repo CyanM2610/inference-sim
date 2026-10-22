@@ -55,6 +55,7 @@ type NativeAsyncEvent struct {
 	Transaction      int64                  `json:"transaction,omitempty"`
 	Transfer         *NativeTransferPlan    `json:"transfer,omitempty"`
 	TransferShape    *NativeTransferShape   `json:"transfer_shape,omitempty"`
+	TransferFailure  *NativeTransferFailure `json:"transfer_failure,omitempty"`
 	ProducerBatch    int64                  `json:"producer_batch,omitempty"`
 	ProducerPhase    string                 `json:"producer_phase,omitempty"`
 	Request          string                 `json:"request,omitempty"`

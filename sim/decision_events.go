@@ -18,6 +18,8 @@ type DecisionProgress struct {
 // instance; DeliveredUS may be later when CPU decision service is busy.
 // request_completed means scheduler completion/resource release, not client
 // response delivery. batch_returned is an engine boundary, not a GPU timestamp.
+// transfer_failed is a physically terminal failure, never a successful cache
+// adoption; native control HBM ownership may still await FIFO receipt consumption.
 type DecisionEvent struct {
 	Sequence    uint64             `json:"sequence"`
 	Kind        string             `json:"kind"`

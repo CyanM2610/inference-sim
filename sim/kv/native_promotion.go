@@ -15,18 +15,20 @@ type NativePromotionPrefix struct {
 }
 
 type nativePromotion struct {
-	id          string
-	prefix      NativePromotionPrefix
-	budget      int
-	lookupReady bool
-	matched     int64
-	ids         []int64
-	cached      int
-	completed   int
-	claimed     bool
-	submitted   bool
-	cancelled   bool
-	closing     bool
+	id            string
+	prefix        NativePromotionPrefix
+	budget        int
+	lookupReady   bool
+	matched       int64
+	ids           []int64
+	cached        int
+	settled       int
+	failed        bool
+	copiedTargets map[int64]bool
+	claimed       bool
+	submitted     bool
+	cancelled     bool
+	closing       bool
 }
 
 // SnapshotNativePromotionPrefix freezes a full-host-chunk prefix from current
@@ -138,6 +140,13 @@ func (s *PeerCache) prepareNativePromotion() *nativePromotion {
 		s.retireNativePromotion(c, "hbm_hit_budget_or_capacity")
 		return nil
 	}
+	if s.nativePartialFailure > 0 {
+		objects := (len(c.prefix.hashes)-1)/int(s.fabric.hostChunks.blocks) - len(cached)/int(s.fabric.hostChunks.blocks) + 1
+		if s.nativePartialFailure >= objects {
+			s.retireNativePromotion(c, "partial_failure_requires_multiple_retained_objects")
+			return nil
+		}
+	}
 	c.cached = len(cached)
 	c.ids = append(c.ids, cached...)
 	for _, id := range cached {
@@ -179,7 +188,7 @@ func (s *PeerCache) submitNativePromotion(c *nativePromotion) {
 }
 
 func (s *PeerCache) adoptNativePromotion(c *nativePromotion) {
-	if c != s.nativeControl || !c.claimed || c.completed != len(c.ids)-c.cached || c.closing {
+	if c != s.nativeControl || !c.claimed || c.settled != len(c.ids)-c.cached || c.closing {
 		panic("native control adopted without terminal ownership")
 	}
 	for i := c.cached; i < len(c.ids); i++ {
@@ -189,7 +198,7 @@ func (s *PeerCache) adoptNativePromotion(c *nativePromotion) {
 		}
 		hash := c.prefix.hashes[i]
 		delete(s.restoring, s.restoreIdentity(c.id, hash))
-		if !c.cancelled {
+		if !c.cancelled && !c.failed {
 			b.Hash = hash
 			s.HashToBlock[hash] = b.ID
 			s.publishReadyCopy(b)
@@ -205,6 +214,9 @@ func (s *PeerCache) adoptNativePromotion(c *nativePromotion) {
 	reason := "success"
 	if c.cancelled {
 		reason = "cancelled_after_capture"
+	}
+	if c.failed {
+		reason = "partial_submission_failed"
 	}
 	s.emit("native_control_adopted", c.id, "", "host", "hbm", reason)
 	s.retireNativePromotion(c, reason)

@@ -20,6 +20,7 @@ type PeerCache struct {
 	nativeControl           *nativePromotion
 	nativeControlSerial     int64
 	nativeControlRPCs       int64
+	nativePartialFailure    int
 	nativePageAccess        map[int64]nativePendingPageAccess
 	nativeReserving         bool
 	nativeBatchPins         int64
@@ -584,7 +585,10 @@ func (s *PeerCache) fetchInto(h, req string, e *peerEntry, a *PeerAccess, protec
 	s.fabric.submit(s.clock, &peerJob{nativeControl: control, hostObject: e.object, nativeSource: func() string { return e.nativeBuffer }, nativeDestination: func() string { return s.fabric.hbmBuffer(b.ID) }, record: PeerRecord{Instance: s.id, Request: req, Source: a.Pool, Destination: "hbm", Hash: h, HBMBlocks: targetIDs, Reason: reason}, path: a.ReadPath, schedule: s.schedule, prepare: prepare, cancel: cancel, done: func(now int64) {
 		s.clock = now
 		delete(s.pendingTargets, b.ID)
-		b.Tokens = append([]sim.TokenID(nil), e.tokens...)
+		copied := control == nil || control.copiedTargets == nil || control.copiedTargets[b.ID]
+		if copied {
+			b.Tokens = append([]sim.TokenID(nil), e.tokens...)
+		}
 		if control == nil {
 			b.Hash = h
 			s.HashToBlock[h] = b.ID
@@ -592,7 +596,9 @@ func (s *PeerCache) fetchInto(h, req string, e *peerEntry, a *PeerAccess, protec
 		if !s.nativeAsync || background && !nativePromotion {
 			s.publishReadyCopy(b)
 		}
-		s.metricLoad(b, a.Pool, reason, req)
+		if copied {
+			s.metricLoad(b, a.Pool, reason, req)
+		}
 		s.releaseHotPrefixParent(h)
 		e.readers--
 		e.last = now
@@ -605,9 +611,9 @@ func (s *PeerCache) fetchInto(h, req string, e *peerEntry, a *PeerAccess, protec
 			delete(s.readPending, req)
 		}
 		if control != nil {
-			control.completed++
-			if control.completed > len(control.ids)-control.cached {
-				panic("native control copied a destination twice")
+			control.settled++
+			if control.settled > len(control.ids)-control.cached {
+				panic("native control settled a destination twice")
 			}
 		} else if nativePromotion {
 			// Keep this target owned and undiscoverable until an actual worker
@@ -628,7 +634,9 @@ func (s *PeerCache) fetchInto(h, req string, e *peerEntry, a *PeerAccess, protec
 		if s.readPending[req] == 0 {
 			delete(s.cancelledRestores, req)
 		}
-		if s.nativeAsync && (!background || nativePromotion) {
+		if !copied {
+			s.emit("native_load_not_submitted", req, h, a.Pool, "hbm", "partial_submission_failed")
+		} else if s.nativeAsync && (!background || nativePromotion) {
 			s.emit("native_load_device_complete", req, h, a.Pool, "hbm", reason)
 		} else {
 			s.emit("hbm_publish", req, h, a.Pool, "hbm", reason)

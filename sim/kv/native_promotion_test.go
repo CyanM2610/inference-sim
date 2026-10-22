@@ -279,7 +279,7 @@ func TestNativeControlWholeReservationStaysOwnedUntilSuccessOrCancelAdoption(t *
 							t.Fatal("reserved prefix freed or suffix hashed before adoption", i, block)
 						}
 					}
-					if c.completed == missing {
+					if c.settled == missing {
 						replySeen = true
 						if cancelAt == "terminal" {
 							s.CancelNativePromotion(id)

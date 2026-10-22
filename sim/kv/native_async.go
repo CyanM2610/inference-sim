@@ -382,6 +382,7 @@ func (b *nativeCapturedBatch) PostForward(now int64, producer *sim.NativeFence) 
 	s.nativePrepared = nil
 	for _, j := range jobs {
 		s.fabric.nativePrepared--
+		failure := s.prepareNativePartialFailure(j)
 		j.record.Time, j.record.Name = now, "transfer_queued"
 		s.fabric.emit(j.record)
 		f := s.fabric
@@ -400,22 +401,38 @@ func (b *nativeCapturedBatch) PostForward(now int64, producer *sim.NativeFence) 
 				objects[i].Segments = append([]sim.NativeCopySegment(nil), objects[i].Segments...)
 			}
 			started := int64(-1)
-			fence := s.nativeExecutor.SubmitTransfer(now, j.record.Transaction, sim.NativeTransferShape{Direction: direction, Objects: objects}, producer,
-				func(at int64) { started = at; j.record.Time, j.record.Name = at, "transfer_start"; f.emit(j.record) },
-				func(at int64) {
-					record := j.record
-					record.Time, record.Name, record.Duration = at, "transfer_cuda_complete", at-started
-					f.emit(record)
-				},
-				func(at int64) {
-					delete(s.nativePageAccess, j.record.Transaction)
-					f.nativeInFlight--
-					j.record.Time, j.record.Name, j.record.Duration = at, "transfer_end", at-started
-					f.emit(j.record)
-					j.done(at)
-					f.notifyDecisionTransfer(at, j)
-					f.wakeStores(at)
-				})
+			begin := func(at int64) { started = at; j.record.Time, j.record.Name = at, "transfer_start"; f.emit(j.record) }
+			gpuDone := func(at int64) {
+				record := j.record
+				record.Time, record.Name, record.Duration = at, "transfer_cuda_complete", at-started
+				f.emit(record)
+			}
+			done := func(at int64) {
+				delete(s.nativePageAccess, j.record.Transaction)
+				f.nativeInFlight--
+				j.record.Time, j.record.Name, j.record.Duration = at, "transfer_end", at-started
+				if failure != nil {
+					if !j.nativeControl.failed {
+						panic("failed transfer bypassed failure observation")
+					}
+					j.record.Outcome = "failed"
+				}
+				f.emit(j.record)
+				j.done(at)
+				f.notifyDecisionTransfer(at, j)
+				f.wakeStores(at)
+			}
+			var fence *sim.NativeFence
+			if failure == nil {
+				fence = s.nativeExecutor.SubmitTransfer(now, j.record.Transaction, sim.NativeTransferShape{Direction: direction, Objects: objects}, producer, begin, gpuDone, done)
+			} else {
+				fence = s.nativeExecutor.SubmitFailedTransfer(now, j.record.Transaction, *failure, producer, begin, gpuDone, func(at int64) {
+					j.nativeControl.failed = true
+					r := j.record
+					r.Time, r.Name, r.Outcome = at, "native_transfer_failure_observed", "failed"
+					f.emit(r)
+				}, done)
+			}
 			s.nativePageAccess[j.record.Transaction] = nativePendingPageAccess{ids: append([]int64(nil), j.record.HBMBlocks...), write: direction == "load", fence: fence}
 			continue
 		}
@@ -451,10 +468,14 @@ func (b *nativeCapturedBatch) Poll(now int64) {
 	s.SetClock(now)
 	b.promotions = s.nativePromotionReceipts
 	s.nativePromotionReceipts = nil
-	if c := s.nativeControl; c != nil && c.submitted && !c.claimed && c.completed == len(c.ids)-c.cached {
+	if c := s.nativeControl; c != nil && c.submitted && !c.claimed && c.settled == len(c.ids)-c.cached {
 		c.claimed = true
 		b.controlReceipt = c
-		s.emit("native_control_receipt", c.id, "", "host", "hbm", "worker_poll")
+		reason := "worker_poll"
+		if c.failed {
+			reason = "worker_poll_failed"
+		}
+		s.emit("native_control_receipt", c.id, "", "host", "hbm", reason)
 	}
 	for request, pending := range s.nativeLoadPending {
 		if pending && s.readPending[request] == 0 && len(s.nativeLoadTargets[request]) > 0 {

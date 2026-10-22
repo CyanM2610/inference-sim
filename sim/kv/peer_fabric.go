@@ -42,6 +42,8 @@ type PeerRecord struct {
 	EffectiveBytes  int64                       `json:"effective_bytes,omitempty"`
 	HostObjects     []string                    `json:"host_objects,omitempty"`
 	NativeObjects   []sim.NativeTransferObject  `json:"native_objects,omitempty"`
+	NativeFailure   *sim.NativeTransferFailure  `json:"native_failure,omitempty"`
+	Outcome         string                      `json:"outcome,omitempty"`
 	HostChunkBlocks int64                       `json:"host_chunk_blocks,omitempty"`
 	Duration        int64                       `json:"duration_us,omitempty"`
 	Reason          string                      `json:"reason,omitempty"`
@@ -339,7 +341,11 @@ func (e *peerTransferEvent) Execute(_ *sim.Simulator) {
 func (f *PeerFabric) notifyDecisionTransfer(now int64, j *peerJob) {
 	for _, s := range f.stores {
 		if s.id == j.record.Instance && s.decisionEvents != nil {
-			s.decisionEvents(sim.DecisionEvent{Kind: "transfer_adopted", OccurredUS: now, Request: j.record.Request,
+			kind := "transfer_adopted"
+			if j.record.Outcome == "failed" {
+				kind = "transfer_failed"
+			}
+			s.decisionEvents(sim.DecisionEvent{Kind: kind, OccurredUS: now, Request: j.record.Request,
 				Transfer: &sim.DecisionTransfer{ID: j.record.Transaction, Request: j.record.Request, Source: j.record.Source, Destination: j.record.Destination, Bytes: j.record.Bytes}})
 		}
 	}

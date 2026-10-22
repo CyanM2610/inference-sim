@@ -34,6 +34,9 @@ type NativeTransferPlan struct {
 	Published     string        `json:"published"`
 	CostScope     string        `json:"cost_scope,omitempty"`
 	CoverageGaps  []string      `json:"coverage_gaps,omitempty"`
+	// Only failed submissions name this positive host-service milestone. A
+	// failed receipt still joins GPUComplete, ModelComplete and this handler.
+	FailureObserved string `json:"failure_observed,omitempty"`
 	// Persistent per-context staging allocation, shared by STORE and LOAD.
 	// This is not a new allocation or KV-pool debit for each operation; other
 	// registration buffers and registration costs remain separate obligations.
@@ -43,4 +46,17 @@ type NativeTransferPlan struct {
 
 type NativeTransferCost interface {
 	TransferPlan(NativeTransferShape) NativeTransferPlan
+}
+
+// NativeTransferFailure separates acquired source/target geometry from the
+// prefix of host objects actually submitted before an operation-level failure.
+// No unsubmitted object may enter CUDA or modeled-media service. This is an
+// execution-environment diagnostic, never a Placement-policy result.
+type NativeTransferFailure struct {
+	ReservedShape    NativeTransferShape `json:"reserved_shape"`
+	SubmittedObjects int                 `json:"submitted_objects"`
+}
+
+type NativeTransferFailureCost interface {
+	FailedTransferPlan(NativeTransferFailure) NativeTransferPlan
 }

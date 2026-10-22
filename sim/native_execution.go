@@ -169,6 +169,10 @@ func (e *NativeExecutor) SubmitTransfer(now, transaction int64, shape NativeTran
 		panic("native transfer geometry/model missing")
 	}
 	p := model.TransferPlan(shape)
+	return e.submitTransferPlan(now, transaction, shape, p, nil, producer, begin, gpuDone, nil, done)
+}
+
+func (e *NativeExecutor) submitTransferPlan(now, transaction int64, shape NativeTransferShape, p NativeTransferPlan, failure *NativeTransferFailure, producer *NativeFence, begin, gpuDone, failed, done func(int64)) *NativeFence {
 	ancestors, err := validateNativeStages(p.Stages, e.busy)
 	if err != nil {
 		panic(err)
@@ -180,6 +184,18 @@ func (e *NativeExecutor) SubmitTransfer(now, transaction int64, shape NativeTran
 	}
 	if !ancestors[p.GPUComplete][p.ProducerWait] || !ancestors[p.Published][p.GPUComplete] || !ancestors[p.Published][p.ModelComplete] {
 		panic("native transfer publication must join CUDA and model")
+	}
+	if failure != nil {
+		if p.CostScope == "" || ancestors[p.FailureObserved] == nil || !ancestors[p.Published][p.FailureObserved] || failed == nil {
+			panic("failed transfer requires an explicit failure handler and terminal dependency")
+		}
+		for _, stage := range p.Stages {
+			if stage.Name == p.FailureObserved && (stage.Resource == "" || stage.Delay || stage.DurationUS <= 0) {
+				panic("failure handling requires positive host service")
+			}
+		}
+	} else if p.FailureObserved != "" {
+		panic("successful transfer cannot silently execute a failure plan")
 	}
 	prefix := fmt.Sprintf("kv_%d/", transaction)
 	fences := map[string]*NativeFence{}
@@ -198,6 +214,15 @@ func (e *NativeExecutor) SubmitTransfer(now, transaction int64, shape NativeTran
 		}
 		if spec.Name == p.GPUComplete {
 			j.end = gpuDone
+		}
+		if failure != nil && spec.Name == p.FailureObserved {
+			previous := j.end
+			j.end = func(at int64) {
+				if previous != nil {
+					previous(at)
+				}
+				failed(at)
+			}
 		}
 		if spec.Name == p.Published {
 			previous := j.end
@@ -220,6 +245,7 @@ func (e *NativeExecutor) SubmitTransfer(now, transaction int64, shape NativeTran
 	record.Transaction = transaction
 	record.Transfer = &p
 	record.TransferShape = &shape
+	record.TransferFailure = failure
 	record.ProducerBatch, record.ProducerPhase = producer.batch, producer.phase
 	e.pump(now)
 	return fences[p.Published]
