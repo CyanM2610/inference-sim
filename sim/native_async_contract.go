@@ -63,6 +63,9 @@ type NativeAsyncKVStore interface {
 	// Mirrors the connector contract used by native preemption. Producer
 	// hand-offs discard stale samples; best-effort caches can deliver them.
 	NativeRequiresKVDelivery() bool
+	// Actionable connector control metadata or receipts. An outstanding DMA
+	// alone is false: its completion event owns the wakeup, not a polling loop.
+	NativeControlPending() bool
 	ReserveNativeRange(req *Request, start, end int64, cached []int64) bool
 	CaptureNativeBatch(work []NativeWork) NativeBatchKV
 }

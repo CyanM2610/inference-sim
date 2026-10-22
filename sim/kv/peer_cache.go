@@ -10,34 +10,36 @@ import (
 // PeerCache wraps BLIS's physical HBM allocator. DRAM and CXL are peers in
 // access, not stages in a chain. Only completed full input blocks are reusable.
 type PeerCache struct {
-	nativeAsync            bool
-	nativePhaseTransfers   bool
-	nativeExecutor         *sim.NativeExecutor
-	nativeCopyResource     string
-	nativePrepared         []*peerJob
-	nativePageAccess       map[int64]nativePendingPageAccess
-	nativeReserving        bool
-	nativeBatchPins        int64
-	nativePending          map[string]int
-	nativeDeferred         []nativeRetiredAllocation
-	nativeScheduledStep    int64
-	nativeProcessedStep    int64
-	nativeLastStep         map[string]int64
-	nativeLoadPending      map[string]bool
-	nativeLoadTargets      map[string][]int64
-	nativeStored           map[string]nativeStorePosition
-	nativeRestoreAdmission bool
-	cacheMetrics           *cacheMetricState
-	hotprefix              *hotPrefixRuntime
-	prefixCopies           map[string][]int64
-	decodeTargets          map[string]int64
-	allocationFailure      sim.AllocationFailure
-	promotionRetention     string
-	promotionControl       bool
-	batchPrefixes          *batchPrefixState
-	restoreControl         bool
-	restoreLimits          map[string]int64
-	restoredPrefixBlocks   map[string]int64
+	nativeAsync             bool
+	nativePhaseTransfers    bool
+	nativeExecutor          *sim.NativeExecutor
+	nativeCopyResource      string
+	nativePrepared          []*peerJob
+	nativePromotionPrepared []*peerJob
+	nativePromotionReceipts []int64
+	nativePageAccess        map[int64]nativePendingPageAccess
+	nativeReserving         bool
+	nativeBatchPins         int64
+	nativePending           map[string]int
+	nativeDeferred          []nativeRetiredAllocation
+	nativeScheduledStep     int64
+	nativeProcessedStep     int64
+	nativeLastStep          map[string]int64
+	nativeLoadPending       map[string]bool
+	nativeLoadTargets       map[string][]int64
+	nativeStored            map[string]nativeStorePosition
+	nativeRestoreAdmission  bool
+	cacheMetrics            *cacheMetricState
+	hotprefix               *hotPrefixRuntime
+	prefixCopies            map[string][]int64
+	decodeTargets           map[string]int64
+	allocationFailure       sim.AllocationFailure
+	promotionRetention      string
+	promotionControl        bool
+	batchPrefixes           *batchPrefixState
+	restoreControl          bool
+	restoreLimits           map[string]int64
+	restoredPrefixBlocks    map[string]int64
 	*KVCacheState
 	id                string
 	fabric            *PeerFabric
@@ -486,6 +488,10 @@ func (s *PeerCache) fetch(h, req string, e *peerEntry, a *PeerAccess, protect ma
 }
 
 func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAccess, protect map[int64]bool, background, retainRequest bool) bool {
+	nativePromotion := s.nativePhaseTransfers && background
+	if nativePromotion && retainRequest {
+		panic("native phase promotion uses independent cache ownership")
+	}
 	identity := s.restoreIdentity(req, h)
 	if s.restoring[identity] {
 		s.waiting[req] = true
@@ -569,7 +575,7 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		b.Hash = h
 		b.Tokens = append([]sim.TokenID(nil), e.tokens...)
 		s.HashToBlock[h] = b.ID
-		if !s.nativeAsync || background {
+		if !s.nativeAsync || background && !nativePromotion {
 			s.publishReadyCopy(b)
 		}
 		s.metricLoad(b, a.Pool, reason, req)
@@ -577,12 +583,19 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		e.readers--
 		e.last = now
 		s.fabric.poolPolicyEvent(a.Pool, "ready", req, []string{h}, now)
-		delete(s.restoring, identity)
+		if !nativePromotion {
+			delete(s.restoring, identity)
+		}
 		s.readPending[req]--
 		if s.readPending[req] == 0 {
 			delete(s.readPending, req)
 		}
-		if (background && !retainRequest) || s.cancelledRestores[req] {
+		if nativePromotion {
+			// Keep this target owned and undiscoverable until an actual worker
+			// poll and FIFO consumption adopt the receipt. Further promotions
+			// of the same hash still see restoring=true in this interval.
+			s.nativePromotionReceipts = append(s.nativePromotionReceipts, b.ID)
+		} else if (background && !retainRequest) || s.cancelledRestores[req] {
 			if s.fabric.mechanisms.Online != nil || s.hotprefix != nil {
 				s.promoted[b.ID] = true
 			}
@@ -596,7 +609,7 @@ func (s *PeerCache) fetchWithRetention(h, req string, e *peerEntry, a *PeerAcces
 		if s.readPending[req] == 0 {
 			delete(s.cancelledRestores, req)
 		}
-		if s.nativeAsync && !background {
+		if s.nativeAsync && (!background || nativePromotion) {
 			s.emit("native_load_device_complete", req, h, a.Pool, "hbm", reason)
 		} else {
 			s.emit("hbm_publish", req, h, a.Pool, "hbm", reason)
@@ -989,6 +1002,10 @@ func (s *PeerCache) Promote(tokens []sim.TokenID, budget int) int {
 	return s.promotePrefix(tokens, budget, nil)
 }
 func (s *PeerCache) promotePrefix(tokens []sim.TokenID, budget int, attempted map[string]bool) int {
+	if s.nativePhaseTransfers && !s.nativeExecutor.HasTransferModel() {
+		s.emit("promotion_rejected", "@promotion", "", "", "hbm", "native_transfer_model_required")
+		return 0
+	}
 	if s.fabric.hostChunks != nil {
 		delete(s.fabric.hostChunks.inputs, "@promotion")
 		defer delete(s.fabric.hostChunks.inputs, "@promotion")
@@ -1061,6 +1078,9 @@ func (s *PeerCache) PeerSnapshot() map[string]int64 {
 		m["native_receives_unadopted"] = int64(len(s.nativeLoadPending))
 		m["native_scheduled_step"] = s.nativeScheduledStep
 		m["native_processed_step"] = s.nativeProcessedStep
+		m["native_promotion_prepared"] = int64(len(s.nativePromotionPrepared))
+		m["native_promotion_receipts"] = int64(len(s.nativePromotionReceipts))
+		m["promoted_unconsumed_resident"] = int64(len(s.promoted))
 		for _, retired := range s.nativeDeferred {
 			m["native_deferred_free_refs"] += int64(len(retired.ids))
 		}

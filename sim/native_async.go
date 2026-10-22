@@ -153,7 +153,7 @@ func (n *nativeAsyncRuntime) event(at int64, name string, b *nativeQueuedBatch, 
 }
 
 func (n *nativeAsyncRuntime) hasRequests() bool {
-	return len(n.finished) > 0 || n.s.WaitQ.Len() > 0 || n.s.RunningBatch != nil && len(n.s.RunningBatch.Requests) > 0
+	return n.store.NativeControlPending() || len(n.finished) > 0 || n.s.WaitQ.Len() > 0 || n.s.RunningBatch != nil && len(n.s.RunningBatch.Requests) > 0
 }
 
 func (n *nativeAsyncRuntime) progress(r *Request) *nativeRequestProgress {

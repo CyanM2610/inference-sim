@@ -1,9 +1,168 @@
 package kv
 
 import (
+	"fmt"
 	"github.com/inference-sim/inference-sim/sim"
+	"strings"
 	"testing"
 )
+
+func TestNativePhasePromotionRunsWithoutRequestsAndPublishesAfterReceipt(t *testing.T) {
+	h, s := hostChunkHarness(t, 2, 4)
+	input := []sim.TokenID{1, 2, 3, 4, 5, 6, 7, 8}
+	if err := s.ConfigureNativeHostGeometry(1, 64<<20); err != nil {
+		t.Fatal(err)
+	}
+	seedPeer(t, s, "seed", input)
+	drainHost(t, h, s)
+	for _, b := range s.Blocks {
+		if b.Hash != "" {
+			s.invalidate(b)
+		}
+	}
+	e, err := sim.NewSimulator(sim.SimConfig{Horizon: 100000, Seed: 1, BatchCompletionEvents: true,
+		KVCacheConfig: sim.KVCacheConfig{TotalKVBlocks: 24, BlockSizeTokens: 2},
+		BatchConfig:   sim.BatchConfig{MaxNumSeqs: 2, MaxNumBatchedTokens: 16}}, s, nativeTestCost{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.EnableNativeAsync(2, nativePageAccessCost{}); err != nil {
+		t.Fatal(err)
+	}
+	h.records = nil
+	programs, consumed := 0, 0
+	cuda, reply, published := int64(-1), int64(-1), int64(-1)
+	e.EventObserver = func(event sim.Event, before bool) {
+		x, ok := event.(*sim.NativeAsyncEvent)
+		if !ok || before {
+			return
+		}
+		if x.Name == "native_execution_plan" {
+			programs++
+			if len(x.Shape) != 0 {
+				t.Fatal("promotion fabricated model computation")
+			}
+		}
+		if x.Name == "native_transfer_plan" {
+			objects := x.TransferShape.Objects
+			if len(objects) != 2 || objects[0].StagingBytes+objects[1].StagingBytes != 400 || objects[0].KernelBytes+objects[1].KernelBytes != 300 {
+				t.Fatal("promotion changed native whole-object/partial-kernel accounting", objects)
+			}
+		}
+		if x.Name == "native_phase_end" && strings.HasSuffix(x.Phase, "/copy") {
+			cuda = x.At
+			if len(s.GetCachedBlocks(input)) != 0 || s.UsedBlocks() != 3 {
+				t.Fatal("CUDA completion published or released targets before modeled terminal")
+			}
+		}
+		if x.Name == "native_phase_end" && strings.HasSuffix(x.Phase, "/reply") {
+			reply = x.At
+			if len(s.GetCachedBlocks(input)) != 0 || s.UsedBlocks() != 3 {
+				t.Fatal("terminal reply bypassed worker poll/consumption")
+			}
+		}
+		if x.Name == "native_async_consumed" {
+			consumed++
+			if len(s.GetCachedBlocks(input)) == 3 {
+				published = x.At
+			}
+		}
+	}
+	s.SchedulePromotion(0, input, 3)
+	e.Run()
+	if cuda < 0 || reply <= cuda || published <= reply || programs != 2 || consumed != 2 {
+		t.Fatal("promotion control did not wake, drain, or avoid polling spin", cuda, reply, published, programs, consumed)
+	}
+	if e.Metrics.CompletedRequests != 0 || e.Metrics.TotalOutputTokens != 0 || s.nativeScheduledStep != 0 ||
+		s.fabric.Pending() != 0 || s.UsedBlocks() != 0 || s.PeerSnapshot()["pending_reads"] != 0 {
+		t.Fatal("promotion fabricated request work or retained ownership", s.PeerSnapshot())
+	}
+}
+
+func TestNativePhasePromotionDuringWorkerSubmissionSurvivesForegroundCancellation(t *testing.T) {
+	h, s := hostChunkHarness(t, 2, 4)
+	input := []sim.TokenID{1, 2, 3, 4, 5}
+	if err := s.ConfigureNativeHostGeometry(1, 64<<20); err != nil {
+		t.Fatal(err)
+	}
+	seedPeer(t, s, "seed", input)
+	drainHost(t, h, s)
+	for _, b := range s.Blocks {
+		if b.Hash != "" {
+			s.invalidate(b)
+		}
+	}
+	e, err := sim.NewSimulator(sim.SimConfig{Horizon: 100000, Seed: 1, BatchCompletionEvents: true,
+		KVCacheConfig: sim.KVCacheConfig{TotalKVBlocks: 24, BlockSizeTokens: 2},
+		BatchConfig:   sim.BatchConfig{MaxNumSeqs: 2, MaxNumBatchedTokens: 16}}, s, nativeTestCost{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.EnableNativeAsync(2, nativePageAccessCost{}); err != nil {
+		t.Fatal(err)
+	}
+	h.records = nil
+	foreground := &sim.Request{ID: "cancel", InputTokens: []sim.TokenID{11, 12, 13, 14, 15}, OutputTokens: []sim.TokenID{16, 17}, MaxOutputLen: 2, Deadline: 50}
+	// One new prompt token makes both promoted blocks an APC prefix; native
+	// scheduling still computes that last token for logits.
+	later := &sim.Request{ID: "reuse", ArrivalTime: 10000, InputTokens: input, OutputTokens: []sim.TokenID{9}, MaxOutputLen: 1}
+	e.InjectArrival(foreground)
+	e.InjectArrival(later)
+	// First metadata was captured at zero, but its worker post has not run.
+	// Late promotion must belong to a subsequent control/worker iteration.
+	s.SchedulePromotion(3, input, 2)
+	s.SchedulePromotion(4, input, 2)
+	promotionTx, producer := int64(0), int64(0)
+	duplicateChecked := false
+	e.EventObserver = func(event sim.Event, before bool) {
+		x, ok := event.(*sim.NativeAsyncEvent)
+		if !ok || before {
+			return
+		}
+		if x.Name == "native_transfer_plan" && x.TransferShape.Direction == "load" {
+			if promotionTx != 0 {
+				t.Fatal("duplicate promotion or missed later HBM reuse", x.At, x.TransferShape)
+			}
+			promotionTx, producer = x.Transaction, x.ProducerBatch
+		}
+		if promotionTx != 0 && x.Name == "native_phase_end" && x.Phase == fmt.Sprintf("kv_%d/reply", promotionTx) {
+			duplicateChecked = true
+			if s.Promote(input, 2) != 0 {
+				t.Fatal("physical completion allowed duplicate LOAD before adoption")
+			}
+		}
+	}
+	e.Run()
+	used := 0
+	for _, r := range h.records {
+		if r.Name == "promotion_consumed" && r.Request == later.ID {
+			used++
+		}
+	}
+	if !duplicateChecked || producer <= 1 || used != 2 || foreground.State != sim.StateTimedOut || later.State != sim.StateCompleted ||
+		e.Metrics.CompletedRequests != 1 || e.Metrics.TotalOutputTokens != 1 {
+		t.Fatal("late control/cancellation/reuse failed", producer, used, foreground.State, later.State)
+	}
+	if s.fabric.Pending() != 0 || s.UsedBlocks() != 0 || s.NativeControlPending() || s.nativeBatchPins != 0 || len(s.restoring) != 0 {
+		t.Fatal("promotion or cancelled request retained ownership", s.PeerSnapshot())
+	}
+}
+
+func TestNativePhasePromotionRequiresTransferModelBeforeReservation(t *testing.T) {
+	h, s := hostChunkHarness(t, 2, 4)
+	input := []sim.TokenID{1, 2, 3, 4}
+	seedPeer(t, s, "seed", input)
+	drainHost(t, h, s)
+	for _, b := range s.Blocks {
+		if b.Hash != "" {
+			s.invalidate(b)
+		}
+	}
+	phaseEngine(t, s) // Legacy aggregate copy costs do not define the extension.
+	if s.Promote(input, 2) != 0 || s.UsedBlocks() != 0 || s.fabric.Pending() != 0 || s.NativeControlPending() {
+		t.Fatal("unsupported promotion changed reservations before rejecting")
+	}
+}
 
 // Artificial service values deliberately make output ready before the main
 // stream tail. This is a causal-order test, not a fitted GPU timing model.

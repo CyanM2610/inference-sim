@@ -11,6 +11,13 @@ import (
 // This native hybrid path uses kv_both, whose is_kv_producer is true.
 func (s *PeerCache) NativeRequiresKVDelivery() bool { return true }
 
+// Promotion is an explicit connector-control extension. Ordinary request
+// scheduling stays native; idle control iterations pay the same empty worker
+// plan and host schedule/consume services. In-flight copies do not cause spin.
+func (s *PeerCache) NativeControlPending() bool {
+	return s.nativePhaseTransfers && (len(s.nativePromotionPrepared) > 0 || len(s.nativePromotionReceipts) > 0)
+}
+
 // Native BlockPool.free_blocks preserves reusable cached pages at the tail,
 // but prepends unhashed pages for immediate reuse. ids are in allocation order;
 // native request frees traverse them in reverse, preserving each partition's
@@ -164,6 +171,7 @@ type nativeCapturedBatch struct {
 	posted, polled       bool
 	loads                []*peerJob
 	receives             []string
+	promotions           []int64
 }
 
 // The physical STORE read / LOAD write outlives allocator ownership. Keep the
@@ -222,8 +230,9 @@ func (s *PeerCache) CaptureNativeBatch(work []sim.NativeWork) sim.NativeBatchKV 
 	if !s.nativeAsync {
 		panic("native async KV is disabled")
 	}
-	b := &nativeCapturedBatch{store: s, loads: s.nativePrepared}
+	b := &nativeCapturedBatch{store: s, loads: append(s.nativePrepared, s.nativePromotionPrepared...)}
 	s.nativePrepared = nil
+	s.nativePromotionPrepared = nil
 	if len(work) > 0 {
 		s.nativeScheduledStep++
 		b.step = s.nativeScheduledStep
@@ -417,6 +426,8 @@ func (b *nativeCapturedBatch) Poll(now int64) {
 	b.polled = true
 	s := b.store
 	s.SetClock(now)
+	b.promotions = s.nativePromotionReceipts
+	s.nativePromotionReceipts = nil
 	for request, pending := range s.nativeLoadPending {
 		if pending && s.readPending[request] == 0 && len(s.nativeLoadTargets[request]) > 0 {
 			b.receives = append(b.receives, request)
@@ -478,6 +489,18 @@ func (b *nativeCapturedBatch) Consumed(now int64) {
 	b.consumed = true
 	s := b.store
 	s.SetClock(now)
+	for _, id := range b.promotions {
+		block := s.Blocks[id]
+		s.publishReadyCopy(block)
+		delete(s.restoring, s.restoreIdentity("@promotion", block.Hash))
+		s.promoted[id] = true
+		s.emit("hbm_publish", "@promotion", block.Hash, "host", "hbm", "native_promotion_adopted")
+		s.releaseNativeReferences([]int64{id})
+	}
+	if len(b.promotions) > 0 {
+		s.emit("native_promotion_adopted", "@promotion", "", "host", "hbm", "fifo_output_consumption")
+		b.promotions = nil
+	}
 	for _, request := range b.receives {
 		if !s.nativeLoadPending[request] {
 			continue

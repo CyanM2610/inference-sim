@@ -189,13 +189,18 @@ func (f *PeerFabric) submit(now int64, j *peerJob) {
 	j.record.Time = now
 	j.record.Bytes = max(1, j.units) * f.bytes
 	if len(f.stores) == 1 && f.stores[0].nativePhaseTransfers {
+		store := f.stores[0]
 		if j.record.Reason == "promotion" {
-			panic("native phase Promotion needs an explicit worker submission path")
+			store.nativePromotionPrepared = append(store.nativePromotionPrepared, j)
+		} else {
+			store.nativePrepared = append(store.nativePrepared, j)
 		}
-		f.stores[0].nativePrepared = append(f.stores[0].nativePrepared, j)
 		f.nativePrepared++
 		j.record.Name = "native_transfer_prepared"
 		f.emit(j.record)
+		if j.record.Reason == "promotion" {
+			store.wake(now)
+		}
 		return
 	}
 	if f.phases != nil {

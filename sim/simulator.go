@@ -521,6 +521,9 @@ func (sim *Simulator) SimHorizon() int64 { return sim.Horizon }
 func (sim *Simulator) ScheduleStepIfIdle(time int64) {
 	work := sim.WaitQ.Len() > 0 || sim.pendingRegistrations() ||
 		(sim.decision != nil && (sim.decision.prefillWaits || sim.decision.prefillDeferrals) && sim.RunningBatch != nil && len(sim.RunningBatch.Requests) > 0)
+	if sim.nativeAsync != nil {
+		work = work || sim.nativeAsync.store.NativeControlPending()
+	}
 	if sim.postStep != nil && sim.postStep.active {
 		sim.postStep.revisit = sim.postStep.revisit || work
 		return
