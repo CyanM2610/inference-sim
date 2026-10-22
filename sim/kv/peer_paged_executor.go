@@ -13,12 +13,13 @@ import (
 // It shares the legacy native adapter's arena setup and paged implementation,
 // but owns no scheduler, policy clock, or synthetic completion acknowledgement.
 type PagedExecutor struct {
-	Runtime   *kvruntime.Runtime
-	native    *NativePeerRuntime
-	requests  map[string]*sim.Request
-	hashes    map[string][]string
-	batches   map[int64]bool
-	transfers map[int64]*physicalTransferState
+	copySubmitClass, copyD2HClass, copyH2DClass string
+	Runtime                                     *kvruntime.Runtime
+	native                                      *NativePeerRuntime
+	requests                                    map[string]*sim.Request
+	hashes                                      map[string][]string
+	batches                                     map[int64]bool
+	transfers                                   map[int64]*physicalTransferState
 }
 
 type physicalTransferState struct {
@@ -27,11 +28,15 @@ type physicalTransferState struct {
 }
 
 type PagedExecutorConfig struct {
-	Profile             *kvruntime.Profile
-	NUMA                int
-	HBMSlots, DRAMSlots int64
-	CopyEnginePolicy    string
-	Requests            []*sim.Request // independent token references, never policy output budgets
+	// Optional bindings for an external, calibrated rate model. Empty preserves
+	// the solo-cost path; setting names alone does not imply measured slowdown.
+	PagedServiceClasses                                              kvruntime.PagedServiceClasses
+	CopySubmitServiceClass, CopyD2HServiceClass, CopyH2DServiceClass string
+	Profile                                                          *kvruntime.Profile
+	NUMA                                                             int
+	HBMSlots, DRAMSlots                                              int64
+	CopyEnginePolicy                                                 string
+	Requests                                                         []*sim.Request // independent token references, never policy output budgets
 }
 
 type PagedBatchResult struct {
@@ -48,6 +53,8 @@ func NewPagedExecutor(c PagedExecutorConfig, sink func(kvruntime.Record)) (*Page
 		return nil, err
 	}
 	x := &PagedExecutor{Runtime: n.Runtime, native: n, requests: map[string]*sim.Request{}, hashes: map[string][]string{}, batches: map[int64]bool{}, transfers: map[int64]*physicalTransferState{}}
+	n.pagedServiceClasses = c.PagedServiceClasses
+	x.copySubmitClass, x.copyD2HClass, x.copyH2DClass = c.CopySubmitServiceClass, c.CopyD2HServiceClass, c.CopyH2DServiceClass
 	var inputs []kvruntime.InputRequest
 	for _, req := range c.Requests {
 		if req == nil || req.ID == "" || x.requests[req.ID] != nil || len(req.InputTokens) == 0 || len(req.OutputTokens) == 0 {
@@ -143,7 +150,11 @@ func (x *PagedExecutor) StartTransfer(c ExternalTransfer) (*kvruntime.TransferRe
 		spans[i] = kvruntime.Span{SourceOffset: int64(i) * 16384, DestinationOffset: int64(i) * 16384, Bytes: 16384}
 	}
 	state := &physicalTransferState{hash: c.Hash, destination: c.Destination}
-	result, err := x.Runtime.Transfer(kvruntime.TransferSpec{ID: fmt.Sprintf("peer/%d/%s", c.ID, c.Reason), Source: c.Source, Destination: c.Destination, CPU: "copy_thread", DMA: "copy_" + direction, StreamGroup: "kv_stream", Spans: spans, Cost: x.native.points[direction].Cost, Done: func(*kvruntime.TransferResult) {
+	dmaClass := x.copyD2HClass
+	if direction == "h2d" {
+		dmaClass = x.copyH2DClass
+	}
+	result, err := x.Runtime.Transfer(kvruntime.TransferSpec{ID: fmt.Sprintf("peer/%d/%s", c.ID, c.Reason), Source: c.Source, Destination: c.Destination, CPU: "copy_thread", DMA: "copy_" + direction, StreamGroup: "kv_stream", Spans: spans, Cost: x.native.points[direction].Cost, SubmitServiceClass: x.copySubmitClass, DMAServiceClass: dmaClass, Done: func(*kvruntime.TransferResult) {
 		if err := x.CheckContents(c.Hash, c.Destination); err != nil {
 			x.Runtime.Engine.Fail(err)
 			return

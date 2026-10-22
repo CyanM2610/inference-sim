@@ -16,8 +16,9 @@ import (
 func run() error {
 	timingPath := flag.String("timing-log", "", "optional protocol boundary timings, written after final reply")
 	hashPath := flag.String("hash-work-log", "", "optional deterministic hash counts; separate from service timing")
+	cpuPath := flag.String("cpu-time-log", "", "optional Linux CPU attribution; intrusive diagnostic, pair with plain timing")
 	flag.Parse()
-	if *hashPath != "" && *timingPath != "" {
+	if *hashPath != "" && (*timingPath != "" || *cpuPath != "") {
 		return fmt.Errorf("hash-work collection must be separated from service timing")
 	}
 	logrus.SetLevel(logrus.ErrorLevel)
@@ -26,6 +27,20 @@ func run() error {
 	var reader *timedReader
 	var writer *timedWriter
 	var timings []protocolTiming
+	var cpuBaseline, cpuTimings []cpuPollTiming
+	if *cpuPath != "" {
+		for i := 0; i < 100; i++ {
+			before, err := beginCPUPoll()
+			if err != nil {
+				return err
+			}
+			row, err := endCPUPoll(i, before)
+			if err != nil {
+				return err
+			}
+			cpuBaseline = append(cpuBaseline, row)
+		}
+	}
 	if *timingPath != "" {
 		reader = &timedReader{reader: os.Stdin}
 		writer = &timedWriter{writer: os.Stdout}
@@ -63,7 +78,21 @@ func run() error {
 			timing.DecodeEndNS = clockNS()
 			timing.PollStartNS = clockNS()
 		}
+		var cpuBefore cpuSample
+		if *cpuPath != "" {
+			cpuBefore, err = beginCPUPoll()
+			if err != nil {
+				return err
+			}
+		}
 		reply, e := controller.Poll(poll)
+		if *cpuPath != "" {
+			row, cpuErr := endCPUPoll(len(cpuTimings), cpuBefore)
+			if cpuErr != nil {
+				return cpuErr
+			}
+			cpuTimings = append(cpuTimings, row)
+		}
 		if e != nil {
 			return e
 		}
@@ -89,6 +118,11 @@ func run() error {
 			timings = append(timings, timing)
 		}
 		if reply.Done {
+			if *cpuPath != "" {
+				if err := saveCPUTimings(*cpuPath, cpuBaseline, cpuTimings); err != nil {
+					return err
+				}
+			}
 			if *hashPath != "" {
 				data, err := json.MarshalIndent(hashWork, "", "  ")
 				if err != nil {

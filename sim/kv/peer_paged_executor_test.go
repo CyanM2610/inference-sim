@@ -8,7 +8,7 @@ import (
 	"github.com/inference-sim/inference-sim/sim/kvruntime"
 )
 
-func pagedExecutorFixture(t *testing.T) (*PagedExecutor, *sim.Request) {
+func pagedExecutorFixture(t *testing.T, configure ...func(*PagedExecutorConfig)) (*PagedExecutor, *sim.Request) {
 	t.Helper()
 	cost := kvruntime.TransferCost{SubmitNS: 2, DMANS: 3, HoldCPUUntilDMA: true}
 	p := &kvruntime.Profile{QueueDepth: 8}
@@ -30,11 +30,80 @@ func pagedExecutorFixture(t *testing.T) (*PagedExecutor, *sim.Request) {
 	for i := range req.InputTokens {
 		req.InputTokens[i] = sim.TokenID(i + 1)
 	}
-	x, err := NewPagedExecutor(PagedExecutorConfig{Profile: p, HBMSlots: 40, DRAMSlots: 64, CopyEnginePolicy: "fifo", Requests: []*sim.Request{req}}, nil)
+	config := PagedExecutorConfig{Profile: p, HBMSlots: 40, DRAMSlots: 64, CopyEnginePolicy: "fifo", Requests: []*sim.Request{req}}
+	for _, apply := range configure {
+		apply(&config)
+	}
+	x, err := NewPagedExecutor(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return x, req
+}
+
+func TestPagedExecutorServiceBindingsDelayRealPublication(t *testing.T) {
+	x, req := pagedExecutorFixture(t, func(c *PagedExecutorConfig) {
+		c.PagedServiceClasses.Forward = "forward_work"
+		c.CopySubmitServiceClass = "copy_issue"
+		c.CopyD2HServiceClass = "d2h_work"
+	})
+	e := x.Runtime.Engine
+	if err := e.SetServiceRate("forward_work", 0); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := x.StartBatch(1, req.ID, 0, 16, []int64{0}, req.InputTokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = e.At(1000, func() {
+		if err := e.SetServiceRate("forward_work", 500000); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err = e.RunUntil(500); err != nil {
+		t.Fatal(err)
+	}
+	if batch.Token != nil || batch.Step.CompleteNS != 0 {
+		t.Fatal("bound forward class did not delay publication")
+	}
+	if err = e.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if batch.Token == nil || *batch.Token != 12345 || batch.Step.CompleteNS <= 1000 {
+		t.Fatal("resumed worker lost output dependency")
+	}
+	h := hash.ComputeBlockHashes(16, req.InputTokens)[0]
+	copy := ExternalTransfer{ID: 1, Source: "hbm/slot/0", Destination: "dram/slot/0", Hash: h, Bytes: 917504, Reason: "store"}
+	if err := e.SetServiceRate("copy_issue", 500000); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SetServiceRate("d2h_work", 0); err != nil {
+		t.Fatal(err)
+	}
+	start := e.NowNS
+	if _, err = x.StartTransfer(copy); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.At(start+1000, func() {
+		if err := e.SetServiceRate("d2h_work", 500000); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err = e.RunUntil(start + 500); err != nil {
+		t.Fatal(err)
+	}
+	if x.CheckTransfer(1, h, "dram/slot/0") == nil || x.CheckIdle("hbm/slot/0") == nil {
+		t.Fatal("bound copy class published or released the paused transaction")
+	}
+	if err = e.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if err = x.CheckTransfer(1, h, "dram/slot/0"); err != nil {
+		t.Fatal(err)
+	}
+	if err = x.ValidateDrained(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPagedExecutorCopiesCausalPagesAndProtectsInflightStorage(t *testing.T) {

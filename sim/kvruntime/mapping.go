@@ -8,10 +8,11 @@ import (
 // MappingKernel is one GPU transformation launch with many logical byte spans.
 // It distinguishes an index/scatter kernel from hundreds of memcpy API calls.
 type MappingKernel struct {
-	Name                string
-	Source, Destination string
-	Spans               []Span
-	Endpoints           []CopyEndpoints
+	SubmitServiceClass, KernelServiceClass string
+	Name                                   string
+	Source, Destination                    string
+	Spans                                  []Span
+	Endpoints                              []CopyEndpoints
 	// Nonempty WriteOwner uses an already-open compound destination writer.
 	// The caller publishes that writer after all owned kernels complete.
 	WriteOwner          string
@@ -64,7 +65,7 @@ func (r *Runtime) MapKernel(operation, cpu, gpu string, k MappingKernel) (submit
 	}
 	sort.Strings(sources)
 	sort.Strings(targets)
-	submit = e.MustAdd(Task{Name: k.Name + "_submit", Operation: operation, Resource: cpu, DurationNS: k.SubmitNS, Parents: k.Parents, Start: func() error {
+	submit = e.MustAdd(Task{Name: k.Name + "_submit", Operation: operation, Resource: cpu, ServiceClass: k.SubmitServiceClass, DurationNS: k.SubmitNS, Parents: k.Parents, Start: func() error {
 		if k.Prepare != nil {
 			if err := k.Prepare(); err != nil {
 				return err
@@ -113,7 +114,7 @@ func (r *Runtime) MapKernel(operation, cpu, gpu string, k MappingKernel) (submit
 	if k.StreamParent != 0 {
 		parents = append(parents, k.StreamParent)
 	}
-	complete = e.MustAdd(Task{Name: k.Name, Operation: operation, Resource: gpu, DurationNS: k.ServiceNS, Parents: parents, Start: func() error {
+	complete = e.MustAdd(Task{Name: k.Name, Operation: operation, Resource: gpu, ServiceClass: k.KernelServiceClass, DurationNS: k.ServiceNS, Parents: parents, Start: func() error {
 		for _, id := range sources {
 			if err := m.Pin(id); err != nil {
 				return err

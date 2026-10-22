@@ -5,10 +5,21 @@ import (
 	"math"
 )
 
+// PagedServiceClasses opt existing tasks into progress-preserving rate changes.
+// Forward still denotes the measured forward envelope, not pure kernel cycles.
+// Empty classes retain fixed solo costs. Rate selection belongs to a separately
+// calibrated interference model; these bindings do not invent slowdown factors.
+type PagedServiceClasses struct {
+	Forward                      string
+	GatherSubmit, GatherKernel   string
+	ScatterSubmit, ScatterKernel string
+}
+
 // PagedStepSpec describes one real batch-one gather/forward/delta-scatter step.
 // TokenOrigins identify the full causal input prefix, including reference output
 // tokens already consumed by decode. They are not numerical model predictions.
 type PagedStepSpec struct {
+	ServiceClasses      PagedServiceClasses
 	Inputs              *RequestInputs
 	HostOutputBuffer    string
 	OutputCopyResource  string
@@ -148,6 +159,8 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 		cpuTail := beginPhase("gather_prefix")
 		var gpuTail int64
 		kernel := func(k MappingKernel) error {
+			k.SubmitServiceClass = s.ServiceClasses.GatherSubmit
+			k.KernelServiceClass = s.ServiceClasses.GatherKernel
 			k.Parents = []int64{cpuTail}
 			k.StreamParent = gpuTail
 			k.SubmitNS = cost.SubmitNS
@@ -252,7 +265,7 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 		}
 		assigned += ns
 		layer := segment - 1
-		tailID = e.MustAdd(Task{Name: fmt.Sprintf("forward_segment_%02d", segment), Operation: s.ID + "/forward", Resource: "gpu_compute", DurationNS: ns, Parents: []int64{tailID}, Start: func() error {
+		tailID = e.MustAdd(Task{Name: fmt.Sprintf("forward_segment_%02d", segment), Operation: s.ID + "/forward", Resource: "gpu_compute", ServiceClass: s.ServiceClasses.Forward, DurationNS: ns, Parents: []int64{tailID}, Start: func() error {
 			if layer < 0 || layer >= 28 {
 				return nil
 			}
@@ -410,7 +423,7 @@ func (r *Runtime) PagedStep(s PagedStepSpec) (*PagedStepResult, error) {
 			}
 		}
 		var err error
-		cpuTail, gpuTail, err = r.MapKernel(s.ID+"/scatter", "cpu", "gpu_compute", MappingKernel{Name: name, Spans: spans, Endpoints: endpoints, WriteOwner: owner, Parents: []int64{cpuTail}, StreamParent: gpuTail, SubmitNS: scatter.SubmitNS, ServiceNS: scatter.ServiceNS})
+		cpuTail, gpuTail, err = r.MapKernel(s.ID+"/scatter", "cpu", "gpu_compute", MappingKernel{Name: name, Spans: spans, Endpoints: endpoints, WriteOwner: owner, Parents: []int64{cpuTail}, StreamParent: gpuTail, SubmitNS: scatter.SubmitNS, ServiceNS: scatter.ServiceNS, SubmitServiceClass: s.ServiceClasses.ScatterSubmit, KernelServiceClass: s.ServiceClasses.ScatterKernel})
 		result.MappingTasks++
 		return err
 	}
