@@ -14,21 +14,23 @@ func (nativePhaseTestCost) CopyResource() string         { return "copy" }
 func (nativePhaseTestCost) ExecutionPlan(shape []sim.NativeBatchShape) sim.NativeExecutionPlan {
 	if len(shape) == 0 {
 		return sim.NativeExecutionPlan{Stages: []sim.NativeStage{
+			{Name: "kv_access", Stream: "host"},
 			{Name: "post", Resource: "cpu", Stream: "host", DurationUS: 10},
 			{Name: "producer", Stream: "main", After: []string{"post"}},
 			{Name: "poll", Resource: "cpu", Stream: "host", DurationUS: 5, After: []string{"post"}},
-		}, Computed: "post", ProducerReady: "producer", PostForward: "post", Poll: "poll", HostReturned: "poll", OutputReady: "poll"}
+		}, KVAccess: "kv_access", Computed: "post", ProducerReady: "producer", PostForward: "post", Poll: "poll", HostReturned: "poll", OutputReady: "poll"}
 	}
 	return sim.NativeExecutionPlan{Stages: []sim.NativeStage{
 		{Name: "prepare", Resource: "cpu", Stream: "host", DurationUS: 10},
-		{Name: "forward", Resource: "compute", Stream: "main", DurationUS: 100, After: []string{"prepare"}},
-		{Name: "sample_submit", Resource: "cpu", Stream: "host", DurationUS: 5, After: []string{"prepare"}},
+		{Name: "kv_access", Stream: "host", After: []string{"prepare"}},
+		{Name: "forward", Resource: "compute", Stream: "main", DurationUS: 100, After: []string{"kv_access"}},
+		{Name: "sample_submit", Resource: "cpu", Stream: "host", DurationUS: 5, After: []string{"kv_access"}},
 		{Name: "sample", Resource: "compute", Stream: "main", DurationUS: 10, After: []string{"forward", "sample_submit"}},
 		{Name: "output_copy", Resource: "copy", Stream: "output", DurationUS: 5, After: []string{"sample"}},
 		{Name: "main_tail", Resource: "compute", Stream: "main", DurationUS: 80, After: []string{"sample"}},
 		{Name: "post", Resource: "cpu", Stream: "host", DurationUS: 10, After: []string{"sample_submit"}},
 		{Name: "poll", Resource: "cpu", Stream: "host", DurationUS: 5, After: []string{"post"}},
-	}, Computed: "forward", ProducerReady: "main_tail", PostForward: "post", Poll: "poll", HostReturned: "poll", OutputReady: "output_copy"}
+	}, KVAccess: "kv_access", Computed: "forward", ProducerReady: "main_tail", PostForward: "post", Poll: "poll", HostReturned: "poll", OutputReady: "output_copy"}
 }
 
 func phaseEngine(t *testing.T, store *PeerCache) *sim.Simulator {

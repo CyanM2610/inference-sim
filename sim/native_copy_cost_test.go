@@ -72,6 +72,49 @@ func TestNativeCopyProfileDoesNotTurnTrainingSizeIntoExecutionLimit(t *testing.T
 	}
 }
 
+func TestNativeCopyProfileMixedLoadKeepsOneFourSlotBatchAndReportsCostGap(t *testing.T) {
+	p, x, first := copyProfileFixture()
+	p.LoadBatch = 4
+	x.PoolMedia["warm"] = "dram"
+	objects := []NativeTransferObject{first, first, first, first}
+	for i := range objects {
+		objects[i].Key = string(rune('a' + i))
+		if i%2 == 0 {
+			objects[i].Pool = "warm"
+		}
+		if i > 0 {
+			objects[i].SkipTokens = 0
+			objects[i].KernelBytes = 1024
+			objects[i].HBMBlocks = []int64{1, 2, 3, 4}
+		}
+	}
+	plan := p.TransferPlan(NativeTransferShape{Direction: "load", Objects: objects}, x)
+	kernels, submits, replies := 0, 0, 0
+	for _, stage := range plan.Stages {
+		if stage.Name == "kernel_0" {
+			kernels++
+			if stage.DurationUS != 3840 {
+				t.Fatal("combined scatter undercharged", stage)
+			}
+		}
+		if stage.Name == "host_submit" {
+			submits++
+		}
+		if stage.Name == "reply" {
+			replies++
+		}
+	}
+	if plan.GPUComplete != "kernel_0" || kernels != 1 || submits != 1 || replies != 1 {
+		t.Fatal("pool boundary split the native operation/batch", plan)
+	}
+	if plan.StagingSlots != 4 || plan.StagingBufferBytes != 4096 {
+		t.Fatal("native shared staging allocation not reported", plan)
+	}
+	if len(plan.CoverageGaps) == 0 {
+		t.Fatal("unmeasured mixed-media composition silently accepted")
+	}
+}
+
 func TestNativeCopyProfileRejectsUnpaidOrMalformedTransfer(t *testing.T) {
 	for _, mutation := range []func(*NativeTransferExecution, *NativeTransferObject){
 		func(x *NativeTransferExecution, o *NativeTransferObject) { x.HostSubmitUS = 0 },

@@ -15,6 +15,7 @@ type PeerCache struct {
 	nativeExecutor         *sim.NativeExecutor
 	nativeCopyResource     string
 	nativePrepared         []*peerJob
+	nativePageAccess       map[int64]nativePendingPageAccess
 	nativeReserving        bool
 	nativeBatchPins        int64
 	nativePending          map[string]int
@@ -884,7 +885,11 @@ func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
 	delete(s.restoredPrefixBlocks, req.ID)
 	delete(s.prefillTargets, req.ID)
 	s.ClearDeferred(req.ID)
-	s.holdHostStoreRequest(req)
+	// request_finished retains allocation for pending STORE; a preemption is
+	// not request_finished. Native page conflicts are fenced at actual access.
+	if !s.nativePhaseTransfers || req.State != sim.StateRunning {
+		s.holdHostStoreRequest(req)
+	}
 	if req.State != sim.StateRunning {
 		s.endHostLookup(req.ID)
 	}
@@ -1052,6 +1057,7 @@ func (s *PeerCache) PeerSnapshot() map[string]int64 {
 	m["extra_refs"] = m["total_refs"] - m["request_refs"]
 	if s.nativeAsync {
 		m["native_batch_pins"] = s.nativeBatchPins
+		m["native_page_accesses_pending"] = int64(len(s.nativePageAccess))
 		m["native_receives_unadopted"] = int64(len(s.nativeLoadPending))
 		m["native_scheduled_step"] = s.nativeScheduledStep
 		m["native_processed_step"] = s.nativeProcessedStep

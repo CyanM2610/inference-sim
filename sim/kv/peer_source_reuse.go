@@ -19,7 +19,7 @@ type sourceOverwrite struct {
 }
 
 func (s *PeerCache) storeSourceReuseEnabled() bool {
-	return s.fabric.phases != nil && s.fabric.phases.reuseSources
+	return s.nativePhaseTransfers && s.nativeExecutor.HasTransferModel() || s.fabric.phases != nil && s.fabric.phases.reuseSources
 }
 
 // EnableStoreSourceReuse permits allocator reuse for all STORE sources,

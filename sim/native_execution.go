@@ -18,6 +18,7 @@ type NativeStage struct {
 // Milestones describe native protocol boundaries, not interchangeable costs.
 type NativeExecutionPlan struct {
 	Stages        []NativeStage `json:"stages"`
+	KVAccess      string        `json:"kv_access"`
 	Computed      string        `json:"computed"`
 	ProducerReady string        `json:"producer_ready"`
 	PostForward   string        `json:"post_forward"`
@@ -145,12 +146,12 @@ func validateNativePlan(p NativeExecutionPlan, resources map[string]bool) error 
 	if err != nil {
 		return err
 	}
-	for _, name := range []string{p.Computed, p.ProducerReady, p.PostForward, p.Poll, p.HostReturned, p.OutputReady} {
+	for _, name := range []string{p.KVAccess, p.Computed, p.ProducerReady, p.PostForward, p.Poll, p.HostReturned, p.OutputReady} {
 		if ancestors[name] == nil {
 			return fmt.Errorf("missing native milestone %q", name)
 		}
 	}
-	for _, edge := range [][2]string{{p.Computed, p.OutputReady}, {p.Computed, p.ProducerReady}, {p.PostForward, p.Poll}, {p.Poll, p.HostReturned}} {
+	for _, edge := range [][2]string{{p.KVAccess, p.Computed}, {p.KVAccess, p.PostForward}, {p.Computed, p.OutputReady}, {p.Computed, p.ProducerReady}, {p.PostForward, p.Poll}, {p.Poll, p.HostReturned}} {
 		if !ancestors[edge[1]][edge[0]] {
 			return fmt.Errorf("missing native dependency %s -> %s", edge[0], edge[1])
 		}
@@ -162,7 +163,7 @@ func (e *NativeExecutor) HasTransferModel() bool { _, ok := e.n.cost.(NativeTran
 
 // SubmitTransfer keeps modeled service parallel to physical CUDA work. Stream
 // queues are shared with compute/output programs; a model delay holds no GPU.
-func (e *NativeExecutor) SubmitTransfer(now, transaction int64, shape NativeTransferShape, producer *NativeFence, begin, gpuDone, done func(int64)) {
+func (e *NativeExecutor) SubmitTransfer(now, transaction int64, shape NativeTransferShape, producer *NativeFence, begin, gpuDone, done func(int64)) *NativeFence {
 	model, ok := e.n.cost.(NativeTransferCost)
 	if !ok || producer == nil || len(shape.Objects) == 0 {
 		panic("native transfer geometry/model missing")
@@ -221,9 +222,10 @@ func (e *NativeExecutor) SubmitTransfer(now, transaction int64, shape NativeTran
 	record.TransferShape = &shape
 	record.ProducerBatch, record.ProducerPhase = producer.batch, producer.phase
 	e.pump(now)
+	return fences[p.Published]
 }
 
-func (e *NativeExecutor) submit(now int64, b *nativeQueuedBatch, p NativeExecutionPlan, callbacks map[string]func(int64), fences map[string]*NativeFence) {
+func (e *NativeExecutor) submit(now int64, b *nativeQueuedBatch, p NativeExecutionPlan, callbacks map[string]func(int64), fences map[string]*NativeFence, access []NativeKVAccessDependency) {
 	if err := validateNativePlan(p, e.busy); err != nil {
 		panic(err)
 	}
@@ -235,6 +237,14 @@ func (e *NativeExecutor) submit(now int64, b *nativeQueuedBatch, p NativeExecuti
 	}
 	for _, spec := range p.Stages {
 		j := &nativeStageRun{spec: spec, batch: b, fence: fences[spec.Name], end: callbacks[spec.Name]}
+		if spec.Name == p.KVAccess {
+			for _, dep := range access {
+				if dep.Fence == nil || dep.Transaction <= 0 || len(dep.HBMBlocks) == 0 {
+					panic("invalid native physical page dependency")
+				}
+				j.dependencies = append(j.dependencies, dep.Fence)
+			}
+		}
 		for _, dep := range spec.After {
 			j.dependencies = append(j.dependencies, fences[dep])
 		}

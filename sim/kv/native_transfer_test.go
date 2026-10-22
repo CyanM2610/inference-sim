@@ -3,8 +3,91 @@ package kv
 import (
 	"fmt"
 	"github.com/inference-sim/inference-sim/sim"
+	"reflect"
+	"strings"
 	"testing"
 )
+
+type mixedTransferCost struct {
+	nativePhaseTestCost
+	shapes *[]sim.NativeTransferShape
+}
+
+func (c mixedTransferCost) TransferPlan(shape sim.NativeTransferShape) sim.NativeTransferPlan {
+	*c.shapes = append(*c.shapes, shape)
+	// Artificial per-object copies followed by one operation-level completion.
+	stages := []sim.NativeStage{{Name: "submit", Resource: "cpu", Stream: "mp_host", DurationUS: 3}}
+	previous := "submit"
+	for i := range shape.Objects {
+		name := fmt.Sprintf("object_%d", i)
+		stages = append(stages, sim.NativeStage{Name: name, Resource: "copy", Stream: "native-kv-stream", DurationUS: 20, After: []string{previous}})
+		previous = name
+	}
+	stages = append(stages, sim.NativeStage{Name: "reply", Resource: "cpu", Stream: "mp_reply", DurationUS: 2, After: []string{previous}})
+	return sim.NativeTransferPlan{Stages: stages, ProducerWait: "object_0", GPUComplete: previous, ModelComplete: "submit", Published: "reply"}
+}
+
+func TestNativeMixedPoolOperationPreservesObjectOrderAndAtomicCompletion(t *testing.T) {
+	for _, load := range []bool{false, true} {
+		t.Run(map[bool]string{false: "store", true: "load_partial_prefix"}[load], func(t *testing.T) {
+			h, s := hostChunkHarness(t, 2, 2)
+			input := []sim.TokenID{1, 2, 3, 4, 5, 6, 7, 8, 9}
+			if err := s.ConfigureNativeHostGeometry(1, 64<<20); err != nil {
+				t.Fatal(err)
+			}
+			if load {
+				seedPeer(t, s, "seed", input)
+				drainHost(t, h, s)
+				first := s.hashes(input)[0]
+				for _, block := range s.Blocks {
+					if block.Hash != first {
+						s.invalidate(block)
+					}
+				}
+			}
+			e, err := sim.NewSimulator(sim.SimConfig{Horizon: 100000, Seed: 1, BatchCompletionEvents: true,
+				KVCacheConfig: sim.KVCacheConfig{TotalKVBlocks: 24, BlockSizeTokens: 2}, BatchConfig: sim.BatchConfig{MaxNumSeqs: 2, MaxNumBatchedTokens: 16}}, s, nativeTestCost{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var shapes []sim.NativeTransferShape
+			if err = e.EnableNativeAsync(2, mixedTransferCost{shapes: &shapes}); err != nil {
+				t.Fatal(err)
+			}
+			checked := false
+			e.EventObserver = func(event sim.Event, before bool) {
+				x, ok := event.(*sim.NativeAsyncEvent)
+				if !ok || before || x.Name != "native_phase_end" || !strings.HasSuffix(x.Phase, "/object_0") {
+					return
+				}
+				checked = true
+				if load {
+					if s.readPending["mixed"] != 3 {
+						t.Fatal("partial mixed LOAD published before the complete operation")
+					}
+				} else if s.fabric.Snapshot()["dram"]["ready"] != 0 || s.fabric.Snapshot()["cxl"]["ready"] != 0 {
+					t.Fatal("mixed STORE published before all objects/reply")
+				}
+			}
+			r := &sim.Request{ID: "mixed", InputTokens: input, OutputTokens: []sim.TokenID{10}, MaxOutputLen: 1}
+			e.InjectArrival(r)
+			e.Run()
+			if !checked || len(shapes) != 1 || len(shapes[0].Objects) != 2 {
+				t.Fatal("one native request operation was split by pool", len(shapes), shapes)
+			}
+			objects := shapes[0].Objects
+			if !reflect.DeepEqual([]string{objects[0].Pool, objects[1].Pool}, []string{"dram", "cxl"}) {
+				t.Fatal("native token/object order changed", objects)
+			}
+			if load && (objects[0].SkipTokens != 2 || objects[0].KernelBytes != 100 || objects[0].StagingBytes != 200 || objects[1].KernelBytes != 200) {
+				t.Fatal("partial prefix changed whole-object staging geometry", objects)
+			}
+			if e.Metrics.CompletedRequests != 1 || s.UsedBlocks() != 0 || s.fabric.Pending() != 0 || s.nativeBatchPins != 0 {
+				t.Fatal("mixed operation did not drain")
+			}
+		})
+	}
+}
 
 type nativeTransferTestCost struct {
 	nativePhaseTestCost

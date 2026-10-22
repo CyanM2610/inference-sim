@@ -75,6 +75,7 @@ func (s *PeerCache) EnableNativePhaseTransfers(executor *sim.NativeExecutor, res
 	}
 	s.nativePhaseTransfers = true
 	s.nativeExecutor, s.nativeCopyResource = executor, resource
+	s.nativePageAccess = map[int64]nativePendingPageAccess{}
 	return nil
 }
 
@@ -163,6 +164,58 @@ type nativeCapturedBatch struct {
 	posted, polled       bool
 	loads                []*peerJob
 	receives             []string
+}
+
+// The physical STORE read / LOAD write outlives allocator ownership. Keep the
+// exact submitted pages even if their logical hash or request later changes.
+type nativePendingPageAccess struct {
+	ids   []int64
+	write bool
+	fence *sim.NativeFence
+}
+
+func (b *nativeCapturedBatch) KVAccessPlan() sim.NativeKVAccessPlan {
+	s := b.store
+	reads, writes := map[int64]bool{}, map[int64]bool{}
+	for _, captured := range b.works {
+		for i, id := range captured.ids {
+			reads[id] = true
+			if int64(i) >= captured.work.Start/s.BlockSizeTokens {
+				writes[id] = true
+			}
+		}
+	}
+	// A connector-only iteration can overwrite a page by LOAD without forward.
+	for _, j := range b.loads {
+		for _, id := range j.record.HBMBlocks {
+			writes[id] = true
+		}
+	}
+	result := sim.NativeKVAccessPlan{}
+	for id := range reads {
+		result.ReadBlocks = append(result.ReadBlocks, id)
+	}
+	for id := range writes {
+		result.WriteBlocks = append(result.WriteBlocks, id)
+	}
+	sort.Slice(result.ReadBlocks, func(i, j int) bool { return result.ReadBlocks[i] < result.ReadBlocks[j] })
+	sort.Slice(result.WriteBlocks, func(i, j int) bool { return result.WriteBlocks[i] < result.WriteBlocks[j] })
+	for transaction, pending := range s.nativePageAccess {
+		if pending.fence.Ready() {
+			continue
+		}
+		var ids []int64
+		for _, id := range pending.ids {
+			if writes[id] || pending.write && reads[id] {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) > 0 {
+			result.Dependencies = append(result.Dependencies, sim.NativeKVAccessDependency{Transaction: transaction, HBMBlocks: ids, PendingWrite: pending.write, Fence: pending.fence})
+		}
+	}
+	sort.Slice(result.Dependencies, func(i, j int) bool { return result.Dependencies[i].Transaction < result.Dependencies[j].Transaction })
+	return result
 }
 
 func (s *PeerCache) CaptureNativeBatch(work []sim.NativeWork) sim.NativeBatchKV {
@@ -315,7 +368,7 @@ func (b *nativeCapturedBatch) PostForward(now int64, producer *sim.NativeFence) 
 				objects[i].Segments = append([]sim.NativeCopySegment(nil), objects[i].Segments...)
 			}
 			started := int64(-1)
-			s.nativeExecutor.SubmitTransfer(now, j.record.Transaction, sim.NativeTransferShape{Direction: direction, Objects: objects}, producer,
+			fence := s.nativeExecutor.SubmitTransfer(now, j.record.Transaction, sim.NativeTransferShape{Direction: direction, Objects: objects}, producer,
 				func(at int64) { started = at; j.record.Time, j.record.Name = at, "transfer_start"; f.emit(j.record) },
 				func(at int64) {
 					record := j.record
@@ -323,6 +376,7 @@ func (b *nativeCapturedBatch) PostForward(now int64, producer *sim.NativeFence) 
 					f.emit(record)
 				},
 				func(at int64) {
+					delete(s.nativePageAccess, j.record.Transaction)
 					f.nativeInFlight--
 					j.record.Time, j.record.Name, j.record.Duration = at, "transfer_end", at-started
 					f.emit(j.record)
@@ -330,6 +384,7 @@ func (b *nativeCapturedBatch) PostForward(now int64, producer *sim.NativeFence) 
 					f.notifyDecisionTransfer(at, j)
 					f.wakeStores(at)
 				})
+			s.nativePageAccess[j.record.Transaction] = nativePendingPageAccess{ids: append([]int64(nil), j.record.HBMBlocks...), write: direction == "load", fence: fence}
 			continue
 		}
 		duration := f.durationBytes(j.path, max(1, j.units)*f.bytes)

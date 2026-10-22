@@ -52,6 +52,9 @@ func (p NativeCopyProfile) Validate() error {
 	if p.Schema != 1 || p.ObjectBytes <= 0 || p.ChunkTokens <= 0 || p.BlockTokens <= 0 || p.ChunkTokens%p.BlockTokens != 0 || p.SegmentBytes <= 0 || p.StoreBatch != 1 || p.LoadBatch <= 0 {
 		return fmt.Errorf("invalid native copy geometry")
 	}
+	if p.ObjectBytes > math.MaxInt64/int64(p.LoadBatch) {
+		return fmt.Errorf("native staging allocation overflows")
+	}
 	for _, direction := range []string{"load", "store"} {
 		for _, prefix := range []string{"kernel/gpu/", "staging/dram/", "staging/cxl_sim/"} {
 			curve, ok := p.Curves[prefix+direction]
@@ -86,6 +89,39 @@ func (p NativeCopyProfile) primitive(key string, bytes int64, objects, extra int
 	return copyTimeUS(c.Coefficients[0] + c.Coefficients[1]*float64(bytes)/(1<<20) + c.Coefficients[2]*float64(extra))
 }
 
+// One native staging phase may visit several media in object order. Until a
+// mixed-media measurement exists, compose contiguous same-media predictions and
+// explicitly reject any interpretation of that estimate as a calibrated cost.
+// The scatter/gather batch is never split at these media boundaries.
+func (p NativeCopyProfile) stagingCost(objects []NativeTransferObject, direction string, media map[string]string, gaps *[]string) int64 {
+	var duration int64
+	runs := 0
+	for start := 0; start < len(objects); {
+		end := start + 1
+		kind := media[objects[start].Pool]
+		for end < len(objects) && media[objects[end].Pool] == kind {
+			end++
+		}
+		var bytes int64
+		extra := 0
+		for _, object := range objects[start:end] {
+			bytes += object.StagingBytes
+			extra += len(object.Segments) - 1
+		}
+		part := p.primitive("staging/"+kind+"/"+direction, bytes, end-start, extra, gaps)
+		if duration > math.MaxInt64-part {
+			panic("native staging composition overflows")
+		}
+		duration += part
+		runs++
+		start = end
+	}
+	if runs > 1 {
+		*gaps = append(*gaps, fmt.Sprintf("mixed-media %s staging batch: uncalibrated sum of %d contiguous media predictions; may repeat fitted intercepts", direction, runs))
+	}
+	return duration
+}
+
 // TransferPlan expands native batch slots into ordered gather/staging/scatter
 // stages. The modeled-media branch queues serialization only; its latency tail
 // can overlap subsequent objects and joins CUDA before reply/publication.
@@ -96,7 +132,7 @@ func (p NativeCopyProfile) TransferPlan(shape NativeTransferShape, x NativeTrans
 	if len(shape.Objects) == 0 || shape.Direction != "store" && shape.Direction != "load" || x.HostSubmitUS <= 0 || x.ModelRPCUS <= 0 || x.ReplyUS <= 0 || x.Scope == "" || x.HostResource == "" || x.ComputeResource == "" || x.CopyResource == "" || x.ReadModelResource == "" || x.WriteModelResource == "" {
 		panic("native transfer requires geometry and explicit host service assumptions")
 	}
-	plan := NativeTransferPlan{CostScope: "Measured instrumented CUDA primitive curves; CXLMemSim modeled media; host: " + x.Scope}
+	plan := NativeTransferPlan{CostScope: "Instrumented CUDA primitive curves with explicit extrapolation/composition gaps; CXLMemSim modeled media; host: " + x.Scope, StagingSlots: p.LoadBatch, StagingBufferBytes: p.ObjectBytes * int64(p.LoadBatch)}
 	add := func(s NativeStage) { plan.Stages = append(plan.Stages, s) }
 	add(NativeStage{Name: "host_submit", Resource: x.HostResource, Stream: "mp_host", DurationUS: x.HostSubmitUS})
 	lastHost := "host_submit"
@@ -108,6 +144,9 @@ func (p NativeCopyProfile) TransferPlan(shape NativeTransferShape, x NativeTrans
 			panic("unsupported or inconsistent native transfer object geometry")
 		}
 		seen[o.Key] = true
+		if i > 0 && o.SkipTokens != 0 {
+			panic("native LOAD can only skip a contiguous prefix in its first retained object")
+		}
 		if shape.Direction == "store" && o.SkipTokens != 0 {
 			panic("native STORE may not skip the chunk prefix")
 		}
@@ -149,18 +188,12 @@ func (p NativeCopyProfile) TransferPlan(shape NativeTransferShape, x NativeTrans
 	lastGPU := ""
 	for i := 0; i < len(shape.Objects); i += batchSize {
 		objects := shape.Objects[i:min(i+batchSize, len(shape.Objects))]
-		kernelBytes, stagingBytes, extras := int64(0), int64(0), 0
-		media := x.PoolMedia[objects[0].Pool]
+		kernelBytes := int64(0)
 		for _, o := range objects {
-			if x.PoolMedia[o.Pool] != media {
-				panic("mixed-media batch requires separately calibrated staging composition")
-			}
 			kernelBytes += o.KernelBytes
-			stagingBytes += o.StagingBytes
-			extras += len(o.Segments) - 1
 		}
 		kernel := NativeStage{Name: fmt.Sprintf("kernel_%d", i/batchSize), Resource: x.ComputeResource, Stream: "native-kv-stream", DurationUS: p.primitive("kernel/gpu/"+shape.Direction, kernelBytes, len(objects), 0, &plan.CoverageGaps)}
-		staging := NativeStage{Name: fmt.Sprintf("staging_%d", i/batchSize), Resource: x.CopyResource, Stream: "native-kv-stream", DurationUS: p.primitive("staging/"+media+"/"+shape.Direction, stagingBytes, len(objects), extras, &plan.CoverageGaps)}
+		staging := NativeStage{Name: fmt.Sprintf("staging_%d", i/batchSize), Resource: x.CopyResource, Stream: "native-kv-stream", DurationUS: p.stagingCost(objects, shape.Direction, x.PoolMedia, &plan.CoverageGaps)}
 		first, second := kernel, staging
 		if shape.Direction == "load" {
 			first, second = staging, kernel

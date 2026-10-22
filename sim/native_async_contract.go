@@ -26,9 +26,27 @@ type NativeBatchKV interface {
 // Poll freezes the receipts returned by this worker iteration.
 type NativePhasedBatchKV interface {
 	NativeBatchKV
+	KVAccessPlan() NativeKVAccessPlan
 	Computed(now int64)
 	PostForward(now int64, producer *NativeFence)
 	Poll(now int64)
+}
+
+// NativeKVAccessDependency fences device access, not block-pool allocation.
+// Fence comes from a submitted transfer's terminal publication. It cannot be
+// replaced by a predicted absolute completion time supplied by a policy.
+type NativeKVAccessDependency struct {
+	Transaction  int64        `json:"transaction"`
+	HBMBlocks    []int64      `json:"hbm_blocks"`
+	PendingWrite bool         `json:"pending_write"`
+	Fence        *NativeFence `json:"-"`
+}
+
+// Physical IDs are a runtime snapshot for causal audit, never a policy oracle.
+type NativeKVAccessPlan struct {
+	ReadBlocks   []int64                    `json:"read_blocks"`
+	WriteBlocks  []int64                    `json:"write_blocks"`
+	Dependencies []NativeKVAccessDependency `json:"dependencies"`
 }
 
 type NativePhasedKVStore interface {

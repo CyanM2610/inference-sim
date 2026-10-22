@@ -51,6 +51,7 @@ type NativeAsyncEvent struct {
 	Resource         string               `json:"resource,omitempty"`
 	DurationUS       int64                `json:"duration_us,omitempty"`
 	Execution        *NativeExecutionPlan `json:"execution,omitempty"`
+	KVAccess         *NativeKVAccessPlan  `json:"kv_access,omitempty"`
 	Transaction      int64                `json:"transaction,omitempty"`
 	Transfer         *NativeTransferPlan  `json:"transfer,omitempty"`
 	TransferShape    *NativeTransferShape `json:"transfer_shape,omitempty"`
@@ -237,11 +238,13 @@ func (n *nativeAsyncRuntime) step(now int64) {
 
 func (n *nativeAsyncRuntime) executePhases(now int64, b *nativeQueuedBatch) {
 	p := n.cost.(NativePhaseCost).ExecutionPlan(append([]NativeBatchShape(nil), b.shape...))
-	n.event(now, "native_execution_plan", b, nil).Execution = &p
 	kv, ok := b.kv.(NativePhasedBatchKV)
 	if !ok {
 		panic("phase-aware KV capture missing")
 	}
+	access := kv.KVAccessPlan()
+	record := n.event(now, "native_execution_plan", b, nil)
+	record.Execution, record.KVAccess = &p, &access
 	fences := map[string]*NativeFence{p.ProducerReady: {}}
 	callbacks := map[string]func(int64){}
 	// Several milestones may intentionally be the same host-only empty step.
@@ -264,7 +267,7 @@ func (n *nativeAsyncRuntime) executePhases(now int64, b *nativeQueuedBatch) {
 		}
 	})
 	add(p.HostReturned, func(at int64) { n.busy = false; n.next(at) })
-	n.executor.submit(now, b, p, callbacks, fences)
+	n.executor.submit(now, b, p, callbacks, fences, access.Dependencies)
 }
 
 func (n *nativeAsyncRuntime) tryConsume(now int64) {

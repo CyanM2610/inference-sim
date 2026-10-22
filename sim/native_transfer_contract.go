@@ -34,6 +34,11 @@ type NativeTransferPlan struct {
 	Published     string        `json:"published"`
 	CostScope     string        `json:"cost_scope,omitempty"`
 	CoverageGaps  []string      `json:"coverage_gaps,omitempty"`
+	// Persistent per-context staging allocation, shared by STORE and LOAD.
+	// This is not a new allocation or KV-pool debit for each operation; other
+	// registration buffers and registration costs remain separate obligations.
+	StagingSlots       int   `json:"registered_staging_slots,omitempty"`
+	StagingBufferBytes int64 `json:"registered_staging_buffer_bytes,omitempty"`
 }
 
 type NativeTransferCost interface {
