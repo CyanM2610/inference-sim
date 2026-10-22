@@ -8,13 +8,18 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/inference-sim/inference-sim/sim/kv"
 	"github.com/inference-sim/inference-sim/sim/policylab"
 	"github.com/sirupsen/logrus"
 )
 
 func run() error {
 	timingPath := flag.String("timing-log", "", "optional protocol boundary timings, written after final reply")
+	hashPath := flag.String("hash-work-log", "", "optional deterministic hash counts; separate from service timing")
 	flag.Parse()
+	if *hashPath != "" && *timingPath != "" {
+		return fmt.Errorf("hash-work collection must be separated from service timing")
+	}
 	logrus.SetLevel(logrus.ErrorLevel)
 	decoder := json.NewDecoder(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
@@ -34,6 +39,10 @@ func run() error {
 	controller, err := policylab.NewLiveController(config)
 	if err != nil {
 		return err
+	}
+	var hashWork []kv.HashWork
+	if *hashPath != "" {
+		controller.EnableHashWorkAccounting()
 	}
 	if err = encoder.Encode(map[string]bool{"ready": true}); err != nil {
 		return err
@@ -58,6 +67,9 @@ func run() error {
 		if e != nil {
 			return e
 		}
+		if *hashPath != "" {
+			hashWork = append(hashWork, controller.TakeHashWork())
+		}
 		if reader != nil {
 			timing.PollEndNS = clockNS()
 			timing.EncodeStartNS = clockNS()
@@ -77,6 +89,13 @@ func run() error {
 			timings = append(timings, timing)
 		}
 		if reply.Done {
+			if *hashPath != "" {
+				data, err := json.MarshalIndent(hashWork, "", "  ")
+				if err != nil {
+					return err
+				}
+				return os.WriteFile(*hashPath, data, 0644)
+			}
 			if reader != nil {
 				return saveProtocolTimings(*timingPath, timings)
 			}

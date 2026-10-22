@@ -5,7 +5,6 @@ import (
 	"math"
 
 	"github.com/inference-sim/inference-sim/sim"
-	"github.com/inference-sim/inference-sim/sim/internal/hash"
 )
 
 // PeerCache wraps BLIS's physical HBM allocator. DRAM and CXL are peers in
@@ -74,7 +73,7 @@ func (s *PeerCache) hashes(tokens []sim.TokenID) []string {
 	prev := ""
 	// The last prompt token must execute to produce logits even for a full hit.
 	for i := int64(0); i+s.BlockSizeTokens < int64(len(tokens)); i += s.BlockSizeTokens {
-		prev = hash.HashBlock(prev, tokens[i:i+s.BlockSizeTokens])
+		prev = s.hashBlock(prev, tokens[i:i+s.BlockSizeTokens])
 		out = append(out, prev)
 	}
 	return out

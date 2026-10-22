@@ -7,8 +7,21 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/inference-sim/inference-sim/sim/kv"
 	"github.com/inference-sim/inference-sim/sim/kvruntime"
 )
+
+// policyWorkFeatures describes work performed by the existing controller. Hash
+// counts are extracted from actual invocations, independently of host wall time.
+// Pool entries match the entries visited by PeerFabric.Snapshot after Poll.
+func policyWorkFeatures(reply *LiveReply, work kv.HashWork) kvruntime.ControlFeatures {
+	f := kvruntime.ControlFeatures{"events": float64(reply.EventsProcessed), "records": float64(len(reply.Records)), "completed": float64(len(reply.Requests)),
+		"hash_calls": float64(work.Calls), "hash_tokens": float64(work.Tokens), "hash_bytes": float64(work.Bytes), "hash_sha256_blocks": float64(work.SHA256Blocks), "pool_entries": 0}
+	for _, pool := range reply.Pools {
+		f["pool_entries"] += float64(pool["ready"] + pool["reserved"])
+	}
+	return f
+}
 
 // pythonPollBytes matches the native driver's json.dumps separators and field
 // insertion order. In particular completed_copies is present even when empty.
@@ -42,6 +55,15 @@ func RunControlledLive(c Config, p *kvruntime.Profile, control *kvruntime.Contro
 	l, x, err := newPhysicalController(c, p, copyPolicy, sink)
 	if err != nil {
 		return nil, err
+	}
+	countHashes := false
+	for _, name := range []string{"hash_calls", "hash_tokens", "hash_bytes", "hash_sha256_blocks"} {
+		if _, ok := control.Models["go_poll"].Coefficients[name]; ok {
+			countHashes = true
+		}
+	}
+	if countHashes {
+		l.EnableHashWorkAccounting()
 	}
 	e := x.Runtime.Engine
 	out := &PhysicalLiveResult{Scope: "Free-running real LiveController and shared physical DAG with measured control/IPC/driver/worker stage costs. Observed policy clock is captured before request packing; busy arrivals/completions await a subsequent round. Independent captured token values are causal references. Exact measured hardware/model scope; deterministic stage means do not establish tail or unseen-workload accuracy. Full paged contention and allocator internals remain incomplete."}
@@ -80,7 +102,7 @@ func RunControlledLive(c Config, p *kvruntime.Profile, control *kvruntime.Contro
 		if err != nil {
 			return nil, err
 		}
-		features := kvruntime.ControlFeatures{"events": float64(reply.EventsProcessed), "records": float64(len(reply.Records)), "completed": float64(len(reply.Requests))}
+		features := policyWorkFeatures(reply, l.TakeHashWork())
 		// The reply includes a diagnostic wall-time field. Predict its width
 		// from the independently calibrated Poll service, never DES wall time.
 		reply.ControlWallNS, err = control.Predict("go_poll", features)

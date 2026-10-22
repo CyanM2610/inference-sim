@@ -31,6 +31,9 @@ func (l *LiveController) AttachPhysicalMemory(memory kv.ExternalMemory) error {
 }
 func (l *LiveController) ValidatePhysicalMemory() error { return l.fabric.ValidateExternalMemory() }
 
+func (l *LiveController) EnableHashWorkAccounting() { l.store.EnableHashWorkAccounting() }
+func (l *LiveController) TakeHashWork() kv.HashWork { return l.store.TakeHashWork() }
+
 type LiveBatch struct {
 	Tokens   []sim.TokenID `json:"tokens"`
 	ID       int64         `json:"id"`
