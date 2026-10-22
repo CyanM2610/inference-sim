@@ -51,6 +51,43 @@ func TestNativeAsyncPreemptionDrainsStaleOutputBeforeResuming(t *testing.T) {
 	}
 }
 
+func TestNativeAsyncLMCacheProducerDoesNotDeliverPreemptedSamples(t *testing.T) {
+	e, s, _ := nativeAsyncHarness(t, 10, 6)
+	a := &sim.Request{ID: "a", InputTokens: []sim.TokenID{1, 2, 3, 4, 5}, OutputTokens: []sim.TokenID{6, 7, 8, 9, 10}, MaxOutputLen: 5}
+	b := &sim.Request{ID: "b", InputTokens: []sim.TokenID{11, 12, 13, 14, 15}, OutputTokens: []sim.TokenID{16, 17, 18, 19, 20}, MaxOutputLen: 5}
+	byID := map[string]*sim.Request{"a": a, "b": b}
+	beforeOutput := map[string]int64{}
+	checked := 0
+	e.EventObserver = func(event sim.Event, before bool) {
+		x, ok := event.(*sim.NativeAsyncEvent)
+		if !ok || x.Name != "native_async_consumed" {
+			return
+		}
+		if before {
+			beforeOutput = map[string]int64{}
+			for _, shape := range x.Shape {
+				r := byID[shape.Request]
+				if r.State == sim.StateQueued {
+					beforeOutput[r.ID] = r.EmittedTokens()
+				}
+			}
+		} else {
+			for id, count := range beforeOutput {
+				checked++
+				if byID[id].EmittedTokens() != count {
+					t.Fatal("LMCache kv_both delivered a stale preempted sample", id, count, byID[id].EmittedTokens())
+				}
+			}
+		}
+	}
+	e.InjectArrival(a)
+	e.InjectArrival(b)
+	e.Run()
+	if checked == 0 || e.Metrics.CompletedRequests != 2 || e.Metrics.TotalOutputTokens != 10 || s.nativeBatchPins != 0 || s.UsedBlocks() != 0 {
+		t.Fatal("preemption scenario was not exercised or failed to drain", checked, s.PeerSnapshot())
+	}
+}
+
 func TestNativeAsyncNativeAPCAndClosedLoopArrival(t *testing.T) {
 	e, s, _ := nativeAsyncHarness(t, 16)
 	a := &sim.Request{ID: "a", InputTokens: []sim.TokenID{1, 2, 3, 4, 5, 6, 7, 8, 9}, OutputTokens: []sim.TokenID{10}, MaxOutputLen: 1}

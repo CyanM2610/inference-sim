@@ -54,6 +54,9 @@ type NativeAsyncEvent struct {
 	TransferShape *NativeTransferShape `json:"transfer_shape,omitempty"`
 	ProducerBatch int64                `json:"producer_batch,omitempty"`
 	ProducerPhase string               `json:"producer_phase,omitempty"`
+	Request       string               `json:"request,omitempty"`
+	CoverageGap   string               `json:"coverage_gap,omitempty"`
+	Generation    uint64               `json:"generation,omitempty"`
 	run           func()
 }
 
@@ -274,7 +277,7 @@ func (n *nativeAsyncRuntime) tryConsume(now int64) {
 	n.s.stepEvent = n.event(end, "native_async_consumed", b, func() {
 		n.s.KVCache.SetClock(end)
 		for _, w := range b.work {
-			n.consumeWork(w, end)
+			n.consumeWork(w, end, b)
 		}
 		b.kv.Consumed(end)
 		n.queue = n.queue[1:]
@@ -328,6 +331,17 @@ func (n *nativeAsyncRuntime) form(now int64) *nativeQueuedBatch {
 		for len(s.RunningBatch.Requests) > 0 {
 			if n.store.ReserveNativeRange(r, p.scheduled, p.scheduled+grant, nil) {
 				ok = true
+				break
+			}
+			if n.store.NativeRetirementPending() {
+				// This adapter still holds retired physical pages until capture
+				// drain. Preempting every remaining live request cannot reclaim
+				// those holds and would repeatedly discard all useful output.
+				// Record the missing native queued-page-reuse behavior explicitly;
+				// this wait must not be passed off as calibrated native scheduling.
+				event := n.event(now, "native_async_retirement_wait", nil, nil)
+				event.Request = r.ID
+				event.CoverageGap = "retired_physical_page_reuse_waits_for_capture_drain"
 				break
 			}
 			last := len(s.RunningBatch.Requests) - 1
@@ -435,7 +449,7 @@ func (n *nativeAsyncRuntime) form(now int64) *nativeQueuedBatch {
 	return b
 }
 
-func (n *nativeAsyncRuntime) consumeWork(w NativeWork, now int64) {
+func (n *nativeAsyncRuntime) consumeWork(w NativeWork, now int64, batch *nativeQueuedBatch) {
 	r := w.Request
 	p := n.progress(r)
 	p.pending--
@@ -445,6 +459,16 @@ func (n *nativeAsyncRuntime) consumeWork(w NativeWork, now int64) {
 	if r.State == StateTimedOut || r.State == StateCompleted {
 		if p.pending == 0 {
 			delete(n.requests, r.ID)
+		}
+		return
+	}
+	if w.Generation != p.generation && n.store.NativeRequiresKVDelivery() {
+		// Pinned LMCache kv_both has requires_kv_delivery=True. Native marks
+		// these outputs stale at preemption and drops them, rather than treating
+		// them as observed tokens for the next generation's recomputation.
+		if w.Sample {
+			event := n.event(now, "native_async_stale_output_dropped", batch, nil)
+			event.Request, event.Generation = r.ID, w.Generation
 		}
 		return
 	}

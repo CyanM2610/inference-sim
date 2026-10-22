@@ -7,6 +7,12 @@ import (
 	"github.com/inference-sim/inference-sim/sim"
 )
 
+// LMCacheMPConnector inherits KVConnectorBase_V1.requires_kv_delivery.
+// This native hybrid path uses kv_both, whose is_kv_producer is true.
+func (s *PeerCache) NativeRequiresKVDelivery() bool { return true }
+
+func (s *PeerCache) NativeRetirementPending() bool { return len(s.nativeDeferred) != 0 }
+
 func (s *PeerCache) EnableNativeAsyncKV() error {
 	if s.nativeAsync || s.fabric.hostChunks == nil || s.fabric.phases != nil || s.batchPrefixes != nil || len(s.RequestMap) != 0 || s.fabric.Pending() != 0 {
 		return fmt.Errorf("native async KV requires unused host chunks without the legacy batch executor")
