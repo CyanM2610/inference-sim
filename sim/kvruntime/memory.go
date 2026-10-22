@@ -1,0 +1,256 @@
+package kvruntime
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+)
+
+// Cell is a lossless symbolic byte-range identity: Origin selects a payload,
+// Offset its first byte. Copies preserve the identity of every byte in a cell.
+// The simulator does not manufacture floating-point attention/KV values.
+type Cell struct {
+	Origin uint64
+	Offset int64
+	Valid  bool
+}
+type Buffer struct {
+	ID, Pool, Kind      string
+	Bytes               int64
+	State               string
+	Touched, Registered bool
+	Pins, Writers       int
+	Holds               int
+	Cells               []Cell
+	Opaque              bool
+}
+type Memory struct {
+	Unit           int64
+	Capacity, Used map[string]int64
+	Peak           map[string]int64
+	Buffers        map[string]*Buffer
+	e              *Engine
+}
+
+func NewMemory(e *Engine, unit int64, capacity map[string]int64) (*Memory, error) {
+	if unit <= 0 {
+		return nil, fmt.Errorf("positive content granule required")
+	}
+	c := map[string]int64{}
+	for k, v := range capacity {
+		if k == "" || v <= 0 {
+			return nil, fmt.Errorf("invalid capacity")
+		}
+		c[k] = v
+	}
+	return &Memory{Unit: unit, Capacity: c, Used: map[string]int64{}, Peak: map[string]int64{}, Buffers: map[string]*Buffer{}, e: e}, nil
+}
+func (m *Memory) Reserve(id, pool, kind string, bytes int64) (*Buffer, error) {
+	return m.reserve(id, pool, kind, bytes, false)
+}
+
+// ReserveOpaque accounts for measured non-KV resident allocations without
+// inventing their tensor contents. Opaque storage cannot enter a KV transfer.
+func (m *Memory) ReserveOpaque(id, pool, kind string, bytes int64) (*Buffer, error) {
+	return m.reserve(id, pool, kind, bytes, true)
+}
+func (m *Memory) reserve(id, pool, kind string, bytes int64, opaque bool) (*Buffer, error) {
+	if id == "" || m.Buffers[id] != nil || bytes <= 0 || bytes%m.Unit != 0 {
+		return nil, fmt.Errorf("invalid/duplicate buffer or unaligned size %s", id)
+	}
+	if m.Capacity[pool]-m.Used[pool] < bytes {
+		return nil, fmt.Errorf("capacity exhausted in %s", pool)
+	}
+	b := &Buffer{ID: id, Pool: pool, Kind: kind, Bytes: bytes, State: "reserved", Opaque: opaque}
+	if !opaque {
+		b.Cells = make([]Cell, bytes/m.Unit)
+	}
+	m.Buffers[id] = b
+	m.Used[pool] += bytes
+	m.Peak[pool] = max(m.Peak[pool], m.Used[pool])
+	m.e.Emit(Record{Name: "memory_reserve", Destination: id, Resource: pool, Bytes: bytes, Reason: kind})
+	return b, nil
+}
+func (m *Memory) Allocate(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.State != "reserved" {
+		return fmt.Errorf("allocation without reservation: %s", id)
+	}
+	b.State = "allocated"
+	m.e.Emit(Record{Name: "memory_allocate", Destination: id, Resource: b.Pool, Bytes: b.Bytes})
+	return nil
+}
+func (m *Memory) Fill(id string, origin uint64) error {
+	b := m.Buffers[id]
+	if b == nil || b.State != "allocated" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
+		return fmt.Errorf("fill of unavailable buffer %s", id)
+	}
+	for i := range b.Cells {
+		b.Cells[i] = Cell{origin, int64(i) * m.Unit, true}
+	}
+	b.Touched = true
+	b.State = "ready"
+	m.e.Emit(Record{Name: "memory_publish", Destination: id, Bytes: b.Bytes, Reason: "initialized", Origin: origin})
+	return nil
+}
+func (m *Memory) Register(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.State == "reserved" || b.Pool != "dram" || b.Registered || !b.Touched {
+		return fmt.Errorf("invalid registration %s", id)
+	}
+	b.Registered = true
+	m.e.Emit(Record{Name: "memory_register", Destination: id, Bytes: b.Bytes})
+	return nil
+}
+func (m *Memory) Unregister(id string) error {
+	b := m.Buffers[id]
+	if b == nil || !b.Registered || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
+		return fmt.Errorf("invalid unregister %s", id)
+	}
+	b.Registered = false
+	m.e.Emit(Record{Name: "memory_unregister", Destination: id, Bytes: b.Bytes})
+	return nil
+}
+func (m *Memory) Pin(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.State != "ready" || b.Writers > 0 {
+		return fmt.Errorf("read before publication: %s", id)
+	}
+	b.Pins++
+	m.e.Emit(Record{Name: "memory_pin", Source: id, Bytes: b.Bytes, ContentSHA256: m.Digest(id)})
+	return nil
+}
+func (m *Memory) Unpin(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.Pins <= 0 {
+		return fmt.Errorf("unbalanced pin: %s", id)
+	}
+	b.Pins--
+	m.e.Emit(Record{Name: "memory_unpin", Source: id, Bytes: b.Bytes})
+	return nil
+}
+func (m *Memory) BeginWrite(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.State == "reserved" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 {
+		return fmt.Errorf("target unavailable: %s", id)
+	}
+	b.Writers++
+	b.State = "writing"
+	m.e.Emit(Record{Name: "memory_write_pending", Destination: id, Bytes: b.Bytes})
+	return nil
+}
+func (m *Memory) Publish(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.Writers != 1 {
+		return fmt.Errorf("publication without writer: %s", id)
+	}
+	b.Writers = 0
+	b.State = "ready"
+	b.Touched = true
+	m.e.Emit(Record{Name: "memory_publish", Destination: id, Bytes: b.Bytes, Reason: "completion_adopted", ContentSHA256: m.Digest(id)})
+	return nil
+}
+func (m *Memory) Copy(src, dst string, so, do, n int64) error {
+	a, b := m.Buffers[src], m.Buffers[dst]
+	if a == nil || b == nil || a.Opaque || b.Opaque || a.Pins <= 0 || a.State != "ready" || b.Writers != 1 {
+		return fmt.Errorf("copy without live pin/writer")
+	}
+	if n <= 0 || so < 0 || do < 0 || so%m.Unit != 0 || do%m.Unit != 0 || n%m.Unit != 0 || so > a.Bytes-n || do > b.Bytes-n {
+		return fmt.Errorf("copy range out of bounds/unaligned")
+	}
+	for _, c := range a.Cells[so/m.Unit : (so+n)/m.Unit] {
+		if !c.Valid {
+			return fmt.Errorf("copy of uninitialized source")
+		}
+	}
+	copy(b.Cells[do/m.Unit:(do+n)/m.Unit], a.Cells[so/m.Unit:(so+n)/m.Unit])
+	m.e.Emit(Record{Name: "memory_copy", Source: src, Destination: dst, SourceOffset: so, DestinationOffset: do, Bytes: n})
+	return nil
+}
+
+// ComputeRange records newly computed KV identity under the same exclusive
+// writer contract as DMA. Publication remains a separate dependent operation.
+func (m *Memory) ComputeRange(id string, start, bytes int64, origin uint64, offset int64) error {
+	b := m.Buffers[id]
+	if b == nil || b.Opaque || b.Writers != 1 || start < 0 || bytes <= 0 || start > b.Bytes-bytes || start%m.Unit != 0 || bytes%m.Unit != 0 || offset < 0 {
+		return fmt.Errorf("invalid computed range")
+	}
+	for i := int64(0); i < bytes; i += m.Unit {
+		b.Cells[(start+i)/m.Unit] = Cell{origin, offset + i, true}
+	}
+	m.e.Emit(Record{Name: "memory_compute_range", Destination: id, DestinationOffset: start, Bytes: bytes, Origin: origin, OriginOffset: offset})
+	return nil
+}
+func (m *Memory) Free(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 || b.Registered {
+		return fmt.Errorf("free with live references/registration: %s", id)
+	}
+	m.Used[b.Pool] -= b.Bytes
+	delete(m.Buffers, id)
+	m.e.Emit(Record{Name: "memory_free", Source: id, Resource: b.Pool, Bytes: b.Bytes})
+	return nil
+}
+func (m *Memory) Check() error {
+	used := map[string]int64{}
+	for _, b := range m.Buffers {
+		if b.Pins < 0 || b.Writers < 0 || b.Holds < 0 {
+			return fmt.Errorf("negative references")
+		}
+		used[b.Pool] += b.Bytes
+	}
+	for p, n := range m.Used {
+		if n < 0 || n > m.Capacity[p] || used[p] != n {
+			return fmt.Errorf("physical accounting mismatch %s", p)
+		}
+	}
+	return nil
+}
+
+func (m *Memory) SeedRange(id string, start, bytes int64, origin uint64, offset int64) error {
+	b := m.Buffers[id]
+	if b == nil || b.State != "ready" || b.Pins > 0 || b.Writers > 0 || b.Holds > 0 || start < 0 || bytes <= 0 || start > b.Bytes-bytes || start%m.Unit != 0 || bytes%m.Unit != 0 || offset < 0 {
+		return fmt.Errorf("invalid input payload range")
+	}
+	for i := int64(0); i < bytes; i += m.Unit {
+		b.Cells[(start+i)/m.Unit] = Cell{origin, offset + i, true}
+	}
+	m.e.Emit(Record{Name: "memory_initialize_range", Destination: id, DestinationOffset: start, Bytes: bytes, Origin: origin, OriginOffset: offset})
+	return nil
+}
+func (m *Memory) Digest(id string) string {
+	b := m.Buffers[id]
+	h := sha256.New()
+	var bytes [17]byte
+	for _, c := range b.Cells {
+		binary.LittleEndian.PutUint64(bytes[:8], c.Origin)
+		binary.LittleEndian.PutUint64(bytes[8:16], uint64(c.Offset))
+		bytes[16] = 0
+		if c.Valid {
+			bytes[16] = 1
+		}
+		_, _ = h.Write(bytes[:])
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// Hold protects storage for a queued consumer without asserting that its
+// producer has published data. Pin still checks readiness at execution time.
+func (m *Memory) Hold(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.State == "reserved" {
+		return fmt.Errorf("hold of unavailable storage")
+	}
+	b.Holds++
+	m.e.Emit(Record{Name: "memory_hold", Source: id, Bytes: b.Bytes})
+	return nil
+}
+func (m *Memory) Unhold(id string) error {
+	b := m.Buffers[id]
+	if b == nil || b.Holds <= 0 {
+		return fmt.Errorf("unbalanced storage hold")
+	}
+	b.Holds--
+	m.e.Emit(Record{Name: "memory_unhold", Source: id, Bytes: b.Bytes})
+	return nil
+}
