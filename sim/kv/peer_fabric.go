@@ -61,6 +61,7 @@ type peerPool struct {
 	entries map[string]*peerEntry
 }
 type peerJob struct {
+	notBefore         int64
 	units             int64
 	nativeSource      func() string
 	nativeDestination func() string
@@ -74,6 +75,7 @@ type peerJob struct {
 	cancel            func(int64)
 }
 type PeerFabric struct {
+	phases        *PeerEnginePhases
 	groupDepth    int
 	groupBuffer   []*peerJob
 	external      *externalPeerRuntime
@@ -167,6 +169,10 @@ func (f *PeerFabric) submit(now int64, j *peerJob) {
 	j.record.Transaction = f.serial
 	j.record.Time = now
 	j.record.Bytes = max(1, j.units) * f.bytes
+	if f.phases != nil {
+		f.phases.stage(now, j)
+		return
+	}
 	j.record.Name = "transfer_queued"
 	f.emit(j.record)
 	f.queue = append(f.queue, j)
@@ -193,6 +199,9 @@ func (f *PeerFabric) dispatch(now int64) {
 		}
 		j := f.queue[index]
 		attempted[j.record.Transaction] = true
+		if j.notBefore > now {
+			continue
+		}
 		available := true
 		for _, id := range j.path {
 			if f.busy[id] {
@@ -273,6 +282,11 @@ func (e *peerTransferEvent) Execute(_ *sim.Simulator) {
 	j.record.Time = e.at
 	j.record.Name = "transfer_end"
 	f.emit(j.record)
+	if f.phases != nil {
+		f.phases.physicalComplete(e.at, j)
+		f.dispatch(e.at)
+		return
+	}
 	finish := func(now int64) { j.done(now); f.dispatch(now); f.wakeStores(now) }
 	if f.mechanisms.CompletionUS > 0 {
 		f.controlSubmit(e.at, &peerControlJob{record: PeerRecord{Instance: j.record.Instance, Request: j.record.Request, Transaction: j.record.Transaction, Reason: "completion"}, service: f.mechanisms.CompletionUS, schedule: j.schedule, done: finish})
@@ -333,6 +347,9 @@ func (f *PeerFabric) Snapshot() map[string]map[string]int64 {
 	return out
 }
 func (f *PeerFabric) Pending() int {
+	if f.phases != nil {
+		return len(f.phases.jobs)
+	}
 	return f.active + len(f.queue) + f.controlActive + len(f.controlQueue)
 }
 func sortedPeerIDs(m map[string]bool) []string {

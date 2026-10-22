@@ -190,9 +190,12 @@ func (n *NativePeerRuntime) requestOrigins(req *sim.Request, count int64) ([]uin
 // BeginBatch implements sim.AsyncBatchExecutor. The simulator is woken only
 // after scatter publication and HF workspace release actually finish.
 func (s *PeerCache) AsyncBatchEnabled() bool {
-	return s.fabric.native != nil && s.fabric.native.pagedEnabled
+	return s.fabric.phases != nil || s.fabric.native != nil && s.fabric.native.pagedEnabled
 }
 func (s *PeerCache) BeginBatch(now int64, work []sim.BatchWork, done func(int64)) (bool, error) {
+	if s.fabric.phases != nil {
+		return s.fabric.phases.begin(now, work, done)
+	}
 	n := s.fabric.native
 	if n == nil || !n.pagedEnabled {
 		return false, nil

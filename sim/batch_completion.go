@@ -37,6 +37,30 @@ type AsyncBatchExecutor interface {
 	BeginBatch(now int64, work []BatchWork, done func(at int64)) (bool, error)
 }
 
+// AsyncIdleExecutor advances control-only engine steps while I/O remains.
+// Empty steps must have positive duration and must stop once the backend drains.
+type AsyncIdleExecutor interface {
+	ExecutesEmptySteps() bool
+	HasPendingEngineWork() bool
+}
+
+func pendingEngineWork(store KVStore) bool {
+	b, ok := store.(AsyncIdleExecutor)
+	return ok && b.ExecutesEmptySteps() && b.HasPendingEngineWork()
+}
+
+// EngineIdleCompleteEvent completes CPU control work, without reporting GPU
+// computation, advancing tokens, or publishing computed cache blocks.
+type EngineIdleCompleteEvent struct{ At int64 }
+
+func (e *EngineIdleCompleteEvent) Timestamp() int64 { return e.At }
+func (e *EngineIdleCompleteEvent) Priority() int    { return PriorityStep }
+func (e *EngineIdleCompleteEvent) Execute(s *Simulator) {
+	// Keep the in-flight marker through batch formation: reserving a new load
+	// may issue a wakeup, which must not enqueue a duplicate co-timed step.
+	s.Step(e.At)
+}
+
 func (s *Simulator) beginAsyncBatch(now int64) bool {
 	executor, ok := s.KVCache.(AsyncBatchExecutor)
 	if !ok {
@@ -47,7 +71,11 @@ func (s *Simulator) beginAsyncBatch(now int64) bool {
 	}
 	var work []BatchWork
 	ev := &BatchCompleteEvent{Start: now}
-	for _, r := range s.RunningBatch.Requests {
+	var requests []*Request
+	if s.RunningBatch != nil {
+		requests = s.RunningBatch.Requests
+	}
+	for _, r := range requests {
 		if r.NumNewTokens <= 0 {
 			continue
 		}
@@ -62,7 +90,9 @@ func (s *Simulator) beginAsyncBatch(now int64) bool {
 		ev.Requests = append(ev.Requests, r.ID)
 	}
 	if len(work) == 0 {
-		return false
+		if !pendingEngineWork(s.KVCache) {
+			return false
+		}
 	}
 	// Keep an unscheduled in-flight marker so arrivals/transfer wakeups cannot
 	// start another batch while the detailed execution graph owns this batch.
@@ -78,7 +108,11 @@ func (s *Simulator) beginAsyncBatch(now int64) bool {
 		completed = true
 		ev.At = at
 		ev.Duration = at - now
-		s.Schedule(ev)
+		if len(work) == 0 {
+			s.Schedule(&EngineIdleCompleteEvent{At: at})
+		} else {
+			s.Schedule(ev)
+		}
 	})
 	returned = true
 	accepted = handled

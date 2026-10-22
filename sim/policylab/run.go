@@ -40,26 +40,28 @@ type PromotionConfig struct {
 	Budget   int           `json:"block_budget"`
 }
 type Config struct {
-	BatchCost        *BatchCostConfig    `json:"batch_cost,omitempty"`
-	Native           *NativeConfig       `json:"native_runtime,omitempty"`
-	Seed             int64               `json:"seed"`
-	RequestScheduler string              `json:"request_scheduler,omitempty"`
-	BlockTokens      int64               `json:"block_tokens"`
-	MaxBatchTokens   int64               `json:"max_batch_tokens"`
-	MaxSequences     int64               `json:"max_sequences"`
-	PrefillChunk     int64               `json:"prefill_chunk"`
-	Model            sim.ModelConfig     `json:"model"`
-	Hardware         sim.HardwareCalib   `json:"hardware"`
-	Alpha            []float64           `json:"alpha_us"`
-	Routing          string              `json:"routing"`
-	RoutingUS        int64               `json:"routing_us"`
-	Resources        []kv.PeerResource   `json:"resources"`
-	Pools            []kv.PeerPoolConfig `json:"pools"`
-	Instances        []InstanceConfig    `json:"instances"`
-	Policy           PolicyConfig        `json:"policy"`
-	Requests         []RequestConfig     `json:"requests"`
-	Promotions       []PromotionConfig   `json:"promotions"`
-	Mechanisms       *kv.PeerMechanisms  `json:"mechanisms,omitempty"`
+	EnginePhases     *EnginePhaseCostConfig `json:"engine_phases,omitempty"`
+	TraceBatchShapes bool                   `json:"trace_batch_shapes,omitempty"`
+	BatchCost        *BatchCostConfig       `json:"batch_cost,omitempty"`
+	Native           *NativeConfig          `json:"native_runtime,omitempty"`
+	Seed             int64                  `json:"seed"`
+	RequestScheduler string                 `json:"request_scheduler,omitempty"`
+	BlockTokens      int64                  `json:"block_tokens"`
+	MaxBatchTokens   int64                  `json:"max_batch_tokens"`
+	MaxSequences     int64                  `json:"max_sequences"`
+	PrefillChunk     int64                  `json:"prefill_chunk"`
+	Model            sim.ModelConfig        `json:"model"`
+	Hardware         sim.HardwareCalib      `json:"hardware"`
+	Alpha            []float64              `json:"alpha_us"`
+	Routing          string                 `json:"routing"`
+	RoutingUS        int64                  `json:"routing_us"`
+	Resources        []kv.PeerResource      `json:"resources"`
+	Pools            []kv.PeerPoolConfig    `json:"pools"`
+	Instances        []InstanceConfig       `json:"instances"`
+	Policy           PolicyConfig           `json:"policy"`
+	Requests         []RequestConfig        `json:"requests"`
+	Promotions       []PromotionConfig      `json:"promotions"`
+	Mechanisms       *kv.PeerMechanisms     `json:"mechanisms,omitempty"`
 }
 type NativeConfig struct {
 	InputCopies      bool   `json:"input_copies,omitempty"`
@@ -76,6 +78,7 @@ type CPUProfile struct {
 	Nanoseconds int64 `json:"wall_ns"`
 }
 type Result struct {
+	BatchShapes []BatchCostObservation `json:"batch_shapes,omitempty"`
 	// Absolute first observation, captured once before any possible re-prefill
 	// overwrites legacy core TTFT fields. These are the ranking API timestamps.
 	FirstTokenUS      map[string]int64            `json:"first_token_us"`
@@ -97,6 +100,17 @@ type Result struct {
 }
 
 func (c Config) Validate() error {
+	if c.EnginePhases != nil {
+		if c.BatchCost == nil || c.Native != nil || len(c.Instances) != 1 || len(c.Promotions) != 0 {
+			return fmt.Errorf("engine phases require a single batch-cost instance without native runtime or promotions")
+		}
+		if err := c.EnginePhases.Validate(); err != nil {
+			return err
+		}
+	}
+	if c.TraceBatchShapes && c.BatchCost == nil {
+		return fmt.Errorf("trace_batch_shapes requires the batch_cost backend")
+	}
 	if c.BatchCost != nil {
 		if c.Native != nil {
 			return fmt.Errorf("batch_cost and native_runtime are separate execution backends")
@@ -228,6 +242,23 @@ func Run(c Config) (*Result, error) {
 		}
 	}
 	requests := make([]*sim.Request, 0, len(c.Requests))
+	if c.EnginePhases != nil {
+		if c.EnginePhases.BlockBytes != out.BlockBytes {
+			return nil, fmt.Errorf("engine phase profile KV block size mismatch")
+		}
+		err = stores[0].ConfigureEnginePhases(*c.EnginePhases, func(start, end int64, work []sim.BatchWork) {
+			if c.TraceBatchShapes && len(work) > 0 {
+				row := BatchCostObservation{StartUS: start, DurationUS: end - start}
+				for _, w := range work {
+					row.Scheduled = append(row.Scheduled, BatchCostRequest{Request: w.Request.ID, Prefix: w.PrefixTokens, Query: w.NewTokens})
+				}
+				out.BatchShapes = append(out.BatchShapes, row)
+			}
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	if c.Native != nil {
 		p, err := kvruntime.LoadProfile(c.Native.Profile)
 		if err != nil {
@@ -317,7 +348,14 @@ func Run(c Config) (*Result, error) {
 		sc.KVCacheConfig = sim.NewKVCacheConfig(c.Instances[index-1].HBMBlocks, c.BlockTokens, 0, 0, 0, 0)
 		var inst *cluster.InstanceSimulator
 		if c.BatchCost != nil {
-			inst = cluster.NewInstanceSimulatorWithBackends(id, sc, s, &batchCostLatency{store: s, config: *c.BatchCost})
+			cost := &batchCostLatency{store: s, config: *c.BatchCost}
+			inst = cluster.NewInstanceSimulatorWithBackends(id, sc, s, cost)
+			if c.TraceBatchShapes {
+				cost.observe = func(row BatchCostObservation) {
+					row.StartUS = inst.Clock()
+					out.BatchShapes = append(out.BatchShapes, row)
+				}
+			}
 		} else if c.Native != nil && c.Native.ComputeGrid {
 			inst = cluster.NewInstanceSimulatorWithBackends(id, sc, s, &nativeLatency{store: s})
 		} else {

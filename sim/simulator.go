@@ -830,12 +830,28 @@ func (sim *Simulator) recordRequestCompletion(req *Request) {
 // non-nil pointer and skipping their step-scheduling.
 func (sim *Simulator) Step(now int64) {
 	if sim.RunningBatch == nil && sim.WaitQ.Len() == 0 {
+		if sim.batchCompletionEvents && pendingEngineWork(sim.KVCache) && sim.beginAsyncBatch(now) {
+			return
+		}
 		sim.stepEvent = nil
 		return
 	}
+	preemptionsBefore := sim.Metrics.PreemptionCount
 	sim.scheduleBatch(now)
 	if sim.batchCompletionEvents {
 		if len(sim.RunningBatch.Requests) == 0 {
+			if pendingEngineWork(sim.KVCache) && sim.beginAsyncBatch(now) {
+				return
+			}
+			if sim.Metrics.PreemptionCount > preemptionsBefore && sim.WaitQ.Len() > 0 {
+				// Preemption freed capacity but the current formation pass
+				// deliberately skips waiting admissions. Retry that pass;
+				// there may be no pending transfer/arrival to wake us later.
+				// Retry only after actual progress, never spin on a blocked KV.
+				sim.stepEvent = &StepEvent{time: now}
+				sim.Schedule(sim.stepEvent)
+				return
+			}
 			// A KV completion or a new arrival will wake the engine.
 			sim.stepEvent = nil
 			return
@@ -1298,7 +1314,7 @@ func (sim *Simulator) scheduleNextStep(now, currStepAdvance int64, remaining []*
 		// AdapterLoadCompletionEvent — which re-forms a step on completion via
 		// ScheduleStepIfIdle. Scheduling an empty step here instead would spin one
 		// step per tick for the whole load. Inert when no LoRA (loadingAdapter == "").
-		if sim.WaitQ.Len() > 0 && sim.loadingAdapter == "" {
+		if (sim.WaitQ.Len() > 0 || pendingEngineWork(sim.KVCache)) && sim.loadingAdapter == "" {
 			pbe := StepEvent{time: now + currStepAdvance}
 			sim.Schedule(&pbe)
 			sim.stepEvent = &pbe

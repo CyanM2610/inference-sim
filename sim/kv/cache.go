@@ -10,6 +10,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/inference-sim/inference-sim/sim"
+	"github.com/inference-sim/inference-sim/sim/internal/hash"
 	"github.com/inference-sim/inference-sim/sim/internal/util"
 )
 
@@ -21,13 +22,13 @@ import (
 // Each block stores a fixed number of tokens and is tracked by a prefix hash.
 // A block becomes eligible for caching once it is full.
 type KVBlock struct {
-	ID       int64         // Unique ID of the block
-	RefCount int           // Number of active requests referencing this block
-	InUse    bool          // Whether the block is currently in use by an active (batched) request
-	Hash     string        // Prefix hash identifying this block's content and its lineage (if full)
+	ID       int64    // Unique ID of the block
+	RefCount int      // Number of active requests referencing this block
+	InUse    bool     // Whether the block is currently in use by an active (batched) request
+	Hash     string   // Prefix hash identifying this block's content and its lineage (if full)
 	Tokens   []sim.TokenID // Actual tokens stored in this block; full if len(Tokens) == BlockSizeTokens
-	PrevFree *KVBlock      // LRU doubly linked list: previous free block
-	NextFree *KVBlock      // LRU doubly linked list: next free block
+	PrevFree *KVBlock // LRU doubly linked list: previous free block
+	NextFree *KVBlock // LRU doubly linked list: next free block
 }
 
 // KVCacheState maintains global KV cache status across all requests.
@@ -35,8 +36,6 @@ type KVBlock struct {
 // via a direct counter on the free list (FreeBlockCnt), mirroring vLLM's
 // FreeKVCacheBlockQueue.num_free_blocks.
 type KVCacheState struct {
-	hashAccounting  bool
-	hashWork        HashWork
 	TotalBlocks     int64              // Total KV blocks available on GPU
 	BlockSizeTokens int64              // Tokens per block
 	Blocks          []*KVBlock         // All KV blocks
@@ -130,7 +129,7 @@ func (kvc *KVCacheState) GetCachedBlocks(tokens []sim.TokenID) (blockIDs []int64
 	for i := int64(0); i < n; i++ {
 		start := i * kvc.BlockSizeTokens
 		end := start + kvc.BlockSizeTokens
-		h := kvc.hashBlock(prevHash, tokens[start:end])
+		h := hash.HashBlock(prevHash, tokens[start:end])
 		blockId, ok := kvc.HashToBlock[h]
 		if !ok {
 			break
@@ -165,7 +164,7 @@ func (kvc *KVCacheState) SnapshotCachedBlocksFn() func([]sim.TokenID) int {
 		for i := int64(0); i < n; i++ {
 			start := i * blockSize
 			end := start + blockSize
-			h := kvc.hashBlock(prevHash, tokens[start:end])
+			h := hash.HashBlock(prevHash, tokens[start:end])
 			if _, ok := snapshot[h]; !ok {
 				break
 			}
@@ -300,7 +299,7 @@ func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, en
 				if len(ids) >= 2 {
 					prevHash = kvc.Blocks[ids[len(ids)-2]].Hash
 				}
-				h := kvc.hashBlock(prevHash, latestBlk.Tokens)
+				h := hash.HashBlock(prevHash, latestBlk.Tokens)
 				latestBlk.Hash = h
 				kvc.HashToBlock[h] = latestBlk.ID
 			}
@@ -354,7 +353,7 @@ func (kvc *KVCacheState) AllocateKVBlocks(req *sim.Request, startIndex int64, en
 					// Only compute prefix hash during prefill (not decode).
 					// During decode, blocks hold output tokens that should not
 					// participate in prefix caching (input sequences only).
-					h := kvc.hashBlock(prevHash, blk.Tokens)
+					h := hash.HashBlock(prevHash, blk.Tokens)
 					blk.Hash = h
 					kvc.HashToBlock[h] = blk.ID
 					prevHash = h
