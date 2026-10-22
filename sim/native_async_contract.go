@@ -54,6 +54,13 @@ type NativePhasedKVStore interface {
 	EnableNativePhaseTransfers(*NativeExecutor, string) error
 }
 
+// NativeRequestLookupStore gates only fresh waiting admission. The callback
+// polls protocol futures; a pending result consumes no HBM or token budget.
+// A preempted request bypasses external lookup, matching the native connector.
+type NativeRequestLookupStore interface {
+	NativeRequestLookupReady(req *Request, preempted bool) bool
+}
+
 // NativeAsyncKVStore keeps allocation, content and physical lifetimes out of
 // the scheduler. ReserveNativeRange never reads not-yet-emitted output tokens.
 type NativeAsyncKVStore interface {

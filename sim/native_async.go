@@ -400,6 +400,11 @@ func (n *nativeAsyncRuntime) form(now int64) *nativeQueuedBatch {
 		if p.generation > 0 {
 			r.recomputeUntil = r.InputLen() + r.EmittedTokens()
 		}
+		if lookup, ok := n.store.(NativeRequestLookupStore); ok && !lookup.NativeRequestLookupReady(r, p.generation > 0) {
+			skipped = append(skipped, r.ID)
+			scan++
+			continue
+		}
 		prefix := RequestCachedPrefix(s.KVCache, r)
 		grant := nativeTokenGrant(r.PrefillEnd()-prefix.Tokens, budget, s.longPrefillTokenThreshold)
 		if s.maxModelLen > 0 {

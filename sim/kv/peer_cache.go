@@ -20,6 +20,9 @@ type PeerCache struct {
 	nativeControl           *nativePromotion
 	nativeControlSerial     int64
 	nativeControlRPCs       int64
+	nativeRequestLookups    map[string]*nativeRequestLookup
+	nativeRequestRPCs       int64
+	nativeRequestRPCSerial  int64
 	nativePartialFailure    int
 	nativePageAccess        map[int64]nativePendingPageAccess
 	nativeReserving         bool
@@ -648,7 +651,7 @@ func (s *PeerCache) AllocateKVBlocks(req *sim.Request, start, end int64, cached 
 	if s.fabric.hostChunks != nil && s.readPending[req.ID] == 0 && len(s.holds[req.ID]) > 0 {
 		cached = s.GetRequestCachedPrefix(req).Blocks
 	}
-	if s.fabric.hostChunks != nil && len(s.RequestMap[req.ID]) == 0 {
+	if s.fabric.hostChunks != nil && len(s.RequestMap[req.ID]) == 0 && s.nativeRequestLookups == nil {
 		s.ensureHostLookup(req.ID, req.PrefillTokens())
 	}
 	s.observeCacheLookup(req.ID, req.FullInputTokens())
@@ -931,9 +934,9 @@ func (s *PeerCache) ReleaseKVBlocks(req *sim.Request) {
 		s.holdHostStoreRequest(req)
 	}
 	if req.State != sim.StateRunning {
-		s.endHostLookup(req.ID)
+		s.endRequestHostLookup(req.ID)
 	}
-	if s.fabric.hostChunks != nil {
+	if s.fabric.hostChunks != nil && s.nativeRequestLookups[req.ID] == nil {
 		delete(s.fabric.hostChunks.inputs, req.ID)
 	}
 	if s.nativeAsync {
@@ -976,8 +979,8 @@ func (s *PeerCache) ClearDeferred(id string) {
 	if len(s.RequestMap[id]) == 0 {
 		delete(s.nativeLoadPending, id)
 		delete(s.nativeLoadTargets, id)
-		s.endHostLookup(id)
-		if s.fabric.hostChunks != nil {
+		s.endRequestHostLookup(id)
+		if s.fabric.hostChunks != nil && s.nativeRequestLookups[id] == nil {
 			delete(s.fabric.hostChunks.inputs, id)
 		}
 		s.releaseDecodeCapacity(id)
@@ -1105,6 +1108,10 @@ func (s *PeerCache) PeerSnapshot() map[string]int64 {
 		m["native_receives_unadopted"] = int64(len(s.nativeLoadPending))
 		m["native_scheduled_step"] = s.nativeScheduledStep
 		m["native_processed_step"] = s.nativeProcessedStep
+		if s.nativeRequestLookups != nil {
+			m["native_request_rpcs"] = s.nativeRequestRPCs
+			m["native_request_lookup_sessions"] = int64(len(s.nativeRequestLookups))
+		}
 		m["native_promotion_prepared"] = int64(len(s.nativePromotionPrepared))
 		m["native_promotion_receipts"] = int64(len(s.nativePromotionReceipts))
 		if s.nativeControlSerial != 0 {
