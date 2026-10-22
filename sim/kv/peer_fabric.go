@@ -86,28 +86,30 @@ type peerJob struct {
 	cancel            func(int64)
 }
 type PeerFabric struct {
-	hostChunks    *hostChunkState
-	phases        *PeerEnginePhases
-	groupDepth    int
-	groupBuffer   []*peerJob
-	external      *externalPeerRuntime
-	native        *NativePeerRuntime
-	resources     map[string]PeerResource
-	busy          map[string]bool
-	pools         map[string]*peerPool
-	queue         []*peerJob
-	stores        []*PeerCache
-	serial        int64
-	active        int
-	bytes         int64
-	sink          PeerSink
-	mechanisms    PeerMechanisms
-	deadlines     map[string]int64
-	busyUntil     map[string]int64
-	dispatching   bool
-	controlQueue  []*peerControlJob
-	controlActive int
-	controlBusy   map[int]bool
+	hostChunks     *hostChunkState
+	phases         *PeerEnginePhases
+	groupDepth     int
+	groupBuffer    []*peerJob
+	external       *externalPeerRuntime
+	native         *NativePeerRuntime
+	resources      map[string]PeerResource
+	busy           map[string]bool
+	pools          map[string]*peerPool
+	queue          []*peerJob
+	stores         []*PeerCache
+	serial         int64
+	active         int
+	nativePrepared int
+	nativeInFlight int
+	bytes          int64
+	sink           PeerSink
+	mechanisms     PeerMechanisms
+	deadlines      map[string]int64
+	busyUntil      map[string]int64
+	dispatching    bool
+	controlQueue   []*peerControlJob
+	controlActive  int
+	controlBusy    map[int]bool
 }
 
 func NewPeerFabric(resources []PeerResource, pools []PeerPoolConfig, blockBytes int64, sink PeerSink) (*PeerFabric, error) {
@@ -185,6 +187,16 @@ func (f *PeerFabric) submit(now int64, j *peerJob) {
 	j.record.Transaction = f.serial
 	j.record.Time = now
 	j.record.Bytes = max(1, j.units) * f.bytes
+	if len(f.stores) == 1 && f.stores[0].nativePhaseTransfers {
+		if j.record.Reason == "promotion" {
+			panic("native phase Promotion needs an explicit worker submission path")
+		}
+		f.stores[0].nativePrepared = append(f.stores[0].nativePrepared, j)
+		f.nativePrepared++
+		j.record.Name = "native_transfer_prepared"
+		f.emit(j.record)
+		return
+	}
 	if f.phases != nil {
 		f.phases.stage(now, j)
 		return
@@ -422,7 +434,7 @@ func (f *PeerFabric) Pending() int {
 	if f.phases != nil {
 		return len(f.phases.jobs)
 	}
-	return f.active + len(f.queue) + f.controlActive + len(f.controlQueue)
+	return f.active + len(f.queue) + f.controlActive + len(f.controlQueue) + f.nativePrepared + f.nativeInFlight
 }
 func sortedPeerIDs(m map[string]bool) []string {
 	ids := make([]string, 0, len(m))

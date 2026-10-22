@@ -11,6 +11,10 @@ import (
 // access, not stages in a chain. Only completed full input blocks are reusable.
 type PeerCache struct {
 	nativeAsync            bool
+	nativePhaseTransfers   bool
+	nativeExecutor         *sim.NativeExecutor
+	nativeCopyResource     string
+	nativePrepared         []*peerJob
 	nativeReserving        bool
 	nativeBatchPins        int64
 	nativePending          map[string]int

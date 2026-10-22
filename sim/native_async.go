@@ -25,7 +25,8 @@ type nativeQueuedBatch struct {
 type nativeAsyncRuntime struct {
 	s                      *Simulator
 	store                  NativeAsyncKVStore
-	cost                   NativeAsyncCost
+	cost                   NativeHostCost
+	executor               *NativeExecutor
 	depth                  int
 	requests               map[string]*nativeRequestProgress
 	queue                  []*nativeQueuedBatch
@@ -39,11 +40,15 @@ type nativeAsyncRuntime struct {
 // NativeAsyncEvent exposes actual runtime transitions, never trace-forced times.
 // Shape is a submission snapshot, so later formation cannot rewrite past work.
 type NativeAsyncEvent struct {
-	At         int64              `json:"time_us"`
-	Name       string             `json:"name"`
-	BatchID    int64              `json:"batch_id"`
-	Shape      []NativeBatchShape `json:"shape,omitempty"`
-	QueueDepth int                `json:"queue_depth"`
+	At         int64                `json:"time_us"`
+	Name       string               `json:"name"`
+	BatchID    int64                `json:"batch_id"`
+	Shape      []NativeBatchShape   `json:"shape,omitempty"`
+	QueueDepth int                  `json:"queue_depth"`
+	Phase      string               `json:"phase,omitempty"`
+	Resource   string               `json:"resource,omitempty"`
+	DurationUS int64                `json:"duration_us,omitempty"`
+	Execution  *NativeExecutionPlan `json:"execution,omitempty"`
 	run        func()
 }
 
@@ -58,16 +63,38 @@ func (e *NativeAsyncEvent) Execute(*Simulator) {
 // EnableNativeAsync installs the dense single-instance native FCFS execution
 // path. Explicit positive cost services avoid a hidden zero-cost polling loop.
 // The caller owns calibration/coverage; enabling this is not a calibration PASS.
-func (s *Simulator) EnableNativeAsync(depth int, cost NativeAsyncCost) error {
+func (s *Simulator) EnableNativeAsync(depth int, cost NativeHostCost) error {
 	store, ok := s.KVCache.(NativeAsyncKVStore)
 	if !ok || cost == nil || depth < 2 || s.nativeAsync != nil || s.stepCount != 0 || !s.batchCompletionEvents || s.specEnabled || s.residentAdapters != nil || s.decision != nil || s.hostServices != nil || s.postStep != nil || s.latencyModel.OutputTokenProcessingTime() != 0 || s.latencyModel.PostDecodeFixedOverhead() != 0 {
 		return fmt.Errorf("native async requires an idle dense instance, native KV, depth >=2 and explicit costs")
 	}
-	if err := store.EnableNativeAsyncKV(); err != nil {
+	phase, phased := cost.(NativePhaseCost)
+	if _, coarse := cost.(NativeAsyncCost); !phased && !coarse {
+		return fmt.Errorf("native execution model is missing")
+	}
+	n := &nativeAsyncRuntime{s: s, store: store, cost: cost, depth: depth, requests: map[string]*nativeRequestProgress{}}
+	if phased {
+		if _, ok := store.(NativePhasedKVStore); !ok {
+			return fmt.Errorf("native phase model requires a phase-aware KV store")
+		}
+		var err error
+		n.executor, err = newNativeExecutor(n, phase.ExecutionResources())
+		if err != nil {
+			return err
+		}
+		if _, ok := n.executor.busy[phase.CopyResource()]; !ok {
+			return fmt.Errorf("native copy resource is not configured")
+		}
+	}
+	if phased {
+		if err := store.(NativePhasedKVStore).EnableNativePhaseTransfers(n.executor, phase.CopyResource()); err != nil {
+			return err
+		}
+	} else if err := store.EnableNativeAsyncKV(); err != nil {
 		return err
 	}
 	s.scheduler = &FCFSScheduler{}
-	s.nativeAsync = &nativeAsyncRuntime{s: s, store: store, cost: cost, depth: depth, requests: map[string]*nativeRequestProgress{}}
+	s.nativeAsync = n
 	store.BindEvents(s.Schedule, s.ScheduleStepIfIdle)
 	return nil
 }
@@ -172,10 +199,15 @@ func (n *nativeAsyncRuntime) step(now int64) {
 	b := n.form(now)
 	n.s.stepEvent = n.event(end, "native_async_scheduled", b, func() {
 		n.queue = append(n.queue, b)
+		if n.executor != nil {
+			n.executePhases(end, b)
+			return
+		}
+		cost := n.cost.(NativeAsyncCost)
 		start := max(end, n.workerFree)
-		deviceEnd := nativeAfter(start, n.cost.WorkerUS(append([]NativeBatchShape(nil), b.shape...)), true)
+		deviceEnd := nativeAfter(start, cost.WorkerUS(append([]NativeBatchShape(nil), b.shape...)), true)
 		n.workerFree = deviceEnd
-		outputEnd := nativeAfter(max(deviceEnd, n.outputFree), n.cost.OutputUS(append([]NativeBatchShape(nil), b.shape...)), false)
+		outputEnd := nativeAfter(max(deviceEnd, n.outputFree), cost.OutputUS(append([]NativeBatchShape(nil), b.shape...)), false)
 		n.outputFree = outputEnd
 		n.event(start, "native_async_worker_start", b, nil)
 		n.event(deviceEnd, "native_async_device_complete", b, func() { b.kv.DeviceComplete(deviceEnd) })
@@ -188,6 +220,38 @@ func (n *nativeAsyncRuntime) step(now int64) {
 		n.busy = false
 		n.next(end)
 	})
+}
+
+func (n *nativeAsyncRuntime) executePhases(now int64, b *nativeQueuedBatch) {
+	p := n.cost.(NativePhaseCost).ExecutionPlan(append([]NativeBatchShape(nil), b.shape...))
+	n.event(now, "native_execution_plan", b, nil).Execution = &p
+	kv, ok := b.kv.(NativePhasedBatchKV)
+	if !ok {
+		panic("phase-aware KV capture missing")
+	}
+	fences := map[string]*NativeFence{p.ProducerReady: {}}
+	callbacks := map[string]func(int64){}
+	// Several milestones may intentionally be the same host-only empty step.
+	add := func(name string, callback func(int64)) {
+		previous := callbacks[name]
+		callbacks[name] = func(at int64) {
+			if previous != nil {
+				previous(at)
+			}
+			callback(at)
+		}
+	}
+	add(p.Computed, kv.Computed)
+	add(p.PostForward, func(at int64) { kv.PostForward(at, fences[p.ProducerReady]) })
+	add(p.Poll, kv.Poll)
+	add(p.OutputReady, func(at int64) {
+		b.ready = true
+		if n.waiting && !n.busy {
+			n.tryConsume(at)
+		}
+	})
+	add(p.HostReturned, func(at int64) { n.busy = false; n.next(at) })
+	n.executor.submit(now, b, p, callbacks, fences)
 }
 
 func (n *nativeAsyncRuntime) tryConsume(now int64) {

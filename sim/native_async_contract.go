@@ -18,6 +18,21 @@ type NativeBatchKV interface {
 	Consumed(now int64)
 }
 
+// NativePhasedBatchKV separates worker host submission/poll from GPU completion.
+// PostForward may enqueue copies protected by an unresolved producer fence;
+// Poll freezes the receipts returned by this worker iteration.
+type NativePhasedBatchKV interface {
+	NativeBatchKV
+	Computed(now int64)
+	PostForward(now int64, producer *NativeFence)
+	Poll(now int64)
+}
+
+type NativePhasedKVStore interface {
+	NativeAsyncKVStore
+	EnableNativePhaseTransfers(*NativeExecutor, string) error
+}
+
 // NativeAsyncKVStore keeps allocation, content and physical lifetimes out of
 // the scheduler. ReserveNativeRange never reads not-yet-emitted output tokens.
 type NativeAsyncKVStore interface {
@@ -41,9 +56,12 @@ type NativeBatchShape struct {
 // output-ready delay and FIFO consumption. WorkerUS includes its launch gaps;
 // callers must not add the same host submission interval a second time.
 // These are cost interfaces, not a claim that a particular model is calibrated.
-type NativeAsyncCost interface {
+type NativeHostCost interface {
 	ScheduleUS(waiting, running int) int64
+	ConsumeUS(requests int) int64
+}
+type NativeAsyncCost interface {
+	NativeHostCost
 	WorkerUS([]NativeBatchShape) int64
 	OutputUS([]NativeBatchShape) int64
-	ConsumeUS(requests int) int64
 }

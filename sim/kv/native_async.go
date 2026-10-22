@@ -26,6 +26,18 @@ func (s *PeerCache) EnableNativeAsyncKV() error {
 	return nil
 }
 
+func (s *PeerCache) EnableNativePhaseTransfers(executor *sim.NativeExecutor, resource string) error {
+	if s.nativeAsync || s.nativePhaseTransfers || s.fabric.Pending() != 0 || len(s.RequestMap) != 0 || executor == nil || resource == "" || s.fabric.mechanisms.CompletionUS != 0 {
+		return fmt.Errorf("native phase transfers require an unused native async store")
+	}
+	if err := s.EnableNativeAsyncKV(); err != nil {
+		return err
+	}
+	s.nativePhaseTransfers = true
+	s.nativeExecutor, s.nativeCopyResource = executor, resource
+	return nil
+}
+
 func (s *PeerCache) ReserveNativeRange(req *sim.Request, start, end int64, cached []int64) bool {
 	if !s.nativeAsync || s.nativeReserving || start < 0 || end <= start || start >= req.PrefillEnd() && end != start+1 {
 		panic("invalid native reservation")
@@ -66,6 +78,8 @@ type nativeCapturedBatch struct {
 	store                *PeerCache
 	works                []nativeCapturedWork
 	deviceDone, consumed bool
+	posted, polled       bool
+	loads                []*peerJob
 	receives             []string
 }
 
@@ -73,7 +87,8 @@ func (s *PeerCache) CaptureNativeBatch(work []sim.NativeWork) sim.NativeBatchKV 
 	if !s.nativeAsync {
 		panic("native async KV is disabled")
 	}
-	b := &nativeCapturedBatch{store: s}
+	b := &nativeCapturedBatch{store: s, loads: s.nativePrepared}
+	s.nativePrepared = nil
 	for _, w := range work {
 		n := (w.End + s.BlockSizeTokens - 1) / s.BlockSizeTokens
 		ids := s.RequestMap[w.Request.ID]
@@ -146,6 +161,12 @@ func (s *PeerCache) nativeHashAndPublish(req *sim.Request, ids []int64, end int6
 }
 
 func (b *nativeCapturedBatch) DeviceComplete(now int64) {
+	b.Computed(now)
+	b.PostForward(now, nil)
+	b.Poll(now)
+}
+
+func (b *nativeCapturedBatch) Computed(now int64) {
 	if b.deviceDone || b.consumed {
 		panic("duplicate native device completion")
 	}
@@ -158,8 +179,25 @@ func (b *nativeCapturedBatch) DeviceComplete(now int64) {
 		// identities can enter the reusable directory; extra work still pays cost.
 		end := min(w.End, w.Request.InputLen()+int64(len(w.Request.OutputTokens)))
 		s.nativeHashAndPublish(w.Request, captured.ids, end, false)
+	}
+}
+
+func (b *nativeCapturedBatch) PostForward(now int64, producer *sim.NativeFence) {
+	s := b.store
+	if b.posted || b.consumed || s.nativePhaseTransfers && producer == nil {
+		panic("invalid native post-forward")
+	}
+	b.posted = true
+	s.SetClock(now)
+	if len(s.nativePrepared) > 0 {
+		panic("uncaptured native LOAD metadata")
+	}
+	// Sources are schedule-known immutable ranges. Physical copies wait on the
+	// producer's device fence even when host post_forward precedes GPU completion.
+	for _, captured := range b.works {
+		w := captured.work
 		s.fabric.beginTransferGroup()
-		s.storeHostChunksFrom(w.Request, captured.ids, captured.storeStart, min(end, captured.storeEnd), false)
+		s.storeHostChunksFrom(w.Request, captured.ids, captured.storeStart, captured.storeEnd, false)
 		s.fabric.endTransferGroup(now)
 		if w.Request.State == sim.StateTimedOut || w.Request.State == sim.StateCompleted {
 			// A cancelled request can acquire STORE obligations after its host END.
@@ -167,6 +205,45 @@ func (b *nativeCapturedBatch) DeviceComplete(now int64) {
 			s.holdCapturedHostStore(w.Request.ID, captured.ids)
 		}
 	}
+	jobs := append(b.loads, s.nativePrepared...)
+	b.loads = nil
+	s.nativePrepared = nil
+	for _, j := range jobs {
+		s.fabric.nativePrepared--
+		j.record.Time, j.record.Name = now, "transfer_queued"
+		s.fabric.emit(j.record)
+		f := s.fabric
+		f.nativeInFlight++
+		duration := f.durationBytes(j.path, max(1, j.units)*f.bytes)
+		s.nativeExecutor.SubmitService(now, fmt.Sprintf("kv_copy_%d", j.record.Transaction), s.nativeCopyResource, "native-kv-stream", duration, producer,
+			func(at int64) {
+				for _, id := range j.path {
+					f.busy[id] = true
+					f.busyUntil[id] = at + duration
+				}
+				j.record.Time, j.record.Name, j.record.Duration = at, "transfer_start", duration
+				f.emit(j.record)
+			}, func(at int64) {
+				for _, id := range j.path {
+					f.busy[id] = false
+				}
+				f.nativeInFlight--
+				j.record.Time, j.record.Name = at, "transfer_end"
+				f.emit(j.record)
+				j.done(at)
+				f.notifyDecisionTransfer(at, j)
+				f.wakeStores(at)
+			})
+	}
+}
+
+func (b *nativeCapturedBatch) Poll(now int64) {
+	if !b.posted || b.polled || b.consumed {
+		panic("invalid native receipt poll")
+	}
+	b.polled = true
+	s := b.store
+	s.SetClock(now)
 	for request, pending := range s.nativeLoadPending {
 		if pending && s.readPending[request] == 0 && len(s.nativeLoadTargets[request]) > 0 {
 			b.receives = append(b.receives, request)
@@ -194,7 +271,7 @@ func (s *PeerCache) holdCapturedHostStore(request string, ids []int64) {
 }
 
 func (b *nativeCapturedBatch) Consumed(now int64) {
-	if !b.deviceDone || b.consumed {
+	if !b.deviceDone || !b.polled || b.consumed {
 		panic("native batch consumed before device completion or twice")
 	}
 	b.consumed = true
