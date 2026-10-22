@@ -121,6 +121,11 @@ func (s *PeerCache) unpin(b *KVBlock) {
 	}
 }
 func (s *PeerCache) invalidate(b *KVBlock) {
+	if x := s.fabric.external; x != nil && x.memory != nil {
+		if err := x.memory.InvalidateHBM(b.ID); err != nil {
+			panic(err)
+		}
+	}
 	if n := s.fabric.native; n != nil && n.pagedEnabled {
 		n.advance(s.clock)
 		if err := n.Runtime.Memory.Invalidate(n.hbmID(b.ID)); err != nil {
@@ -509,6 +514,11 @@ func (s *PeerCache) MirrorToCPU(batch []*sim.Request) {
 			b := s.Blocks[id]
 			end := int64(i+1) * s.BlockSizeTokens
 			if end <= min(req.ProgressIndex, req.InputLen()) && b.Hash != "" && int64(len(b.Tokens)) == s.BlockSizeTokens {
+				if x := s.fabric.external; x != nil && x.memory != nil && s.ready[id] != b.Hash {
+					if err := x.memory.CheckContents(b.Hash, s.fabric.hbmBuffer(id)); err != nil {
+						panic(err)
+					}
+				}
 				if s.fabric.native != nil && s.ready[id] != b.Hash {
 					s.fabric.native.computed(s.clock, id, b.Hash)
 				}
